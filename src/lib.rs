@@ -10,6 +10,7 @@ pub mod local_fs;
 pub mod pipeline;
 pub mod report;
 pub mod smb;
+pub mod tui;
 
 pub use config::{Config, Model};
 pub use error::AppError;

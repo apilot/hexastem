@@ -13,3 +13,13 @@ thiserror = "2"
 # Сериализация: протокол драйвера движка (JSON по stdio)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TUI-бинарник: ratatui 0.30.2 (ratatui::init/restore, TestBackend), crossterm 0.29
+# (тот же крейт, что в deps ratatui 0.30 — единая версия), версии сверены crates.io 2026-10-13
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = "0.29"
+# Асинхронный event loop TUI: tokio::select, tick-интервал, mpsc, многопоточный рантайм
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[[bin]]
+name = "audio_split_tui"
+path = "src/bin/audio_split_tui.rs"
