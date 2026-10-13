@@ -110,6 +110,8 @@ impl Ctrl {
 pub struct RunnerHandle {
     ctrl: Arc<Ctrl>,
     task: JoinHandle<Result<BatchResult, AppError>>,
+    /// Движок прогона: адресат форс-kill'а (субпроцесс драйвера).
+    engine: Arc<dyn EngineOps + Send + Sync>,
 }
 
 impl RunnerHandle {
@@ -117,6 +119,13 @@ impl RunnerHandle {
     /// (см. ограничения модуля — отдельный subprocess не прерывается).
     pub fn cancel(&self) {
         self.ctrl.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Форс-отмена: немедленно убить subprocess движка (текущий файл
+    /// останется без rename — resume подберёт его в следующем прогоне).
+    /// Ожидание движка завершается ошибкой, раннер доходит до выхода сам.
+    pub fn force_kill(&self) {
+        self.engine.kill_current_engine();
     }
 
     /// Серия завершена для раннера: больше не принимать retry; итог — в `finish`.
@@ -154,8 +163,9 @@ pub fn spawn(deps: RunnerDeps, opts: RunnerOptions, events: UnboundedSender<AppE
         pause_ms: AtomicU64::new(pause_millis(opts.pause_between_files)),
         retries: Mutex::new(Vec::new()),
     });
+    let engine = Arc::clone(&deps.engine);
     let task = tokio::spawn(runner_loop(deps, opts, events, ctrl.clone()));
-    RunnerHandle { ctrl, task }
+    RunnerHandle { ctrl, task, engine }
 }
 
 /// Exit-code прогона по [`BatchResult`]: 0 — нет отказов (дубли не влияют),
@@ -464,11 +474,20 @@ impl TeeEngine<'_> {
     fn report_duplicates(&self, worklist: &[PathBuf]) {
         let in_engine: HashSet<String> =
             worklist.iter().map(|path| path.to_string_lossy().into_owned()).collect();
-        let downloaded = self.downloaded.lock().expect("downloads lock");
-        for (local, name) in downloaded.iter() {
-            if !in_engine.contains(local) {
-                let _ = self.events.send(AppEvent::FileDuplicate { name: name.clone() });
+        let mut dup_names = Vec::new();
+        {
+            let downloaded = self.downloaded.lock().expect("downloads lock");
+            for (local, name) in downloaded.iter() {
+                if !in_engine.contains(local) {
+                    let _ = self.events.send(AppEvent::FileDuplicate { name: name.clone() });
+                    dup_names.push(name.clone());
+                }
             }
+        }
+        // Пачкой, после пер-файловых событий: UI помечает строки дублями
+        // сразу — до старта separate (без «мёртвой» стадии download).
+        if !dup_names.is_empty() {
+            let _ = self.events.send(AppEvent::DuplicatesKnown { names: dup_names });
         }
     }
 }
@@ -750,6 +769,83 @@ mod tests {
             .calls()
             .iter()
             .any(|call| call.contains("rename /nas/copy.wav -> /nas/DUPLICATE_copy.wav")));
+    }
+
+    #[tokio::test]
+    async fn duplicates_known_announced_after_per_file_events_before_separate() {
+        let dir = temp_dir("dup_known");
+        let wav = wav_fix::encode_wav(8_000, 16, 1, &wav_fix::burst_signal(8_000, 2));
+        let rig = Rig {
+            smb: Arc::new(
+                MockSmb::new()
+                    .with_dir("/nas", &["keeper.wav", "copy.wav"])
+                    .with_body("/nas/keeper.wav", wav.clone())
+                    .with_body("/nas/copy.wav", wav),
+            ),
+            engine: Arc::new(MockEngine::new(engine_events(&dir, &["keeper.wav"]))),
+            opts: opts(&dir, 0),
+        };
+
+        let (events, _) = run_full(&rig).await;
+
+        let dup_pos = events
+            .iter()
+            .position(|event| matches!(event, AppEvent::FileDuplicate { name } if name == "copy.wav"))
+            .expect("пер-файловое событие дубля");
+        let known_pos = events
+            .iter()
+            .position(|event| matches!(event, AppEvent::DuplicatesKnown { names } if names.as_slice() == ["copy.wav"]))
+            .expect("пачка дублей после пер-файловых");
+        assert!(known_pos > dup_pos, "пачка идёт после пер-файловых событий");
+        // Дубли известны ДО первого separate-прогресса: строки не показывают
+        // «мёртвый» download 0%.
+        if let Some(separate_pos) = events
+            .iter()
+            .position(|event| matches!(event, AppEvent::FileProgress { .. }))
+        {
+            assert!(known_pos < separate_pos, "дубли распознаны до separate");
+        }
+    }
+
+    #[tokio::test]
+    async fn force_kill_unblocks_engine_and_finish_resolves_quickly() {
+        let dir = temp_dir("force_kill");
+        // Движок «висит» 30 c: без форс-kill ожидание не прервать.
+        let rig = Rig {
+            smb: Arc::new(MockSmb::new().with_dir("/nas", &["a.wav"])),
+            engine: Arc::new(
+                MockEngine::new(engine_events(&dir, &["a.wav"])).with_delay_before(Duration::from_secs(30)),
+            ),
+            opts: opts(&dir, 0),
+        };
+        let (tx, _rx) = unbounded_channel();
+        let handle = spawn(rig.deps(), rig.opts.clone(), tx);
+
+        // Ждём старта батча движка (окно для kill), затем дёргаем форс —
+        // как App.request_force_kill → sync_run_controls → handle.force_kill.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !rig.engine.started() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(rig.engine.started(), "движок не стартовал — тест некорректен");
+
+        let started = std::time::Instant::now();
+        // Как sync_run_controls: cancel_requested → cancel(), take_force_kill → force_kill().
+        handle.cancel();
+        handle.force_kill();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.finish())
+            .await
+            .expect("finish завис после форс-kill");
+
+        assert!(rig.engine.kill_flag().load(std::sync::atomic::Ordering::Relaxed), "kill-флаг не взведён");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "форс-kill обязан завершить ожидание быстро"
+        );
+        let result = result.expect("раннер завершился с итогом батча (ошибка движка = failed-файл)");
+        assert_eq!(result.failed, 1);
+        let error = result.results[0].error.clone().unwrap_or_default();
+        assert!(error.contains("engine killed"), "неожиданная ошибка: {error}");
     }
 
     #[tokio::test]

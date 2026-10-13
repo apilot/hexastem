@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -15,7 +16,7 @@ use crate::config::Model;
 use crate::pipeline::FileStatus;
 use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
 use crate::tui::gpu::{GpuEvent, GpuInfo};
-use crate::tui::log::{LogBuffer, PAGE_LINES};
+use crate::tui::log::{format_hhmmss, now_unix_secs, LogBuffer, PAGE_LINES};
 use crate::tui::persist::TuiSettings;
 use crate::tui::popup::{PopupView, TextFieldView};
 use crate::tui::widgets::{GpuView, Tab, TABS};
@@ -85,6 +86,8 @@ pub struct FileView {
     pub peaks: Option<Arc<[f32]>>,
     /// Терминальный исход (Ok/Failed/Duplicate/Skipped).
     pub outcome: Option<FileOutcome>,
+    /// Момент входа в текущую стадию: тикающий таймер стадии в UI.
+    pub stage_started: Option<Instant>,
 }
 
 /// Текстовое поле ввода с курсором (индекс в СИМВОЛАХ — unicode-safe).
@@ -395,6 +398,16 @@ pub struct App {
     tab_before_help: Option<Tab>,
     /// Открыт модальный диалог выхода во время прогона.
     confirm_quit: bool,
+    /// Идёт мягкая отмена: баннер «Прерывание…», выход — после BatchFinished.
+    cancelling: bool,
+    /// Подтверждён форс: убить движок немедленно (drain event loop'ом).
+    force_kill: bool,
+    /// Paste вне попапа: путь для преффилла Remote dir (drain event loop'ом).
+    paste_prefill: Option<String>,
+    /// Момент старта прогона: общий таймер и ETA в футере.
+    run_started_at: Option<Instant>,
+    /// Счётчик тиков: анимация indeterminate-баров и спиннеров.
+    tick_count: u64,
     /// Кольцевой буфер журнала (таб Log).
     log: LogBuffer,
     /// Режим ввода фильтра журнала (`Some` — клавиши идут в поле).
@@ -416,6 +429,46 @@ impl App {
 
     pub fn cancel_requested(&self) -> bool {
         self.cancel_requested
+    }
+
+    /// Идёт мягкая отмена (баннер «Прерывание…», движок доигрывает файл).
+    pub fn cancelling(&self) -> bool {
+        self.cancelling
+    }
+
+    /// Общий счётчик тиков (анимация баров/спиннеров).
+    pub fn tick_count(&self) -> u64 {
+        self.tick_count
+    }
+
+    /// Момент старта прогона (`None` — прогон не начат).
+    pub fn run_started_at(&self) -> Option<Instant> {
+        self.run_started_at
+    }
+
+    /// Забрать путь из paste вне попапа (преффилл Remote dir попапа).
+    pub fn take_paste_prefill(&mut self) -> Option<String> {
+        std::mem::take(&mut self.paste_prefill)
+    }
+
+    /// Забрать запрос форс-kill'а (drain: event loop дёргает RunnerHandle).
+    pub fn take_force_kill(&mut self) -> bool {
+        std::mem::take(&mut self.force_kill)
+    }
+
+    /// Преффилл поля Remote dir и фокус на нём (paste пути вне попапа).
+    pub fn prefill_remote_dir(&mut self, dir: &str) {
+        let Some(cfg) = self.config.as_mut() else {
+            return;
+        };
+        cfg.remote_dir = TextField::new(dir);
+        cfg.focus = Focus::RemoteDir;
+    }
+
+    /// Ручная очистка списка файлов (Idle/Finished, клавиша `x`).
+    pub fn clear_files(&mut self) {
+        self.files.clear();
+        self.selected = 0;
     }
 
     pub fn paused(&self) -> bool {
@@ -529,33 +582,63 @@ impl App {
             AppEvent::RunFailed { error } => {
                 self.run_error = Some(error.clone());
                 self.state = State::Finished;
+                self.model_pct = None; // индикатор загрузки модели — только на время прогона
+                // Форс-отмена: раннер упал из-за kill — выходим не дожидаясь.
+                if self.cancelling {
+                    self.quit_requested = true;
+                }
             }
             AppEvent::FileStage { name, stage } => self.update_file(name, |file| {
-                file.stage = *stage;
+                if file.stage != *stage {
+                    file.stage = *stage;
+                    file.stage_started = Some(Instant::now());
+                }
                 // Вне separate процент не определён (приближение не храним).
                 if *stage != Stage::Separate {
                     file.pct = None;
                 }
             }),
             AppEvent::FileProgress { name, pct } => self.update_file(name, |file| {
-                file.stage = Stage::Separate;
+                if file.stage != Stage::Separate {
+                    file.stage = Stage::Separate;
+                    file.stage_started = Some(Instant::now());
+                }
                 file.pct = Some(*pct);
             }),
-            AppEvent::ModelProgress { pct } => self.model_pct = Some(*pct),
+            // Загрузка модели глобальна: по завершении (100%) индикатор гаснет.
+            AppEvent::ModelProgress { pct } => {
+                self.model_pct = if *pct >= 100.0 { None } else { Some(*pct) };
+            }
             AppEvent::FileDone { name } => self.update_file(name, |file| {
                 file.outcome = Some(FileOutcome::Ok);
                 file.pct = Some(100.0);
+                file.stage_started = None;
             }),
             AppEvent::FileFailed { name, error } => self.update_file(name, |file| {
                 file.outcome = Some(FileOutcome::Failed { error: error.clone() });
+                file.stage_started = None;
             }),
             AppEvent::FileDuplicate { name } => self.update_file(name, |file| {
                 file.outcome = Some(FileOutcome::Duplicate { kept: String::new() });
+                file.stage_started = None;
             }),
+            AppEvent::DuplicatesKnown { names } => {
+                for name in names {
+                    self.update_file(name, |file| {
+                        file.outcome = Some(FileOutcome::Duplicate { kept: String::new() });
+                        file.pct = None;
+                        file.stage_started = None;
+                    });
+                }
+            }
+            // Строки stderr движка не меняют состояние: их в таб Log пишет
+            // event loop (`log_event`).
+            AppEvent::EngineLog { .. } => {}
             AppEvent::BatchFinished { outcome } => self.on_batch_finished(outcome),
             AppEvent::Envelope { path, peaks } => self.on_envelope(path, peaks.clone()),
-            // Resize/Tick/Ignored на автомат не влияют (перерисовка — в event loop).
-            AppEvent::Resize { .. } | AppEvent::Tick | AppEvent::Ignored => {}
+            // Тик двигает анимации; Resize/Ignored на автомат не влияют.
+            AppEvent::Tick => self.tick_count += 1,
+            AppEvent::Resize { .. } | AppEvent::Ignored => {}
         }
     }
 
@@ -586,13 +669,19 @@ impl App {
             State::Config => {}
             State::Idle => match key.code {
                 KeyCode::Enter | KeyCode::Char('s') => self.state = State::Config,
+                KeyCode::Char('x') => self.clear_files(),
                 KeyCode::Char('q') | KeyCode::Esc => self.quit_requested = true,
                 _ => {}
             },
             State::Running => match key.code {
+                // Баннер «Прерывание…»: Enter/q повторно — форс-остановка.
+                KeyCode::Enter if self.cancelling => self.request_force_kill(),
+                KeyCode::Char('q') if self.cancelling => self.request_force_kill(),
                 // q/Esc — confirm выхода: отмена применяется на границе
                 // файлов, решение остаётся за пользователем (Enter в диалоге).
                 KeyCode::Char('q') | KeyCode::Esc => self.confirm_quit = true,
+                // Стартовые клавиши во время прогона — запрещены (страж).
+                KeyCode::Enter | KeyCode::Char('s') => self.log_start_guard(),
                 KeyCode::Char('p') => self.paused = !self.paused,
                 KeyCode::Char('r') => self.request_retry_selected(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -602,12 +691,32 @@ impl App {
             State::Finished => match key.code {
                 KeyCode::Enter => self.state = State::Idle,
                 KeyCode::Char('q') | KeyCode::Esc => self.quit_requested = true,
+                KeyCode::Char('x') => self.clear_files(),
                 KeyCode::Char('r') => self.request_retry_selected(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 _ => {}
             },
         }
+    }
+
+    /// Страж старта: прогон уже идёт — клавиша не меняет состояние.
+    fn log_start_guard(&mut self) {
+        self.push_log("прогон уже идёт — дождитесь завершения или прервите (q)");
+    }
+
+    /// Форс-отмена: убить движок немедленно и выйти (текущий файл останется
+    /// без rename — resume подберёт его в следующем прогоне).
+    fn request_force_kill(&mut self) {
+        self.force_kill = true;
+        self.cancel_requested = true;
+        self.quit_requested = true;
+        self.push_log("форс: движок остановлен, текущий файл останется без rename (resume)");
+    }
+
+    /// Строка в журнал с меткой времени (системные отказы UI, стражи).
+    fn push_log(&mut self, message: &str) {
+        self.log.push(format_hhmmss(now_unix_secs()), message);
     }
 
     /// Глобальные клавиши вне попапа: Help, табы, клавиши журнала.
@@ -746,13 +855,14 @@ impl App {
         }
     }
 
-    /// Confirm выхода во время прогона: Enter — подтвердить (кооперативная
-    /// отмена + выход из TUI), Esc/q — остаться. Прочие клавиши поглощаются.
+    /// Confirm выхода во время прогона, шаг 1 (мягко): Enter — кооперативная
+    /// отмена + баннер «Прерывание…», цикл живёт; выход — после BatchFinished.
+    /// Повторный Enter/q (в баннере) — форс. Esc/q в диалоге — остаться.
     fn on_key_confirm(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
                 self.cancel_requested = true;
-                self.quit_requested = true;
+                self.cancelling = true;
                 self.confirm_quit = false;
             }
             KeyCode::Char('q') | KeyCode::Esc => self.confirm_quit = false,
@@ -761,17 +871,26 @@ impl App {
     }
 
     /// Засев таблицы из плана; сброс состояния прошлого прогона.
-    fn on_run_started(&mut self, plan: &PlanSummary) {        self.files = plan
+    fn on_run_started(&mut self, plan: &PlanSummary) {
+        self.files = plan
             .pending
             .iter()
             .map(|name| FileView { name: name.clone(), ..FileView::default() })
             .chain(plan.skipped_converted.iter().map(|name| skipped_view(name, SkipReason::Converted)))
-            .chain(plan.skipped_duplicate.iter().map(|name| skipped_view(name, SkipReason::DuplicatePrefix)))
+            // Известные заранее дубли (`DUPLICATE_*`) — сразу DUP-строки,
+            // а не «мёртвый» download 0%.
+            .chain(plan.skipped_duplicate.iter().map(|name| FileView {
+                name: name.clone(),
+                outcome: Some(FileOutcome::Duplicate { kept: String::new() }),
+                ..FileView::default()
+            }))
             .chain(plan.skipped_done.iter().map(|name| skipped_view(name, SkipReason::Done)))
             .collect();
         self.selected = 0;
         self.state = State::Running;
         self.cancel_requested = false;
+        self.cancelling = false;
+        self.force_kill = false;
         self.paused = false;
         self.model_pct = None;
         self.outcome = None;
@@ -779,6 +898,9 @@ impl App {
         self.retry_requests.clear();
         self.confirm_quit = false;
         self.log_filter_input = None;
+        self.paste_prefill = None;
+        self.run_started_at = Some(Instant::now());
+        self.tick_count = 0;
     }
 
     /// Авторитетная сверка статусов из [`BatchResult`] (в т.ч. kept дублей)
@@ -793,10 +915,16 @@ impl App {
                     },
                     FileStatus::Duplicate { kept } => FileOutcome::Duplicate { kept: kept.clone() },
                 });
+                file.stage_started = None;
             });
         }
         self.outcome = Some(outcome.clone());
         self.state = State::Finished;
+        self.model_pct = None; // индикатор загрузки модели — только на время прогона
+        // Мягкая отмена доиграла текущий файл — штатный быстрый выход.
+        if self.cancelling {
+            self.quit_requested = true;
+        }
     }
 
     /// Огибающая принимается только для известного файла без терминального
@@ -872,18 +1000,31 @@ impl App {
         self.pending_start = pending;
     }
 
-    /// Вставка из буфера (bracketed paste): в активное текстовое поле,
-    /// вне попапа и на переключателях — игнорируется.
+    /// Вставка из буфера (bracketed paste):
+    /// — в попапе — в активное текстовое поле;
+    /// — вне попапа (Idle/Finished) — одиночная строка = путь: открыть
+    ///   попап с преффиллом Remote dir;
+    /// — во время прогона — отказ (строка в журнале).
     fn on_paste(&mut self, text: &str) {
-        if self.state != State::Config {
+        if self.state == State::Running {
+            self.push_log("paste отклонён: идёт прогон");
             return;
         }
-        let Some(cfg) = self.config.as_mut() else {
+        if self.state == State::Config {
+            if let Some(cfg) = self.config.as_mut() {
+                if let Some(field) = cfg.focused_field_mut() {
+                    field.insert_str(&sanitize_paste(text));
+                }
+            }
             return;
-        };
-        if let Some(field) = cfg.focused_field_mut() {
-            field.insert_str(&sanitize_paste(text));
         }
+        // Idle/Finished: одиночный непустой путь — преффилл нового прогона.
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+            return;
+        }
+        self.paste_prefill = Some(trimmed.to_string());
+        self.state = State::Config;
     }
 
     /// Снимок GPU-поллера: `None` — GPU недоступна («GPU: n/a» в шапке).
@@ -1116,7 +1257,8 @@ mod tests {
         assert_eq!(app.files()[0].stage, Stage::Queued);
         assert_eq!(app.files()[0].outcome, None);
         assert_eq!(app.files()[2].outcome, Some(FileOutcome::Skipped { reason: SkipReason::Converted }));
-        assert_eq!(app.files()[3].outcome, Some(FileOutcome::Skipped { reason: SkipReason::DuplicatePrefix }));
+        // Известный заранее дубль — сразу DUP-строка (не SKIP, не download).
+        assert_eq!(app.files()[3].outcome, Some(FileOutcome::Duplicate { kept: String::new() }));
         assert_eq!(app.files()[4].outcome, Some(FileOutcome::Skipped { reason: SkipReason::Done }));
     }
 
@@ -1309,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_enter_requests_cancel_and_quit() {
+    fn confirm_enter_starts_soft_cancel_without_quit() {
         let mut app = App::new();
         start_run(&mut app);
         app.handle(&press(KeyCode::Esc));
@@ -1318,8 +1460,189 @@ mod tests {
         app.handle(&press(KeyCode::Enter));
 
         assert!(app.cancel_requested(), "раннер доигрывает файл и останавливается");
-        assert!(app.should_quit());
+        assert!(app.cancelling(), "баннер «Прерывание…» виден");
+        assert!(!app.should_quit(), "цикл живёт до BatchFinished");
         assert!(!app.confirm_open());
+    }
+
+    #[test]
+    fn soft_cancel_finishes_batch_then_quits() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        app.handle(&press(KeyCode::Enter));
+        assert!(app.cancelling());
+
+        // Тик/мышь/лог обрабатываются, пока доигрывает текущий файл.
+        app.handle(&AppEvent::Tick);
+        assert_eq!(app.tick_count(), 1);
+
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+
+        assert_eq!(app.state(), State::Finished);
+        assert!(app.should_quit(), "после штатного завершения — выход");
+    }
+
+    #[test]
+    fn cancelling_enter_forces_kill_and_quit() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        app.handle(&press(KeyCode::Enter));
+        assert!(app.cancelling());
+
+        app.handle(&press(KeyCode::Enter));
+
+        assert!(app.take_force_kill(), "раннер должен убить движок");
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn cancelling_q_also_forces_kill() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        app.handle(&press(KeyCode::Enter));
+
+        app.handle(&press(KeyCode::Char('q')));
+
+        assert!(app.take_force_kill());
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn run_failed_during_cancelling_quits() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        app.handle(&press(KeyCode::Enter));
+        assert!(app.cancelling());
+
+        app.handle(&AppEvent::RunFailed { error: "engine killed by user".to_string() });
+
+        assert_eq!(app.state(), State::Finished);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn cancelling_state_resets_on_new_run() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        app.handle(&press(KeyCode::Enter));
+        assert!(app.cancelling());
+
+        start_run(&mut app);
+
+        assert!(!app.cancelling());
+        assert!(!app.take_force_kill());
+    }
+
+    #[test]
+    fn duplicates_known_marks_rows_before_engine_starts() {
+        let mut app = App::new();
+        start_run(&mut app);
+        // b.wav качался (download 0%) — дедуп признал его дублем до separate.
+        app.handle(&AppEvent::FileStage { name: "b.wav".to_string(), stage: Stage::Download });
+
+        app.handle(&AppEvent::DuplicatesKnown { names: vec!["b.wav".to_string()] });
+
+        let b = app.files().iter().find(|f| f.name == "b.wav").unwrap();
+        assert_eq!(b.outcome, Some(FileOutcome::Duplicate { kept: String::new() }));
+        assert_eq!(b.pct, None, "без мёртвого «download 0%»");
+        assert_eq!(b.stage_started, None);
+    }
+
+    #[test]
+    fn start_keys_in_running_are_guarded_with_log_line() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&press(KeyCode::Char('s')));
+        assert_eq!(app.state(), State::Running, "страж: состояние не меняется");
+        assert!(app.log().visible().iter().any(|e| e.message.contains("прогон уже идёт")));
+
+        app.handle(&press(KeyCode::Enter));
+        assert_eq!(app.state(), State::Running);
+    }
+
+    #[test]
+    fn paste_outside_popup_prefills_remote_dir() {
+        let mut app = App::new();
+        app.handle(&AppEvent::Paste { text: "/nas/music/inbox\n".to_string() });
+
+        assert_eq!(app.state(), State::Config, "paste пути открывает попап");
+        let dir = app.take_paste_prefill().expect("путь в преффилле");
+        assert_eq!(dir, "/nas/music/inbox");
+    }
+
+    #[test]
+    fn paste_multiline_or_empty_outside_popup_is_ignored() {
+        let mut app = App::new();
+        app.handle(&AppEvent::Paste { text: "одна\nвторая\n".to_string() });
+        assert_eq!(app.state(), State::Idle);
+        assert_eq!(app.take_paste_prefill(), None);
+
+        app.handle(&AppEvent::Paste { text: "   \n".to_string() });
+        assert_eq!(app.state(), State::Idle);
+        assert_eq!(app.take_paste_prefill(), None);
+    }
+
+    #[test]
+    fn paste_during_run_is_rejected_with_log_line() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::Paste { text: "/nas/music/inbox".to_string() });
+
+        assert_eq!(app.state(), State::Running);
+        assert_eq!(app.take_paste_prefill(), None);
+        assert!(app.log().visible().iter().any(|e| e.message.contains("paste отклонён")));
+    }
+
+    #[test]
+    fn x_key_clears_file_list_in_idle_and_finished() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+        assert!(!app.files().is_empty());
+
+        app.handle(&press(KeyCode::Char('x')));
+        assert!(app.files().is_empty(), "очистка в Finished");
+
+        // Finished → Enter → Idle: список переживает смену экрана.
+        start_run(&mut app);
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+        app.handle(&press(KeyCode::Enter));
+        assert_eq!(app.state(), State::Idle);
+        assert!(!app.files().is_empty());
+
+        app.handle(&press(KeyCode::Char('x')));
+        assert!(app.files().is_empty(), "очистка в Idle");
+    }
+
+    #[test]
+    fn model_progress_hides_at_hundred_percent() {
+        let mut app = App::new();
+        app.handle(&AppEvent::ModelProgress { pct: 42.0 });
+        assert_eq!(app.model_pct(), Some(42.0));
+
+        app.handle(&AppEvent::ModelProgress { pct: 100.0 });
+        assert_eq!(app.model_pct(), None, "загрузка завершена — индикатор погас");
+    }
+
+    #[test]
+    fn file_stage_sets_stage_timer_and_terminal_clears_it() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::FileStage { name: "a.wav".to_string(), stage: Stage::Download });
+        let a = app.files().iter().find(|f| f.name == "a.wav").unwrap();
+        assert!(a.stage_started.is_some(), "таймер стадии стартовал");
+
+        app.handle(&AppEvent::FileDone { name: "a.wav".to_string() });
+        let a = app.files().iter().find(|f| f.name == "a.wav").unwrap();
+        assert_eq!(a.stage_started, None, "терминальный исход гасит таймер");
     }
 
     #[test]

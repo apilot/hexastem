@@ -100,6 +100,9 @@ pub struct HeaderView {
     pub model: String,
     /// Снимок GPU-поллера, когда он поднят.
     pub gpu: Option<GpuView>,
+    /// Прогресс загрузки модели (`Some` — видимый индикатор «модель: NN%»,
+    /// гаснет по достижении 100%).
+    pub model_pct: Option<f64>,
 }
 
 /// Снимок GPU для шапки (заполняет seq 06 из nvidia-smi).
@@ -128,6 +131,11 @@ pub struct FileRowView {
     pub pct: f64,
     /// Готовых стемов (из [`EXPECTED_STEM_COUNT`]).
     pub stems_done: u8,
+    /// Секунд с входа в текущую стадию (`None` — таймер не идёт).
+    pub stage_elapsed: Option<f64>,
+    /// Фаза неопределённого прогресса (тики): `Some` — анимированный бар
+    /// вместо «мёртвых 0%» на стадиях download/upload/rename.
+    pub indeterminate: Option<u64>,
 }
 
 /// Состояние стема в чеклисте Details.
@@ -190,6 +198,21 @@ pub struct FooterView {
     pub summary: String,
 }
 
+/// Индикатор текущего файла (статус-строка над контентом, «крупно»).
+#[derive(Debug, Clone, Default)]
+pub struct CurrentFileView {
+    /// Имя файла.
+    pub name: String,
+    /// Стадия.
+    pub stage: String,
+    /// Процент separate (`None` — стадия без процента: индeterminate-бар).
+    pub pct: Option<f64>,
+    /// Фаза анимации (тики): спиннер + бегущий бар.
+    pub phase: u64,
+    /// Секунд в текущей стадии.
+    pub stage_elapsed: f64,
+}
+
 /// Табы основного экрана (клики мышью — [`tab_at`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -247,6 +270,10 @@ pub struct ScreenView {
     pub log: LogBuffer,
     /// Режим ввода фильтра журнала: текст и позиция курсора в символах.
     pub log_filter_input: Option<(String, usize)>,
+    /// Баннер над контентом (приоритетнее current): «Прерывание…».
+    pub banner: Option<String>,
+    /// Индикатор текущего файла в статус-строке (`None` — не показывать).
+    pub current: Option<CurrentFileView>,
 }
 
 /// Прямоугольники зон кадра (рендер и мышь используют одни значения).
@@ -256,6 +283,8 @@ pub struct ScreenZones {
     pub header: Rect,
     /// Полоса табов.
     pub tabs: Rect,
+    /// Статус-строка: баннер отмены или индикатор текущего файла.
+    pub status: Rect,
     /// FILES (+ DETAILS в полном режиме).
     pub content: Rect,
     /// Footer.
@@ -296,6 +325,44 @@ pub fn progress_bar_parts(pct: f64, width: usize) -> (String, String) {
 fn fill_columns(pct: f64, width: usize) -> usize {
     let clamped = pct.clamp(0.0, 100.0);
     ((clamped / 100.0) * width as f64).floor() as usize
+}
+
+/// Неопределённый прогресс (download/upload без процента): бегущее окно
+/// заполненных колонок; `phase` — номер тика (анимация при перерисовке).
+pub fn indeterminate_bar(phase: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let fill = (width / 4).clamp(1, width);
+    let pos = (phase as usize) % (width + fill);
+    (0..width)
+        .map(|col| if (pos..pos + fill).contains(&col) { BAR_FILLED } else { BAR_EMPTY })
+        .collect()
+}
+
+/// ETA прогона: среднее время на завершённый файл × остаток.
+/// `None` — считать нечем (ни одного завершённого) или всё завершено.
+pub fn eta_secs(elapsed_secs: f64, done: usize, total: usize) -> Option<f64> {
+    if done == 0 || total == 0 || done >= total {
+        return None;
+    }
+    Some(elapsed_secs / done as f64 * (total - done) as f64)
+}
+
+/// Ячейка стадии с тикающим таймером: `download · 00:12` (без таймера — как есть).
+pub fn stage_cell(stage: &str, stage_elapsed: Option<f64>) -> String {
+    match stage_elapsed {
+        Some(secs) => format!("{stage} · {}", format_mmss(secs)),
+        None => stage.to_string(),
+    }
+}
+
+/// Кадры спиннера для статус-строки (анимация по тикам).
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Символ спиннера по фазе тиков.
+pub fn spinner(phase: u64) -> char {
+    SPINNER[(phase as usize) % SPINNER.len()]
 }
 
 /// Три строки огибающей: колонки ресемплятся из `peaks` (max по окну при
@@ -360,7 +427,7 @@ pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView) {
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-/// Спаны шапки: подключение, директория, модель, GPU-слот.
+/// Спаны шапки: подключение, директория, модель (+загрузка), GPU-слот.
 fn header_spans(view: &HeaderView) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled("audio_split", STYLE_HEADER),
@@ -370,8 +437,13 @@ fn header_spans(view: &HeaderView) -> Vec<Span<'static>> {
         Span::raw(view.remote_dir.clone()),
         Span::raw(" ─ "),
         Span::styled(view.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw(" ─ "),
     ];
+    if let Some(pct) = view.model_pct {
+        // Глобальная загрузка модели: видна только пока идёт (до 100%).
+        spans.push(Span::raw(" ─ "));
+        spans.push(Span::styled(format!("модель: {pct:.0}%"), STYLE_FILL));
+    }
+    spans.push(Span::raw(" ─ "));
     spans.extend(gpu_spans(view.gpu.as_ref()));
     spans
 }
@@ -420,7 +492,7 @@ pub fn render_files(frame: &mut Frame, area: Rect, files: &[FileRowView], select
     let rows: Vec<Row> = files.iter().map(file_row).collect();
     let widths = [
         Constraint::Length(5),
-        Constraint::Length(9),
+        Constraint::Length(16),
         Constraint::Min(8),
         Constraint::Length(18),
         Constraint::Length(6),
@@ -449,17 +521,27 @@ fn render_files_empty(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(hint), inner);
 }
 
-/// Строка таблицы: бейдж / стадия / имя / прогресс / стемы (моно-цифры).
+/// Строка таблицы: бейдж / стадия(+таймер) / имя / прогресс или
+/// индeterminate-бар / стемы (моно-цифры).
 fn file_row(view: &FileRowView) -> Row<'static> {
     let badge = Cell::from(Span::styled(view.badge.label(), view.badge.style()));
-    let stage = Cell::from(Span::styled(view.stage.clone(), STYLE_DIM));
+    let stage = Cell::from(Span::styled(stage_cell(&view.stage, view.stage_elapsed), STYLE_DIM));
     let name = Cell::from(view.name.clone());
-    let (filled, empty) = progress_bar_parts(view.pct, PROGRESS_BAR_WIDTH);
-    let progress = Cell::from(Line::from(vec![
-        Span::styled(filled, STYLE_FILL),
-        Span::styled(empty, STYLE_EMPTY),
-        Span::raw(format!(" {:>3.0}%", view.pct)),
-    ]));
+    let progress = match view.indeterminate {
+        // Стадия без процента: анимированный бар вместо «мёртвых 0%».
+        Some(phase) => Cell::from(Line::from(vec![
+            Span::styled(indeterminate_bar(phase, PROGRESS_BAR_WIDTH), STYLE_FILL),
+            Span::styled("  ··", STYLE_DIM),
+        ])),
+        None => {
+            let (filled, empty) = progress_bar_parts(view.pct, PROGRESS_BAR_WIDTH);
+            Cell::from(Line::from(vec![
+                Span::styled(filled, STYLE_FILL),
+                Span::styled(empty, STYLE_EMPTY),
+                Span::raw(format!(" {:>3.0}%", view.pct)),
+            ]))
+        }
+    };
     let stems = Cell::from(format!("{}/{}", view.stems_done, EXPECTED_STEM_COUNT));
     Row::new([badge, stage, name, progress, stems])
 }
@@ -605,11 +687,18 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView) {
     if area.is_empty() {
         return;
     }
-    let mut spans = vec![Span::styled(KEYHINTS, Style::new().fg(Color::Gray))];
-    if !view.summary.is_empty() {
-        let gap = (area.width as usize).saturating_sub(KEYHINTS.len() + view.summary.len());
-        // Сводка прижата вправо; при нехватке ширины — минимум один пробел.
-        spans.push(Span::raw(" ".repeat(gap.max(1))));
+    let mut spans = Vec::new();
+    if view.summary.is_empty() {
+        // Нечего показывать справа — место целиком подсказкам клавиш.
+        spans.push(Span::styled(KEYHINTS, Style::new().fg(Color::Gray)));
+    } else {
+        // Сводка важнее подсказок: не влезают обе — только сводка.
+        let both_fit = area.width as usize > KEYHINTS.len() + view.summary.len();
+        if both_fit {
+            spans.push(Span::styled(KEYHINTS, Style::new().fg(Color::Gray)));
+            let gap = (area.width as usize).saturating_sub(KEYHINTS.len() + view.summary.len());
+            spans.push(Span::raw(" ".repeat(gap.max(1))));
+        }
         spans.push(Span::styled(view.summary.clone(), Style::new().fg(Color::Cyan)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -841,6 +930,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         help_line("Enter", "новый цикл (Finished)"),
         help_line("p", "пауза между файлами (Running)"),
         help_line("r", "повтор выбранного упавшего файла"),
+        help_line("x", "очистить список файлов (Idle/Finished)"),
         help_line("↑/↓, j/k", "выбор файла в таблице"),
         help_line("f", "фильтр журнала по подстроке (Log)"),
         help_line("c", "очистить журнал (Log)"),
@@ -859,7 +949,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
 
 /// Модальный диалог выхода во время прогона (поверх всего кадра).
 pub fn render_confirm(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 70, 34);
+    let popup = centered(area, 70, 44);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(STYLE_FILL)
@@ -872,15 +962,23 @@ pub fn render_confirm(frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from("Прервать прогон и выйти?"),
         Line::from(String::new()),
-        Line::from(Span::styled("Отмена применяется на границе файлов:", STYLE_FILL)),
+        Line::from(Span::styled("Мягкая отмена — на границе файлов:", STYLE_FILL)),
         Line::from(Span::styled("текущий файл будет доигран раннером.", STYLE_FILL)),
         Line::from(String::new()),
         Line::from(vec![
             Span::styled("Enter", STYLE_FILL),
-            Span::raw(" — прервать и выйти · "),
-            Span::styled("Esc", STYLE_FILL),
+            Span::raw(" — мягко: доиграть текущий файл и выйти · "),
+            Span::styled("Esc/q", STYLE_FILL),
             Span::raw(" — остаться"),
         ]),
+        Line::from(Span::styled(
+            "Повторный Enter/q в баннере «Прерывание…» — форс: движок будет убит,",
+            STYLE_DIM,
+        )),
+        Line::from(Span::styled(
+            "текущий файл останется без rename (resume подберёт его сам).",
+            STYLE_DIM,
+        )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -905,11 +1003,12 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 // --- композиция кадра и карта для мыши ------------------------------------------
 
-/// Полный кадр: шапка → табы → контент активного таба → footer.
+/// Полный кадр: шапка → табы → статус-строка → контент активного таба → footer.
 pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView) {
     let zones = compute_zones(area);
     render_header(frame, zones.header, &view.header);
     render_tab_bar(frame, zones.tabs, view.tab);
+    render_status_line(frame, zones.status, view.banner.as_deref(), view.current.as_ref());
     match view.tab {
         Tab::Files => render_files_tab(frame, zones, view),
         Tab::Dedup => {
@@ -933,16 +1032,45 @@ fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView) {
     render_details_or_empty(frame, details_area, view.details.as_ref());
 }
 
+/// Статус-строка между табами и контентом: баннер отмены (приоритет) либо
+/// «живой» индикатор текущего файла (имя + стадия + таймер + бар/спиннер).
+fn render_status_line(frame: &mut Frame, area: Rect, banner: Option<&str>, current: Option<&CurrentFileView>) {
+    if let Some(text) = banner {
+        let line = Line::from(Span::styled(format!("! {text}"), STYLE_FILL));
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let Some(current) = current else {
+        return;
+    };
+    let (bar, pct_label) = match current.pct {
+        Some(pct) => (progress_bar(pct, PROGRESS_BAR_WIDTH), format!("{pct:>3.0}%")),
+        None => (indeterminate_bar(current.phase, PROGRESS_BAR_WIDTH), "··".to_string()),
+    };
+    let line = Line::from(vec![
+        Span::styled(spinner(current.phase).to_string(), STYLE_FILL),
+        Span::raw(" ▶ "),
+        Span::styled(current.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+        Span::raw(" ─ "),
+        Span::styled(stage_cell(&current.stage, Some(current.stage_elapsed)), STYLE_DIM),
+        Span::raw(" ─ "),
+        Span::styled(bar, STYLE_FILL),
+        Span::styled(format!(" {pct_label}"), STYLE_DIM),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 /// Зона таблицы файлов внутри контента (мышь — [`file_row_at`] по ней же);
 /// `has_details` — полный режим с DETAILS-панелью справа.
 pub fn files_table_area(content: Rect, has_details: bool) -> Rect {
     content_split(content, has_details).0
 }
 
-/// Зоны кадра: шапка 3, табы 1, контент Min(1), footer 1.
+/// Зоны кадра: шапка 3, табы 1, статус-строка 1, контент Min(1), footer 1.
 pub fn compute_zones(area: Rect) -> ScreenZones {
     let rows = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -951,8 +1079,9 @@ pub fn compute_zones(area: Rect) -> ScreenZones {
     ScreenZones {
         header: rows[0],
         tabs: rows[1],
-        content: rows[2],
-        footer: rows[3],
+        status: rows[2],
+        content: rows[3],
+        footer: rows[4],
     }
 }
 
@@ -1166,12 +1295,99 @@ mod tests {
         let zones = compute_zones(Rect::new(0, 0, 80, 24));
         assert_eq!(zones.header, Rect::new(0, 0, 80, 3));
         assert_eq!(zones.tabs, Rect::new(0, 3, 80, 1));
-        assert_eq!(zones.content, Rect::new(0, 4, 80, 19));
+        assert_eq!(zones.status, Rect::new(0, 4, 80, 1));
+        assert_eq!(zones.content, Rect::new(0, 5, 80, 18));
         assert_eq!(zones.footer, Rect::new(0, 23, 80, 1));
     }
 
-    // --- golden-рендеры ---
+    // --- инфографика: таймеры/ETA/анимация (багфикс-волна G) ---
 
+    #[test]
+    fn indeterminate_bar_moves_window_and_loops() {
+        let width = 12;
+        assert_ne!(indeterminate_bar(0, width), indeterminate_bar(1, width), "анимация по фазе");
+        // Окно = width/4; период = width + fill → фаза циклится.
+        let fill = width / 4;
+        assert_eq!(
+            indeterminate_bar(0, width).chars().filter(|c| *c == BAR_FILLED).count(),
+            fill
+        );
+        assert_eq!(indeterminate_bar(0, width), indeterminate_bar((width + fill) as u64, width));
+        assert_eq!(indeterminate_bar(0, 0), "");
+    }
+
+    #[test]
+    fn eta_secs_is_average_times_remaining() {
+        assert_eq!(eta_secs(20.0, 0, 10), None, "до первого завершённого ETA нет");
+        assert_eq!(eta_secs(20.0, 10, 10), None, "всё завершено");
+        assert_eq!(eta_secs(20.0, 2, 0), None, "пустой план");
+        let eta = eta_secs(20.0, 2, 5).expect("ETA по двум завершённым");
+        assert!((eta - 30.0).abs() < 1e-9, "10 c/файл × 3 остатка");
+    }
+
+    #[test]
+    fn stage_cell_appends_ticking_timer() {
+        assert_eq!(stage_cell("download", None), "download");
+        assert_eq!(stage_cell("download", Some(12.4)), "download · 00:12");
+        assert_eq!(stage_cell("separate", Some(252.0)), "separate · 04:12");
+    }
+
+    #[test]
+    fn spinner_cycles_through_frames() {
+        assert_eq!(spinner(0), spinner(10), "полный оборот — 10 кадров");
+        assert_ne!(spinner(0), spinner(1));
+    }
+
+    #[test]
+    fn header_shows_model_load_indicator_only_while_active() {
+        let loading = HeaderView { model: "sw".into(), model_pct: Some(37.4), ..HeaderView::default() };
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading)));
+        assert!(text.contains("модель: 37%"), "глобальная загрузка модели видна");
+
+        let idle = HeaderView { model: "sw".into(), ..HeaderView::default() };
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &idle)));
+        assert!(!text.contains("модель:"), "вне загрузки слот скрыт");
+    }
+
+    #[test]
+    fn status_line_shows_current_file_and_banner_takes_priority() {
+        let current = CurrentFileView {
+            name: "a.wav".into(),
+            stage: "download".into(),
+            pct: None,
+            phase: 2,
+            stage_elapsed: 5.0,
+        };
+        let text = buffer_text(&render_frame(100, 1, |f, a| render_status_line(f, a, None, Some(&current))));
+        assert!(text.contains("a.wav"));
+        assert!(text.contains("download · 00:05"), "таймер стадии");
+        assert!(text.contains("··"), "стадия без процента — индeterminate-бар");
+
+        let text = buffer_text(&render_frame(100, 1, |f, a| {
+            render_status_line(f, a, Some("Прерывание… текущий файл доигрывается"), Some(&current))
+        }));
+        assert!(text.contains("Прерывание…"), "баннер приоритетен");
+        assert!(!text.contains("a.wav"), "индикатор файла скрыт под баннером");
+    }
+
+    #[test]
+    fn table_stage_column_shows_timer_and_indeterminate_bar() {
+        let rows = vec![FileRowView {
+            badge: FileBadge::Run,
+            name: "a.wav".into(),
+            stage: "download".into(),
+            pct: 0.0,
+            stems_done: 0,
+            stage_elapsed: Some(65.0),
+            indeterminate: Some(3),
+        }];
+        let text = buffer_text(&render_frame(100, 8, |f, a| render_files(f, a, &rows, None)));
+        assert!(text.contains("download · 01:05"));
+        assert!(text.contains("··"), "индeterminate-бар");
+        assert!(!text.contains("  0%"), "мёртвых 0% больше нет");
+    }
+
+    // --- golden-рендеры ---
     fn header_view() -> HeaderView {
         HeaderView {
             host: "nas.local".into(),
@@ -1179,6 +1395,7 @@ mod tests {
             remote_dir: "/recordings".into(),
             model: "sw".into(),
             gpu: None,
+            model_pct: None,
         }
     }
 
@@ -1189,6 +1406,8 @@ mod tests {
             stage: "separate".into(),
             pct,
             stems_done: stems,
+            stage_elapsed: None,
+            indeterminate: None,
         }
     }
 
@@ -1440,12 +1659,12 @@ mod tests {
     fn screen_too_small_area_renders_without_panic() {
         let files = [file_row_view(FileBadge::Run, "a.wav", 63.0, 1)];
         let view = screen_view(files.into(), None);
-        // Ниже минимума 80×24 — рендер не паникует; footer обрезается по ширине,
-        // поэтому проверяем подсказку, попадающую в первые 40 колонок.
+        // Ниже минимума 80×24 — рендер не паникует; сводка важнее подсказок,
+        // в 40 колонок влезает только она (новое правило приоритета footer).
         let terminal = render_frame(40, 12, |f, area| render_screen(f, area, &view));
         let text = buffer_text(&terminal);
         assert!(text.contains("audio_split"));
-        assert!(text.contains("[s]tart"));
+        assert!(text.contains("ETA 04:12"), "сводка видна даже в узком кадре");
     }
 
     #[test]
@@ -1652,8 +1871,10 @@ mod tests {
         assert!(text.contains("Прервать прогон и выйти?"));
         assert!(text.contains("границе файлов"), "предупреждение");
         assert!(text.contains("доигран раннером"));
-        assert!(text.contains("Esc — остаться"));
-        assert!(text.contains("Enter — прервать и выйти"));
+        assert!(text.contains("Esc/q — остаться"));
+        assert!(text.contains("мягко: доиграть текущий файл"));
+        assert!(text.contains("форс"), "форс-ветка описана");
+        assert!(text.contains("без rename"), "resume-оговорка");
     }
 
     #[test]

@@ -482,8 +482,9 @@ async fn e2e_retry_after_engine_failure_via_ui_makes_batch_clean() {
     assert_eq!(app.state(), State::Finished);
     assert_eq!(app.outcome().map(|outcome| outcome.failed), Some(1));
 
-    // Мышью выбираем строку b.wav (вторая строка таблицы) и жмём `r`.
-    handle_mouse(&mut app, click_up(10, 7), SCREEN);
+    // Мышью выбираем строку b.wav (вторая строка таблицы; контент начинается
+    // со строки 5 — добавилась статус-строка между табами и таблицей) и жмём `r`.
+    handle_mouse(&mut app, click_up(10, 8), SCREEN);
     assert_eq!(app.selected_file().map(|file| file.name.as_str()), Some("b.wav"));
     app.handle(&key(KeyCode::Char('r')));
     let retries = app.take_retry_requests();
@@ -510,7 +511,8 @@ async fn e2e_retry_after_engine_failure_via_ui_makes_batch_clean() {
 
 // --- сценарий 3: cancel через quit-confirm ------------------------------------
 
-/// `q` во время прогона → confirm → Enter = кооперативная отмена + выход:
+/// `q` во время прогона → confirm → Enter = мягкая отмена: раннеру уходит
+/// cancel, UI живёт (баннер «Прерывание…»), выход — по завершении батча;
 /// оба файла Failed («cancelled»), исходники не переименованы, код 1.
 #[tokio::test]
 async fn e2e_cancel_confirmed_through_quit_dialog_fails_run() {
@@ -542,12 +544,16 @@ async fn e2e_cancel_confirmed_through_quit_dialog_fails_run() {
     }
     app.handle(&key(KeyCode::Char('q')));
     assert!(app.confirm_open(), "q в Running открывает подтверждение");
-    app.handle(&key(KeyCode::Enter)); // подтвердить: cancel + quit
-    assert!(app.cancel_requested() && app.should_quit());
+    app.handle(&key(KeyCode::Enter)); // мягко: доиграть текущий файл, выйти по завершении
+    assert!(
+        app.cancel_requested() && app.cancelling() && !app.should_quit(),
+        "Enter#1 — мягкая отмена: cancel взведён, выхода ещё нет"
+    );
 
     // Event loop синхронизирует флаги с раннером — повторяем это здесь.
     handle.cancel();
     drive(&mut app, &mut rx, 1).await;
+    assert!(app.should_quit(), "по завершении батча — штатный выход");
     handle.shutdown();
     let result = handle.finish().await.expect("батч завершён с отказами");
     drain(&mut app, &mut rx).await;
@@ -637,12 +643,13 @@ async fn e2e_second_run_skips_converted_duplicate_and_fully_stemmed() {
     assert_eq!(second.ok, 1);
     assert_eq!(exit_code(&second), 0);
 
-    // Таблица пересеяна: fresh в работе/готов, три SKIP-строки.
+    // Таблица пересеяна: fresh готов, дубль сразу DUP-строкой, два скипа.
     assert_eq!(app.files().len(), 4);
     assert_eq!(app.state(), State::Finished);
     let text = render(&app);
-    assert!(text.contains("OK 1 · FAIL 0 · DUP 0 · SKIP 3"), "{text}");
+    assert!(text.contains("OK 1 · FAIL 0 · DUP 1 · SKIP 2"), "{text}");
     assert!(text.contains("SKIP"));
+    assert!(text.contains("дубль"), "prefix-дубль сеется DUP-строкой: {text}");
     assert!(text.contains("fresh.wav"));
     assert!(text.contains("CONVERTED_ok.wav"));
 

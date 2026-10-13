@@ -17,14 +17,15 @@
 //! 6. итог — [`BatchResult`] (ok/failed/duplicate по каждому файлу).
 //!
 //! DI: SMB и движок инжектятся трейтами [`SmbOps`]/[`EngineOps`] — тесты идут
-//! на моках, без сети и GPU. Таймаут/kill драйвера ТЗ не предусмотрен: отказы
-//! изолирует сам драйвер (per-file retry), зависание процесса означает
-//! зависание батча (принятый KISS-компромисс).
+//! на моках, без сети и GPU. Зависание драйвера лечит форс-отмена TUI:
+//! [`EngineRunner::kill_current_engine`] добивает процесс движка (текущий файл
+//! останется без rename — resume подберёт его в следующем прогоне).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -157,10 +158,18 @@ pub trait EngineOps {
         output_dir: &Path,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<(), AppError>;
+
+    /// Форс-остановка текущего процесса движка (форс-отмена TUI).
+    /// По умолчанию — no-op (у моков/CLI нет процесса).
+    fn kill_current_engine(&self) {}
 }
 
+/// Строки stderr движка, перехваченные из пути событий (CLI-путь: терминал,
+/// TUI-путь: общий канал событий → таб Log).
+pub type StderrSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Rust-адаптер python-драйвера: subprocess `{venv}/bin/python separator_driver.py`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineRunner {
     /// Интерпретатор venv (`{venv}/bin/python`).
     python: PathBuf,
@@ -170,6 +179,32 @@ pub struct EngineRunner {
     model_checkpoint: String,
     /// Формат стемов (напр. `flac`).
     output_format: String,
+    /// Приёмник `[engine]`-строк (прогресс/сводка драйвера). По умолчанию —
+    /// `eprintln!` (CLI-поведение); TUI подставляет канал событий.
+    on_stderr: StderrSink,
+    /// Слот текущего процесса драйвера: форс-kill забирает `Child` из слота,
+    /// ожидание это видит и завершается ошибкой «движок убит».
+    current: Arc<Mutex<Option<Child>>>,
+}
+
+impl std::fmt::Debug for EngineRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineRunner")
+            .field("python", &self.python)
+            .field("driver", &self.driver)
+            .field("model_checkpoint", &self.model_checkpoint)
+            .field("output_format", &self.output_format)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Интервал опроса потомка в ожидании (kill-совместимое ожидание).
+const CHILD_POLL: Duration = Duration::from_millis(50);
+
+/// Блокировка без отравления: паника предыдущего владельца не должна ломать
+/// доступ к слоту процесса (данные консистентны — просто guard брошен).
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl EngineRunner {
@@ -180,6 +215,35 @@ impl EngineRunner {
             driver: driver_script.to_path_buf(),
             model_checkpoint: model_checkpoint.to_string(),
             output_format: output_format.to_string(),
+            on_stderr: Arc::new(|line| eprintln!("{line}")),
+            current: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Builder: подменяет приёмник `[engine]`-строк (CLI оставляет дефолт —
+    /// терминал; TUI шлёт строки в общий канал событий).
+    pub fn on_stderr(mut self, sink: Box<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.on_stderr = Arc::from(sink);
+        self
+    }
+
+    /// Останавливает текущий процесс драйвера, если он запущен (форс-отмена).
+    /// `Child` забирается из слота — поллер ожидания видит пустой слот и
+    /// возвращает «движок убит». Текущий файл останется без rename — resume.
+    pub fn kill_current_engine(&self) {
+        let child = lock(&self.current).take();
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// `[engine]`-строки события (формат прежнего CLI-вывода).
+    fn stderr_line(event: &EngineEvent) -> Option<String> {
+        match event {
+            EngineEvent::Progress { file, stage, pct } => Some(format!("[engine] {file}: {stage} {pct:.1}%")),
+            EngineEvent::BatchDone { ok, failed } => Some(format!("[engine] batch done: ok={ok} failed={failed}")),
+            EngineEvent::FileDone { .. } | EngineEvent::FileError { .. } => None,
         }
     }
 
@@ -199,6 +263,35 @@ impl EngineRunner {
             .stderr(Stdio::piped());
         cmd
     }
+
+    /// Ожидание потомка c проверкой kill-слота: пустой слот = движок убит.
+    /// Guard не держится между опросами — kill никогда не блокируется.
+    fn wait_cancellable(&self, file: &Path) -> Result<ExitStatus, AppError> {
+        loop {
+            {
+                let mut guard = lock(&self.current);
+                match guard.as_mut() {
+                    Some(child) => {
+                        let status = child.try_wait().map_err(|err| AppError::Io {
+                            path: self.python.clone(),
+                            source: err,
+                        })?;
+                        if let Some(status) = status {
+                            return Ok(status);
+                        }
+                    }
+                    None => {
+                        return Err(AppError::Engine {
+                            file: file.to_path_buf(),
+                            exit_code: None,
+                            stderr_tail: "engine killed by user (current file left without rename)".to_string(),
+                        });
+                    }
+                }
+            }
+            std::thread::sleep(CHILD_POLL);
+        }
+    }
 }
 
 impl EngineOps for EngineRunner {
@@ -211,7 +304,7 @@ impl EngineOps for EngineRunner {
         if files.is_empty() {
             return Ok(());
         }
-        let mut child = self
+        let child = self
             .build_command(files, output_dir)
             .spawn()
             .map_err(|err| AppError::Engine {
@@ -219,12 +312,34 @@ impl EngineOps for EngineRunner {
                 exit_code: None,
                 stderr_tail: format!("spawn failed: {err}"),
             })?;
-        let stderr_tail = read_stderr(child.stderr.take());
-        let saw_summary = relay_stdout(child.stdout.take(), &files[0], on_event)?;
-        let status = child
-            .wait()
-            .map_err(|err| AppError::Io { path: self.python.clone(), source: err })?;
+        *lock(&self.current) = Some(child);
+
+        let sink = Arc::clone(&self.on_stderr);
+        let mut tee = |event: EngineEvent| {
+            if let Some(line) = Self::stderr_line(&event) {
+                sink(&line);
+            }
+            on_event(event);
+        };
+
+        // Захват пайпов под коротким guard'ом; сам guard НЕ держится во время
+        // чтения stdout — иначе kill_current_engine заблокируется до конца батча.
+        let (stdout, stderr) = {
+            let mut guard = lock(&self.current);
+            let child = guard
+                .as_mut()
+                .ok_or_else(|| AppError::Pipeline("engine process slot lost".to_string()))?;
+            (child.stdout.take(), child.stderr.take())
+        };
+        let stderr_tail = read_stderr(stderr);
+        let saw_summary = relay_stdout(stdout, &files[0], &mut tee)?;
+
+        let status = self.wait_cancellable(&files[0])?;
         evaluate_exit(status, saw_summary, stderr_tail, &files[0])
+    }
+
+    fn kill_current_engine(&self) {
+        EngineRunner::kill_current_engine(self);
     }
 }
 
@@ -524,8 +639,9 @@ impl<'a> Pipeline<'a> {
     /// (spawn/крах), если движок отчитался ею.
     fn run_engine(&self, files: &[PathBuf], done: &mut HashMap<String, FileResult>) -> Option<String> {
         let mut on_event = |event: EngineEvent| match event {
-            EngineEvent::Progress { file, stage, pct } => eprintln!("[engine] {file}: {stage} {pct:.1}%"),
-            EngineEvent::BatchDone { ok, failed } => eprintln!("[engine] batch done: ok={ok} failed={failed}"),
+            // `[engine]`-строки печатает сам EngineRunner (stderr-sink):
+            // CLI — в терминал, TUI — в общий канал событий (таб Log).
+            EngineEvent::Progress { .. } | EngineEvent::BatchDone { .. } => {}
             EngineEvent::FileDone { file, stems, .. } => {
                 let result = self.finalize_separated(&file, &stems);
                 done.insert(file, result);
@@ -1234,6 +1350,85 @@ mod tests {
                 "--files",
                 "/tmp/a.wav",
             ]
+        );
+    }
+
+    /// Fake-venv: `bin/python` — shell-скрипт, изображающий драйвер.
+    fn fake_venv(venv: &Path, body: &str) {
+        let bin = venv.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let python = bin.join("python");
+        fs::write(&python, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn stderr_sink_receives_engine_lines_and_events_are_forwarded() {
+        let dir = temp_dir("stderr_sink");
+        fake_venv(
+            &dir.join("venv"),
+            "echo '{\"event\":\"progress\",\"file\":\"a.wav\",\"stage\":\"separate\",\"pct\":42.5}'\n\
+             echo '{\"event\":\"batch_done\",\"ok\":1,\"failed\":0}'",
+        );
+        let driver = dir.join("driver.py");
+        fs::write(&driver, "").unwrap();
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        let runner = EngineRunner::new(&dir.join("venv"), &driver, "m", "flac")
+            .on_stderr(Box::new(move |line: &str| captured.lock().unwrap().push(line.to_string())));
+
+        let mut forwarded = Vec::new();
+        runner
+            .separate_batch(&[dir.join("a.wav")], &work, &mut |e| forwarded.push(e))
+            .unwrap();
+
+        assert_eq!(
+            *lines.lock().unwrap(),
+            [
+                "[engine] a.wav: separate 42.5%".to_string(),
+                "[engine] batch done: ok=1 failed=0".to_string(),
+            ],
+            "[engine]-строки идут в sink, а не в stderr"
+        );
+        assert_eq!(
+            forwarded,
+            [
+                EngineEvent::Progress { file: "a.wav".to_string(), stage: "separate".to_string(), pct: 42.5 },
+                EngineEvent::BatchDone { ok: 1, failed: 0 },
+            ],
+            "события протокола форвардятся без изменений"
+        );
+    }
+
+    #[test]
+    fn kill_current_engine_unblocks_running_batch_quickly() {
+        let dir = temp_dir("kill");
+        fake_venv(&dir.join("venv"), "sleep 30 >/dev/null"); // «зависший» драйвер — только kill
+        let driver = dir.join("driver.py");
+        fs::write(&driver, "").unwrap();
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        let runner = EngineRunner::new(&dir.join("venv"), &driver, "m", "flac");
+        let killer_runner = runner.clone();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            killer_runner.kill_current_engine(); // как RunnerHandle::force_kill
+        });
+
+        let started = Instant::now();
+        let result = runner.separate_batch(&[dir.join("a.wav")], &work, &mut |_| {});
+        killer.join().unwrap();
+
+        let err = result.expect_err("убитый движок = батчевая ошибка");
+        assert!(err.to_string().contains("engine killed"), "неожиданная ошибка: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "форс-kill обязан прервать ожидание быстро, а не через 30 c"
         );
     }
 

@@ -140,6 +140,12 @@ pub enum AppEvent {
     FileFailed { name: String, error: String },
     /// Файл — дубль: снят с обработки, будет обработан хранитель.
     FileDuplicate { name: String },
+    /// Движку известны дубли текущего батча (после download, до separate):
+    /// строки-файлы помечаются дублями сразу — без «мёртвой» стадии download.
+    DuplicatesKnown { names: Vec<String> },
+    /// Строка stderr движка (`[engine] …`): в TUI идёт только в таб Log,
+    /// терминал не засоряет.
+    EngineLog { line: String },
     /// Прогон завершён: авторитетная сверка статусов и переход в Finished.
     BatchFinished { outcome: BatchOutcome },
     /// Огибающая файла посчитана (после download, ровно 1 раз на файл);

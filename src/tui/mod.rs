@@ -54,7 +54,7 @@ use crate::tui::event::{spawn_input_thread, AppEvent, BatchOutcome, RunSpec, Sta
 use crate::tui::gpu::GpuEvent;
 use crate::tui::persist::TuiSettings;
 use crate::tui::runner::{RunnerHandle, RunnerOptions};
-use crate::tui::widgets::{FileBadge, FileRowView, FooterView, HeaderView, ScreenView};
+use crate::tui::widgets::{CurrentFileView, FileBadge, FileRowView, FooterView, HeaderView, ScreenView};
 
 use app::{App, FileOutcome, FileView, State};
 
@@ -125,10 +125,14 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
             },
             _ = tick.tick() => app.handle(&AppEvent::Tick),
         }
-        // Попап открыт только что перешедшему в Config: преффилл из пресета.
+        // Попап открыт только что перешедшему в Config: преффилл из пресета,
+        // плюс путь из paste вне попапа (Remote dir + фокус на нём).
         if app.state() == State::Config && !popup_open {
             popup_open = true;
             app.open_config(persist::load());
+            if let Some(dir) = app.take_paste_prefill() {
+                app.prefill_remote_dir(&dir);
+            }
         }
         if app.state() != State::Config {
             popup_open = false;
@@ -141,8 +145,12 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
             }
         }
         sync_run_controls(&mut app, run.as_ref());
-        if let Some(spec) = app.take_start_request() {
-            spawn_validation(spec, tx_events.clone());
+        // Старт-страж: запрос старта учитывается только вне прогона
+        // (App::on_key уже не пускает 's'/Enter в Running — двойная защита).
+        if app.state() == State::Config {
+            if let Some(spec) = app.take_start_request() {
+                spawn_validation(spec, tx_events.clone());
+            }
         }
         quit |= app.should_quit();
     }
@@ -210,6 +218,11 @@ fn event_log_messages(event: &AppEvent) -> Vec<String> {
         AppEvent::FileDone { name } => vec![format!("{name}: готово")],
         AppEvent::FileFailed { name, error } => vec![format!("ОШИБКА: {name}: {error}")],
         AppEvent::FileDuplicate { name } => vec![format!("{name}: дубль (снят с обработки)")],
+        AppEvent::DuplicatesKnown { names } => {
+            vec![format!("дубли распознаны до разделения: {}", names.join(", "))]
+        }
+        // Строки `[engine]` (прогресс/сводка драйвера) — как есть в таб Log.
+        AppEvent::EngineLog { line } => vec![line.clone()],
         AppEvent::BatchFinished { outcome } => batch_log_messages(outcome),
         _ => Vec::new(),
     }
@@ -249,6 +262,11 @@ fn sync_run_controls(app: &mut App, run: Option<&ActiveRun>) {
     if app.cancel_requested() {
         active.handle.cancel();
     }
+    // Форс-отмена: убить subprocess движка немедленно (текущий файл без
+    // rename — resume); раннер завершится ошибкой, finish не зависнет.
+    if app.take_force_kill() {
+        active.handle.force_kill();
+    }
     active.handle.set_pause(app.paused().then_some(PAUSE_WHEN_PAUSED));
     for name in app.take_retry_requests() {
         active.handle.request_retry(name);
@@ -263,12 +281,15 @@ fn start_run(spec: RunSpec, tx_events: UnboundedSender<AppEvent>, tx_gpu: Unboun
     } else {
         Arc::new(SmbClient::new(spec.host.clone(), spec.share.clone(), None))
     };
-    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(EngineRunner::new(
-        &venv_path(),
-        &driver_script(),
-        spec.model.checkpoint(),
-        OUTPUT_FORMAT,
-    ));
+    let tx_engine_log = tx_events.clone();
+    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(
+        EngineRunner::new(&venv_path(), &driver_script(), spec.model.checkpoint(), OUTPUT_FORMAT)
+            // Строки stderr драйвера — в общий канал событий: только таб Log,
+            // терминал TUI не засоряется (A: STDERR-ЛИК).
+            .on_stderr(Box::new(move |line: &str| {
+                let _ = tx_engine_log.send(AppEvent::EngineLog { line: line.to_string() });
+            })),
+    );
     let deps = runner::RunnerDeps { smb, engine };
     let opts = RunnerOptions {
         remote_dir: spec.remote_dir.clone(),
@@ -468,10 +489,11 @@ fn screen_view(app: &App) -> ScreenView {
     let log_filter_input = app
         .log_filter_input()
         .map(|field| (field.as_str().to_string(), field.cursor()));
+    let tick = app.tick_count();
     ScreenView {
         header: header_view(app),
         tab: app.active_tab(),
-        files: app.files().iter().map(file_row_view).collect(),
+        files: app.files().iter().map(|view| file_row_view(view, tick)).collect(),
         selected: (!app.files().is_empty()).then_some(app.selected_index()),
         // Details-панель — отдельный этап (таб Files, полный режим).
         details: None,
@@ -480,13 +502,37 @@ fn screen_view(app: &App) -> ScreenView {
         dedup_unparseable,
         log: app.log().clone(),
         log_filter_input,
+        banner: cancel_banner(app),
+        current: current_file_view(app),
     }
 }
 
-/// Шапка: подключение/дир/модель из открытого конфига, GPU-слот из поллера.
+/// Баннер мягкой отмены: живёт, пока движок доигрывает текущий файл.
+fn cancel_banner(app: &App) -> Option<String> {
+    app.cancelling().then(|| "Прерывание… текущий файл доигрывается (форс: Enter ещё раз)".to_string())
+}
+
+/// Индикатор текущего файла: первый файл без терминального исхода в Running.
+fn current_file_view(app: &App) -> Option<CurrentFileView> {
+    if app.state() != State::Running {
+        return None;
+    }
+    let view = app.files().iter().find(|file| file.outcome.is_none())?;
+    Some(CurrentFileView {
+        name: view.name.clone(),
+        stage: stage_label(view.stage).to_string(),
+        pct: view.pct,
+        phase: app.tick_count(),
+        stage_elapsed: view.stage_started.map_or(0.0, |started| started.elapsed().as_secs_f64()),
+    })
+}
+
+/// Шапка: подключение/дир/модель из открытого конфига, GPU-слот из поллера,
+/// индикатор загрузки модели — глобальный.
 fn header_view(app: &App) -> HeaderView {
+    let model_pct = app.model_pct();
     let Some(cfg) = app.config() else {
-        return HeaderView { gpu: app.gpu().cloned(), ..HeaderView::default() };
+        return HeaderView { gpu: app.gpu().cloned(), model_pct, ..HeaderView::default() };
     };
     HeaderView {
         host: cfg.host.as_str().to_string(),
@@ -494,6 +540,7 @@ fn header_view(app: &App) -> HeaderView {
         remote_dir: cfg.remote_dir.as_str().to_string(),
         model: model_label(cfg.model).to_string(),
         gpu: app.gpu().cloned(),
+        model_pct,
     }
 }
 
@@ -502,14 +549,30 @@ fn model_label(model: Model) -> &'static str {
     persist::model_label(model)
 }
 
-/// Строка таблицы из модели прогона: бейдж по исходу, стадия текстом.
-fn file_row_view(view: &FileView) -> FileRowView {
+/// Строка таблицы из модели прогона: бейдж и стадия по исходу (терминальные
+/// строки без «мёртвой» стадии), таймер стадии, индeterminate-бар.
+fn file_row_view(view: &FileView, tick: u64) -> FileRowView {
+    let terminal = view.outcome.is_some();
+    let stage = view
+        .outcome
+        .as_ref()
+        .map_or_else(|| stage_label(view.stage), stage_label_of_outcome);
+    let stage_elapsed = if terminal {
+        None
+    } else {
+        view.stage_started.map(|started| started.elapsed().as_secs_f64())
+    };
+    // Стадии без процента (download/upload/rename) — анимированный бар.
+    let moving = matches!(view.stage, Stage::Download | Stage::Upload | Stage::Rename);
+    let indeterminate = (!terminal && view.pct.is_none() && moving).then_some(tick);
     FileRowView {
         badge: file_badge(view),
         name: view.name.clone(),
-        stage: stage_label(view.stage).to_string(),
+        stage: stage.to_string(),
         pct: view.pct.unwrap_or(0.0),
         stems_done: 0,
+        stage_elapsed,
+        indeterminate,
     }
 }
 
@@ -535,7 +598,20 @@ fn stage_label(stage: Stage) -> &'static str {
     }
 }
 
-/// Сводка footer: счётчики исходов; после завершения — длительность,
+/// Метка стадии по терминальному исходу: строки не «зависают» на последней
+/// стадии (дубль больше не выглядит как «download 0%»).
+fn stage_label_of_outcome(outcome: &FileOutcome) -> &'static str {
+    match outcome {
+        FileOutcome::Ok => "готово",
+        FileOutcome::Failed { .. } => "ошибка",
+        FileOutcome::Duplicate { .. } => "дубль",
+        FileOutcome::Skipped { .. } => "скип",
+    }
+}
+
+/// Сводка footer: глобальная полоса прогона — файлы done/total, счётчики
+/// исходов, общий elapsed и ETA (среднее по завершённым × остаток;
+/// до первого завершённого — «--»). После завершения ETA скрыт,
 /// при батчевой ошибке прогона — её текст.
 fn footer_summary(app: &App) -> String {
     if let Some(error) = app.run_error() {
@@ -555,9 +631,24 @@ fn footer_summary(app: &App) -> String {
         }
     }
     let [ok, fail, dup, skip] = counts;
-    let mut summary = format!("OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}");
-    if let Some(outcome) = app.outcome() {
-        summary.push_str(&format!(" · {}", widgets::format_mmss(outcome.elapsed.as_secs_f64())));
+    let done = ok + fail + dup + skip;
+    let total = app.files().len();
+    // Idle без истории: пустая сводка — место в footer отдано подсказкам.
+    if total == 0 && app.outcome().is_none() {
+        return String::new();
+    }
+    let mut summary = format!("файлы {done}/{total} · OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}");
+    match app.outcome() {
+        Some(outcome) => {
+            // Завершённый прогон: авторитетная длительность, ETA не нужен.
+            summary.push_str(&format!(" · {}", widgets::format_mmss(outcome.elapsed.as_secs_f64())));
+        }
+        None => {
+            let elapsed = app.run_started_at().map_or(0.0, |started| started.elapsed().as_secs_f64());
+            let eta = widgets::eta_secs(elapsed, done, total)
+                .map_or_else(|| "--".to_string(), widgets::format_mmss);
+            summary.push_str(&format!(" · {} · ETA {eta}", widgets::format_mmss(elapsed)));
+        }
     }
     summary
 }
@@ -659,6 +750,99 @@ mod tests {
             pending: ["a.wav".to_string()].into_iter().collect(),
             ..PlanSummary::default()
         }
+    }
+
+    // --- багфикс-волна: живой цикл отмены, инфографика, журнал движка ---
+
+    #[test]
+    fn mouse_clicks_work_while_cancelling() {
+        let mut app = running_app();
+        app.handle(&key(crossterm::event::KeyCode::Esc));
+        app.handle(&key(crossterm::event::KeyCode::Enter));
+        assert!(app.cancelling());
+
+        handle_mouse(&mut app, click_up(30, 3), SCREEN);
+
+        assert_eq!(app.active_tab(), widgets::Tab::Dedup, "клики живут в Cancelling");
+    }
+
+    #[test]
+    fn cancelling_screen_shows_banner() {
+        let mut app = running_app();
+        app.handle(&key(crossterm::event::KeyCode::Esc));
+        app.handle(&key(crossterm::event::KeyCode::Enter));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("Прерывание…"), "баннер мягкой отмены");
+    }
+
+    #[test]
+    fn running_screen_shows_current_file_indicator() {
+        let mut app = running_app();
+        app.handle(&AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Download });
+        app.handle(&AppEvent::Tick);
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("▶"), "спиннер текущего файла");
+        assert!(text.contains("a.wav"));
+        assert!(text.contains("download · "), "тикающий таймер стадии");
+        assert!(text.contains("··"), "download без процента — индeterminate-бар");
+    }
+
+    #[test]
+    fn footer_shows_global_progress_with_eta_placeholder() {
+        let app = running_app();
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("файлы 0/1"), "глобальный счётчик");
+        assert!(text.contains("ETA --"), "до первого завершённого ETA нет");
+    }
+
+    #[test]
+    fn footer_eta_computed_from_completed_files() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
+        feed(&mut app, AppEvent::FileDone { name: "a.wav".into() });
+        // run_started_at только что — elapsed ≈ 0, но ETA уже не «--».
+        let text = render(100, 30, &app);
+        assert!(text.contains("файлы 1/3"));
+        assert!(!text.contains("ETA --"), "после первого файла ETA есть");
+    }
+
+    #[test]
+    fn engine_log_lines_land_in_log_tab_and_leave_state_alone() {
+        let mut app = App::new();
+
+        apply_event(&mut app, &AppEvent::EngineLog { line: "[engine] tmp/a.wav: load 3.0%".into() });
+
+        assert!(app.log().visible().iter().any(|entry| entry.message.contains("[engine] tmp/a.wav: load 3.0%")));
+        assert_eq!(app.state(), State::Idle, "строки движка не меняют состояние");
+    }
+
+    #[test]
+    fn run_started_replaces_rows_of_previous_series() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
+        feed(&mut app, AppEvent::BatchFinished { outcome: outcome_with_dedup() });
+
+        feed(&mut app, AppEvent::RunStarted { plan: plan_fixture() });
+
+        let names: Vec<&str> = app.files().iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["a.wav"], "новая серия заменяет строки, а не дописывает");
+    }
+
+    #[test]
+    fn duplicate_rows_are_seeded_from_prefix_dups_without_dead_stage() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
+
+        // seeded из skipped_duplicate: см. app::run_started_seeds_files —
+        // здесь проверяем рендер: DUP-строка без стадии download.
+        let text = render(100, 30, &app);
+        assert!(!text.contains("download  0%"), "мёртвых «download 0%» нет");
     }
 
     // --- рендеры ------------------------------------------------------------
@@ -968,7 +1152,8 @@ mod tests {
         assert!(text.contains("[1–4]/Tab"), "навигация табов");
         assert!(text.contains("PgUp/PgDn"), "прокрутка журнала");
         assert!(text.contains("зарезервировано"), "m/o помечены");
-        assert!(text.contains("нет файлов"), "фон (таблица Files) жив под оверлеем");
+        // Рамка таблицы Files видна в левом поле попапа — фон жив под оверлеем.
+        assert!(text.contains("FILES"), "фон (таблица Files) жив под оверлеем");
     }
 
     #[test]
@@ -1050,8 +1235,8 @@ mod tests {
         let mut app = App::new();
         feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
 
-        // Контент с y=4; строка таблицы 0 — с y=6 (рамка+заголовок).
-        handle_mouse(&mut app, click_up(10, 7), SCREEN);
+        // Контент с y=5 (статус-строка); строка таблицы 0 — с y=7 (рамка+заголовок).
+        handle_mouse(&mut app, click_up(10, 8), SCREEN);
 
         assert_eq!(app.selected_index(), 1, "клик по второй строке таблицы");
         assert_eq!(app.selected_file().map(|file| file.name.as_str()), Some("b.wav"));

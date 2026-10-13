@@ -9,7 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::AppError;
@@ -123,6 +124,9 @@ impl SmbOps for MockSmb {
 /// Движок-мок: проигрывает сценарные события; для `FileDone` создаёт файлы
 /// стемов на диске (как реальный драйвер). `delay_before` — пауза до
 /// проигрывания (окно для cancel-теста на границе upload).
+/// Интервал проверяемого сна мока: kill прерывает задержку порциями.
+const MOCK_SLEEP_SLICE: Duration = Duration::from_millis(10);
+
 pub(crate) struct MockEngine {
     events: Vec<EngineEvent>,
     fail: bool,
@@ -130,6 +134,10 @@ pub(crate) struct MockEngine {
     /// Файлы, отказ которых эмулируется ОДИН раз (первый вызов), для retry.
     fail_file_once: Mutex<HashSet<String>>,
     calls: Mutex<Vec<Vec<PathBuf>>>,
+    /// Форс-kill: прерывает задержку/работу separate_batch.
+    kill_flag: Arc<AtomicBool>,
+    /// Признак «батч движка стартовал» — окно для тестового kill.
+    started: Arc<AtomicBool>,
 }
 
 impl MockEngine {
@@ -140,6 +148,8 @@ impl MockEngine {
             delay_before: None,
             fail_file_once: Mutex::new(HashSet::new()),
             calls: Mutex::new(Vec::new()),
+            kill_flag: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -157,9 +167,37 @@ impl MockEngine {
     pub(crate) fn called_batches(&self) -> Vec<Vec<PathBuf>> {
         self.calls.lock().expect("lock").clone()
     }
+
+    /// Клон kill-флага: тест «дёргает» его из другого потока и ассертит.
+    pub(crate) fn kill_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.kill_flag)
+    }
+
+    /// Батч движка уже стартовал (окно для форс-kill в тесте).
+    pub(crate) fn started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
+    }
+
+    /// Сон порциями с проверкой kill: форс-отмена не ждёт конца задержки.
+    fn interruptible_sleep(&self, delay: Duration) -> bool {
+        let mut slept = Duration::ZERO;
+        while slept < delay {
+            if self.kill_flag.load(Ordering::Relaxed) {
+                return false;
+            }
+            let slice = MOCK_SLEEP_SLICE.min(delay - slept);
+            std::thread::sleep(slice);
+            slept += slice;
+        }
+        !self.kill_flag.load(Ordering::Relaxed)
+    }
 }
 
 impl EngineOps for MockEngine {
+    fn kill_current_engine(&self) {
+        self.kill_flag.store(true, Ordering::Relaxed);
+    }
+
     fn separate_batch(
         &self,
         files: &[PathBuf],
@@ -174,8 +212,15 @@ impl EngineOps for MockEngine {
                 stderr_tail: "spawn failed: forced".to_string(),
             });
         }
+        self.started.store(true, Ordering::Relaxed);
         if let Some(delay) = self.delay_before {
-            std::thread::sleep(delay);
+            if !self.interruptible_sleep(delay) {
+                return Err(AppError::Engine {
+                    file: files.first().cloned().unwrap_or_default(),
+                    exit_code: None,
+                    stderr_tail: "engine killed by user".to_string(),
+                });
+            }
         }
         for event in &self.events {
             if let EngineEvent::FileDone { file, stems, .. } = event {
