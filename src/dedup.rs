@@ -227,6 +227,8 @@ pub struct DuplicateMatch {
     pub kept: usize,
     /// Метрики сравнения пары (хранитель, дубль).
     pub verdict: PairVerdict,
+    /// Почему хранитель выбран (для TUI/отчёта).
+    pub reason: KeeperReason,
 }
 
 /// Итог разбора группы кандидатов: кто движку, кто дубль.
@@ -659,6 +661,7 @@ pub fn resolve_group(analyses: &[FileAnalysis]) -> GroupResolution {
                 duplicate: dup,
                 kept,
                 verdict: compare_pair(&analyses[kept], &analyses[dup]),
+                reason: choice.reason.clone(),
             });
         }
     }
@@ -708,6 +711,8 @@ pub struct PairReport {
     pub renamed: bool,
     /// Текст ошибки rename (если переименование не удалось).
     pub rename_error: Option<String>,
+    /// Причина выбора хранителя в этой паре.
+    pub reason: KeeperReason,
 }
 
 /// Сводка стадии дедупликации для отчёта.

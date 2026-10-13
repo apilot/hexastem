@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::dedup::{self, DedupSummary, FileAnalysis, PairReport, PairVerdict};
+use crate::dedup::{self, DedupSummary, FileAnalysis, KeeperReason, PairReport, PairVerdict};
 use crate::error::AppError;
 use crate::smb::{SmbClient, SmbEntry};
 
@@ -615,6 +615,8 @@ struct PendingDup {
     kept: String,
     /// Метрики сравнения пары (хранитель, дубль) — для отчёта.
     verdict: PairVerdict,
+    /// Причина выбора хранителя — для отчёта/TUI.
+    reason: KeeperReason,
 }
 
 /// Исход стадии дедупликации внутри батча.
@@ -692,6 +694,7 @@ impl<'a> Pipeline<'a> {
                     dup_clipping: dup.verdict.clip_b.is_clipping(),
                     renamed,
                     rename_error,
+                    reason: dup.reason.clone(),
                 }
             })
             .collect()
@@ -747,6 +750,7 @@ fn resolve_duplicates(
                 duplicate: downloaded[dup_i].name.clone(),
                 kept: downloaded[kept_i].name.clone(),
                 verdict: matched.verdict,
+                reason: matched.reason,
             });
         }
     }

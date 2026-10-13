@@ -393,6 +393,7 @@ mod tests {
             selected: None,
             details: None,
             footer: FooterView { summary: String::new() },
+            ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal

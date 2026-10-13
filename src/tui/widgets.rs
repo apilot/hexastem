@@ -15,7 +15,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
+use crate::dedup::{KeeperReason, PairReport};
 use crate::pipeline::EXPECTED_STEM_COUNT;
+use crate::tui::log::{LogBuffer, LogEntry};
 
 // --- глифы и геометрия ----------------------------------------------------------
 
@@ -237,6 +239,14 @@ pub struct ScreenView {
     pub details: Option<DetailsView>,
     /// Footer.
     pub footer: FooterView,
+    /// Пары дедупликации последнего прогона (таб Dedup).
+    pub dedup_pairs: Vec<PairReport>,
+    /// Файлы с нечитаемым заголовком (таб Dedup, примечание).
+    pub dedup_unparseable: Vec<String>,
+    /// Журнал событий (таб Log).
+    pub log: LogBuffer,
+    /// Режим ввода фильтра журнала: текст и позиция курсора в символах.
+    pub log_filter_input: Option<(String, usize)>,
 }
 
 /// Прямоугольники зон кадра (рендер и мышь используют одни значения).
@@ -605,17 +615,321 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+// --- табы Dedup / Log / Help и confirm-диалог ------------------------------------
+
+/// Человекочитаемая причина выбора хранителя. Единственный источник текста:
+/// используют таблица Dedup и журнал (mod.rs).
+pub fn keeper_reason_label(reason: &KeeperReason) -> String {
+    match reason {
+        KeeperReason::SoleCandidate => "единственный кандидат".to_string(),
+        KeeperReason::OnlyNonClipped => "без клипа".to_string(),
+        KeeperReason::CleanerDynamics { margin_db } => format!("динамичнее на {margin_db:.1} дБ"),
+        KeeperReason::Louder { margin_db } => format!("громче на {margin_db:.1} дБ"),
+        KeeperReason::AllClipped { margin_db } => {
+            format!("макс. crest при клипе (+{margin_db:.1} дБ)")
+        }
+    }
+}
+
+/// Corr по окнам: `0.99/1.00/0.99` (tabular-цифры, моноширинный шрифт).
+fn corr_cells(corr: &[f32]) -> String {
+    corr.iter().map(|c| format!("{c:.2}")).collect::<Vec<_>>().join("/")
+}
+
+/// Флаг клипа пары: текст + цвет (`color-not-only`). `K` — хранитель,
+/// `D` — дубль, `KD` — оба, `—` — никто.
+fn clip_flag(kept_clipping: bool, dup_clipping: bool) -> (&'static str, Style) {
+    match (kept_clipping, dup_clipping) {
+        (false, false) => ("—", STYLE_DIM),
+        (true, false) => ("K", Style::new().fg(Color::Red)),
+        (false, true) => ("D", Style::new().fg(Color::Red)),
+        (true, true) => ("KD", Style::new().fg(Color::Red)),
+    }
+}
+
+/// Таблица дедупликации (таб Dedup): пары дубль → хранитель; пустой итог —
+/// заглушка; под таблицей — примечание о нечитаемых WAV.
+pub fn render_dedup(frame: &mut Frame, area: Rect, pairs: &[PairReport], unparseable: &[String]) {
+    let (content, note) = split_dedup_note(area, unparseable);
+    if pairs.is_empty() {
+        render_dedup_empty(frame, content);
+    } else {
+        render_dedup_table(frame, content, pairs);
+    }
+    if let (Some(note_area), false) = (note, unparseable.is_empty()) {
+        let text = format!("! не разобраны как WAV: {}", unparseable.join(", "));
+        frame.render_widget(Paragraph::new(text).style(STYLE_FILL), note_area);
+    }
+}
+
+/// Место под примечание: одна строка внизу, если есть нечитаемые файлы.
+fn split_dedup_note(area: Rect, unparseable: &[String]) -> (Rect, Option<Rect>) {
+    if unparseable.is_empty() {
+        return (area, None);
+    }
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    (rows[0], Some(rows[1]))
+}
+
+fn render_dedup_empty(frame: &mut Frame, area: Rect) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(" Dedup ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(Paragraph::new("дублей не найдено").style(STYLE_DIM), inner);
+}
+
+fn render_dedup_table(frame: &mut Frame, area: Rect, pairs: &[PairReport]) {
+    let header = Row::new(["DUP", "KEPT", "CORR", "GAIN дБ", "CREST дБ", "CLIP", "REN", "REASON"])
+        .style(STYLE_HEADER);
+    let rows: Vec<Row> = pairs.iter().map(dedup_row).collect();
+    let widths = [
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(15),
+        Constraint::Length(7),
+        Constraint::Length(10),
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Min(10),
+    ];
+    frame.render_widget(Table::new(rows, widths).header(header), area);
+}
+
+fn dedup_row(pair: &PairReport) -> Row<'static> {
+    let (clip, clip_style) = clip_flag(pair.kept_clipping, pair.dup_clipping);
+    let (renamed, renamed_style) = if pair.rename_error.is_some() {
+        ("!", Style::new().fg(Color::Red))
+    } else if pair.renamed {
+        ("✓", STYLE_DIM)
+    } else {
+        ("—", STYLE_DIM)
+    };
+    Row::new([
+        Cell::from(pair.duplicate.clone()),
+        Cell::from(pair.kept.clone()),
+        Cell::from(corr_cells(&pair.corr)),
+        Cell::from(format!("{:+.1}", pair.gain_db)),
+        Cell::from(format!("{:.1}/{:.1}", pair.crest_kept_db, pair.crest_dup_db)),
+        Cell::from(Span::styled(clip, clip_style)),
+        Cell::from(Span::styled(renamed, renamed_style)),
+        Cell::from(Span::styled(keeper_reason_label(&pair.reason), STYLE_DIM)),
+    ])
+}
+
+/// Журнал (таб Log): хвост буфера (автоскролл при scroll == 0), прокрутка
+/// вверх, строка статуса/фильтра внизу. Пустой буфер — заглушка.
+pub fn render_log(
+    frame: &mut Frame,
+    area: Rect,
+    log: &LogBuffer,
+    filter_input: Option<&(String, usize)>,
+) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(" Log ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    render_log_lines(frame, rows[0], log);
+    render_log_status(frame, rows[1], log, filter_input);
+}
+
+/// Окно журнала: `scroll` строк от хвоста вверх; 0 — последние строки.
+fn render_log_lines(frame: &mut Frame, area: Rect, log: &LogBuffer) {
+    if log.is_empty() {
+        frame.render_widget(
+            Paragraph::new("журнал пуст — события прогона появятся здесь").style(STYLE_DIM),
+            area,
+        );
+        return;
+    }
+    let visible = log.visible();
+    if visible.is_empty() {
+        frame.render_widget(Paragraph::new("нет записей по фильтру").style(STYLE_DIM), area);
+        return;
+    }
+    let height = area.height as usize;
+    let start = visible.len().saturating_sub(height + log.scroll());
+    let end = (start + height).min(visible.len());
+    let lines: Vec<Line> = visible[start..end].iter().map(|e| log_entry_line(e)).collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Строка журнала: dim-время + текст события.
+fn log_entry_line(entry: &LogEntry) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(entry.time.clone(), STYLE_DIM),
+        Span::raw("  "),
+        Span::raw(entry.message.clone()),
+    ])
+}
+
+/// Нижняя строка таба Log: ввод фильтра → активный фильтр → подсказки.
+fn render_log_status(
+    frame: &mut Frame,
+    area: Rect,
+    log: &LogBuffer,
+    filter_input: Option<&(String, usize)>,
+) {
+    let line = match filter_input {
+        Some((text, cursor)) => filter_input_line(text, *cursor),
+        None => match log.filter() {
+            Some(filter) => Line::from(vec![
+                Span::raw(format!(
+                    "фильтр: \"{filter}\" — {} из {} · ",
+                    log.visible_len(),
+                    log.len()
+                )),
+                Span::styled("f — изменить · c — очистить", STYLE_DIM),
+            ]),
+            None => log_hints_line(log),
+        },
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Ввод фильтра: курсор `▌` вставлен по позиции (unicode-safe).
+fn filter_input_line(text: &str, cursor: usize) -> Line<'static> {
+    let mut value: String = text.chars().take(cursor).collect();
+    value.push('▌');
+    value.extend(text.chars().skip(cursor));
+    Line::from(vec![
+        Span::raw("фильтр: "),
+        Span::styled(value, STYLE_FILL),
+        Span::styled("  Enter — применить · Esc — отмена", STYLE_DIM),
+    ])
+}
+
+fn log_hints_line(log: &LogBuffer) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "f — фильтр · c — очистить · PgUp/PgDn — прокрутка".to_string(),
+        STYLE_DIM,
+    )];
+    if log.scroll() > 0 {
+        spans.push(Span::styled(format!("  ↑{} от хвоста", log.scroll()), STYLE_FILL));
+    }
+    Line::from(spans)
+}
+
+/// Строка справки: клавиша (подсвечена) — действие.
+fn help_line(key: &str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {key:<10}"), STYLE_FILL),
+        Span::raw(" "),
+        Span::raw(desc.to_string()),
+    ])
+}
+
+/// Справка: оверлей со всеми кейбиндами (истина — по коду app.rs/mod.rs:
+/// Tab-навигация, таб Log, confirm выхода, попап запуска).
+pub fn render_help(frame: &mut Frame, area: Rect) {
+    let popup = centered(area, 86, 88);
+    let block = Block::bordered().border_type(BorderType::Rounded).title(" Справка ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return;
+    }
+    let lines = vec![
+        help_line("[1–4]/Tab", "табы: Files, Dedup, Log, Help"),
+        help_line("?", "эта справка (повторно — назад)"),
+        help_line("Enter/s", "настройки прогона (Idle)"),
+        help_line("Enter", "новый цикл (Finished)"),
+        help_line("p", "пауза между файлами (Running)"),
+        help_line("r", "повтор выбранного упавшего файла"),
+        help_line("↑/↓, j/k", "выбор файла в таблице"),
+        help_line("f", "фильтр журнала по подстроке (Log)"),
+        help_line("c", "очистить журнал (Log)"),
+        help_line("PgUp/PgDn", "прокрутка журнала (Log)"),
+        help_line("Enter", "подтвердить в диалогах и попапе"),
+        help_line("Esc", "закрыть попап/справку/диалог"),
+        help_line("q/Esc", "выход; в Running — подтверждение отмены"),
+        help_line("m/o", "модель/отчёт — зарезервировано"),
+        Line::from(Span::styled(
+            " CLIP: K/D — клипует хранитель/дубль · REN: ✓ — переименован",
+            STYLE_DIM,
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Модальный диалог выхода во время прогона (поверх всего кадра).
+pub fn render_confirm(frame: &mut Frame, area: Rect) {
+    let popup = centered(area, 70, 34);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(STYLE_FILL)
+        .title(" Подтверждение ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.is_empty() {
+        return;
+    }
+    let lines = vec![
+        Line::from("Прервать прогон и выйти?"),
+        Line::from(String::new()),
+        Line::from(Span::styled("Отмена применяется на границе файлов:", STYLE_FILL)),
+        Line::from(Span::styled("текущий файл будет доигран раннером.", STYLE_FILL)),
+        Line::from(String::new()),
+        Line::from(vec![
+            Span::styled("Enter", STYLE_FILL),
+            Span::raw(" — прервать и выйти · "),
+            Span::styled("Esc", STYLE_FILL),
+            Span::raw(" — остаться"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Центрированный прямоугольник в процентах от площади (паттерн popup.rs).
+fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let side_y = (100 - percent_y) / 2;
+    let side_x = (100 - percent_x) / 2;
+    let rows = Layout::vertical([
+        Constraint::Percentage(side_y),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage(side_y),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage(side_x),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage(side_x),
+    ])
+    .split(rows[1])[1]
+}
+
 // --- композиция кадра и карта для мыши ------------------------------------------
 
-/// Полный кадр: шапка → табы → FILES (+DETAILS) → footer.
+/// Полный кадр: шапка → табы → контент активного таба → footer.
 pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView) {
     let zones = compute_zones(area);
     render_header(frame, zones.header, &view.header);
     render_tab_bar(frame, zones.tabs, view.tab);
+    match view.tab {
+        Tab::Files => render_files_tab(frame, zones, view),
+        Tab::Dedup => {
+            render_dedup(frame, zones.content, &view.dedup_pairs, &view.dedup_unparseable);
+        }
+        Tab::Log => render_log(frame, zones.content, &view.log, view.log_filter_input.as_ref()),
+        // Фон — таблица файлов, справка поверх.
+        Tab::Help => {
+            render_files_tab(frame, zones, view);
+            render_help(frame, zones.content);
+        }
+    }
+    render_footer(frame, zones.footer, &view.footer);
+}
+
+/// Классический вид таба Files: таблица + DETAILS в полном режиме.
+fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView) {
     let (files_area, details_area) = content_split(zones.content, view.details.is_some());
     render_files(frame, files_area, &view.files, view.selected);
     render_details_or_empty(frame, details_area, view.details.as_ref());
-    render_footer(frame, zones.footer, &view.footer);
 }
 
 /// Зоны кадра: шапка 3, табы 1, контент Min(1), footer 1.
@@ -1044,6 +1358,7 @@ mod tests {
             selected: Some(0),
             details,
             footer: FooterView { summary: "ETA 04:12".into() },
+            ..Default::default()
         }
     }
 
@@ -1132,5 +1447,212 @@ mod tests {
         // Нулевой и усечённый размеры не должны паниковать при сборке кадра.
         render_frame(0, 0, |f, area| render_screen(f, area, &view));
         render_frame(10, 2, |f, area| render_screen(f, area, &view));
+    }
+
+    // --- табы Dedup / Log / Help и confirm (seq 05) ------------------------------
+
+    use crate::dedup::KeeperReason;
+    use crate::tui::log::LogBuffer;
+
+    /// Пара дедупликации для таба Dedup (числа из CLI-кейса unknown 2/3).
+    fn dedup_pair() -> PairReport {
+        PairReport {
+            duplicate: "unknown 3.wav".into(),
+            kept: "unknown 2.wav".into(),
+            corr: [0.985, 0.999, 0.991],
+            gain_db: 11.1,
+            crest_kept_db: 28.2,
+            crest_dup_db: 23.0,
+            kept_clipping: false,
+            dup_clipping: false,
+            renamed: true,
+            rename_error: None,
+            reason: KeeperReason::Louder { margin_db: 11.1 },
+        }
+    }
+
+    /// Журнал с двумя записями.
+    fn log_fixture() -> LogBuffer {
+        let mut log = LogBuffer::default();
+        log.push("00:00:01", "download a.wav");
+        log.push("00:00:02", "separate b.wav");
+        log
+    }
+
+    /// Экран с нестандартным табом/данными поверх базовой фикстуры.
+    fn tab_view(tab: Tab, fill: impl FnOnce(&mut ScreenView)) -> ScreenView {
+        let mut view = ScreenView { tab, ..ScreenView::default() };
+        view.header = header_view();
+        view.footer = FooterView { summary: String::new() };
+        fill(&mut view);
+        view
+    }
+
+    #[test]
+    fn keeper_reason_labels_cover_all_variants() {
+        assert_eq!(keeper_reason_label(&KeeperReason::SoleCandidate), "единственный кандидат");
+        assert_eq!(keeper_reason_label(&KeeperReason::OnlyNonClipped), "без клипа");
+        assert_eq!(
+            keeper_reason_label(&KeeperReason::CleanerDynamics { margin_db: 3.25 }),
+            "динамичнее на 3.2 дБ"
+        );
+        assert_eq!(keeper_reason_label(&KeeperReason::Louder { margin_db: 11.1 }), "громче на 11.1 дБ");
+        assert_eq!(
+            keeper_reason_label(&KeeperReason::AllClipped { margin_db: 0.5 }),
+            "макс. crest при клипе (+0.5 дБ)"
+        );
+    }
+
+    #[test]
+    fn corr_cells_format_three_windows() {
+        assert_eq!(corr_cells(&[0.985, 0.999, 0.991]), "0.99/1.00/0.99");
+    }
+
+    #[test]
+    fn dedup_tab_renders_pairs_table() {
+        let view = tab_view(Tab::Dedup, |v| {
+            v.dedup_pairs = vec![dedup_pair()];
+            v.dedup_unparseable = vec!["broken.wav".into()];
+        });
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("DUP"), "заголовок");
+        assert!(text.contains("KEPT"));
+        assert!(text.contains("CORR"));
+        assert!(text.contains("REASON"));
+        assert!(text.contains("unknown 3.wav"), "файл-дубль");
+        assert!(text.contains("unknown 2.wav"), "хранитель");
+        assert!(text.contains("0.99/1.00/0.99"), "corr по окнам");
+        assert!(text.contains("+11.1"), "gain со знаком");
+        assert!(text.contains("28.2/23.0"), "crest пары");
+        assert!(text.contains("✓"), "переименован");
+        assert!(text.contains("громче на 11.1 дБ"), "решение с причиной");
+        assert!(text.contains("не разобраны как WAV: broken.wav"), "примечание");
+    }
+
+    #[test]
+    fn dedup_empty_state_shows_hint() {
+        let view = tab_view(Tab::Dedup, |_| {});
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        assert!(buffer_text(&terminal).contains("дублей не найдено"));
+    }
+
+    #[test]
+    fn dedup_clip_flags_text_and_rename_error() {
+        let mut pair = dedup_pair();
+        pair.kept_clipping = true;
+        pair.dup_clipping = true;
+        pair.rename_error = Some("EACCES".into());
+        let view = tab_view(Tab::Dedup, |v| v.dedup_pairs = vec![pair]);
+
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("KD"), "клипуют оба (текст, не только цвет)");
+        assert!(text.contains("!"), "ошибка rename видна текстом");
+    }
+
+    #[test]
+    fn log_tab_renders_entries_with_timestamps() {
+        let view = tab_view(Tab::Log, |v| v.log = log_fixture());
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Log"), "заголовок");
+        assert!(text.contains("00:00:01"), "timestamp");
+        assert!(text.contains("download a.wav"));
+        assert!(text.contains("separate b.wav"));
+        assert!(text.contains("f — фильтр"), "подсказки");
+    }
+
+    #[test]
+    fn log_empty_state_shows_hint() {
+        let view = tab_view(Tab::Log, |_| {});
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        assert!(buffer_text(&terminal).contains("журнал пуст"));
+    }
+
+    #[test]
+    fn log_filtered_to_nothing_shows_hint() {
+        let view = tab_view(Tab::Log, |v| {
+            v.log = log_fixture();
+            v.log.set_filter(Some("нет-таких".into()));
+        });
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("нет записей по фильтру"));
+        assert!(text.contains("фильтр: \"нет-таких\""));
+    }
+
+    #[test]
+    fn log_filter_input_renders_cursor_in_text() {
+        let view = tab_view(Tab::Log, |v| v.log_filter_input = Some(("do".into(), 1)));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("фильтр:"), "строка ввода");
+        assert!(text.contains("d▌o"), "курсор внутри текста");
+        assert!(text.contains("Enter — применить"));
+    }
+
+    #[test]
+    fn log_window_follows_tail_and_scrolls_up() {
+        let mut log = LogBuffer::default();
+        for i in 0..30 {
+            log.push("00:00:00", format!("msg-{i:02}"));
+        }
+        let mut view = tab_view(Tab::Log, |v| v.log = log.clone());
+
+        let tail = render_frame(80, 24, |f, area| render_screen(f, area, &view));
+        let tail_text = buffer_text(&tail);
+        assert!(tail_text.contains("msg-29"), "автоскролл: хвост виден");
+        assert!(!tail_text.contains("msg-00"), "голова за окном");
+
+        log.scroll_up(100);
+        view.log = log;
+        let head = render_frame(80, 24, |f, area| render_screen(f, area, &view));
+        let head_text = buffer_text(&head);
+        assert!(head_text.contains("msg-00"), "прокрутка вверх: голова видна");
+        assert!(head_text.contains("от хвоста"), "индикатор отступа");
+    }
+
+    #[test]
+    fn help_overlay_renders_all_keybind_groups() {
+        let view = tab_view(Tab::Help, |_| {});
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Справка"));
+        assert!(text.contains("[1–4]/Tab"), "табы");
+        assert!(text.contains("эта справка"), "?");
+        assert!(text.contains("настройки прогона"), "Enter/s");
+        assert!(text.contains("пауза"), "p");
+        assert!(text.contains("повтор"), "r");
+        assert!(text.contains("фильтр журнала"), "f");
+        assert!(text.contains("очистить журнал"), "c");
+        assert!(text.contains("PgUp/PgDn"), "прокрутка");
+        assert!(text.contains("подтверждение отмены"), "q/Esc в Running");
+        assert!(text.contains("зарезервировано"), "m/o");
+        assert!(text.contains("K/D — клипует"), "легенда CLIP");
+    }
+
+    #[test]
+    fn confirm_renders_warning_and_both_actions() {
+        let terminal = render_frame(100, 30, render_confirm);
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Подтверждение"));
+        assert!(text.contains("Прервать прогон и выйти?"));
+        assert!(text.contains("границе файлов"), "предупреждение");
+        assert!(text.contains("доигран раннером"));
+        assert!(text.contains("Esc — остаться"));
+        assert!(text.contains("Enter — прервать и выйти"));
+    }
+
+    #[test]
+    fn confirm_and_help_survive_degenerate_areas() {
+        render_frame(0, 0, render_confirm);
+        render_frame(2, 2, render_confirm);
+        render_frame(2, 2, render_help);
     }
 }

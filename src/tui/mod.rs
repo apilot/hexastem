@@ -22,6 +22,7 @@
 pub mod app;
 pub mod event;
 pub mod gpu;
+pub mod log;
 pub mod persist;
 pub mod popup;
 pub mod runner;
@@ -46,11 +47,11 @@ use crate::config::Model;
 use crate::local_fs::LocalFs;
 use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
 use crate::smb::SmbClient;
-use crate::tui::event::{spawn_input_thread, AppEvent, RunSpec, Stage};
+use crate::tui::event::{spawn_input_thread, AppEvent, BatchOutcome, RunSpec, Stage};
 use crate::tui::gpu::GpuEvent;
 use crate::tui::persist::TuiSettings;
 use crate::tui::runner::{RunnerHandle, RunnerOptions};
-use crate::tui::widgets::{FileBadge, FileRowView, FooterView, HeaderView, ScreenView, Tab};
+use crate::tui::widgets::{FileBadge, FileRowView, FooterView, HeaderView, ScreenView};
 
 use app::{App, FileOutcome, FileView, State};
 
@@ -153,6 +154,7 @@ fn on_internal_event(
     run: &mut Option<ActiveRun>,
 ) {
     app.handle(&event);
+    log_event(app, &event);
     let AppEvent::ValidationFinished { spec, error: None } = &event else {
         return;
     };
@@ -161,6 +163,64 @@ fn on_internal_event(
     }
     let _ = persist::save(&settings_of_spec(spec));
     *run = Some(start_run(spec.clone(), tx_events.clone(), tx_gpu.clone()));
+}
+
+/// Единая точка журналирования: события пайплайна (стадии/ошибки/итог/дедуп)
+/// дописываются в кольцевой буфер таба Log. GPU-сэмплы и покадровый прогресс
+/// не журналируем (шум).
+fn log_event(app: &mut App, event: &AppEvent) {
+    let time = log::format_hhmmss(log::now_unix_secs());
+    for message in event_log_messages(event) {
+        app.log_mut().push(time.clone(), message);
+    }
+}
+
+/// Сообщения журнала для события (пусто — событие не журналируется).
+fn event_log_messages(event: &AppEvent) -> Vec<String> {
+    match event {
+        AppEvent::RunStarted { plan } => vec![format!(
+            "прогон начат: {} файлов к обработке",
+            plan.pending.len()
+        )],
+        AppEvent::RunFailed { error } => {
+            vec![format!("ОШИБКА: прогон не состоялся: {error}")]
+        }
+        AppEvent::ValidationFinished { error: Some(error), .. } => {
+            vec![format!("ОШИБКА: валидация: {error}")]
+        }
+        AppEvent::FileStage { name, stage } => vec![format!("{name}: {}", stage_label(*stage))],
+        AppEvent::FileDone { name } => vec![format!("{name}: готово")],
+        AppEvent::FileFailed { name, error } => vec![format!("ОШИБКА: {name}: {error}")],
+        AppEvent::FileDuplicate { name } => vec![format!("{name}: дубль (снят с обработки)")],
+        AppEvent::BatchFinished { outcome } => batch_log_messages(outcome),
+        _ => Vec::new(),
+    }
+}
+
+/// Итог батча + решения дедупа с причинами (текст причин — widgets::keeper_reason_label).
+fn batch_log_messages(outcome: &BatchOutcome) -> Vec<String> {
+    let mut messages = vec![format!(
+        "прогон завершён: {} ок, {} ошибок, {} дублей за {}",
+        outcome.ok,
+        outcome.failed,
+        outcome.dedup.pairs.len(),
+        widgets::format_mmss(outcome.elapsed.as_secs_f64())
+    )];
+    for pair in &outcome.dedup.pairs {
+        messages.push(format!(
+            "дубль {} → хранитель {}: {}",
+            pair.duplicate,
+            pair.kept,
+            widgets::keeper_reason_label(&pair.reason)
+        ));
+    }
+    if !outcome.dedup.unparseable.is_empty() {
+        messages.push(format!(
+            "! не разобраны как WAV: {}",
+            outcome.dedup.unparseable.join(", ")
+        ));
+    }
+    messages
 }
 
 /// Управление активным прогоном по флагам App (cancel/pause/retry).
@@ -326,22 +386,38 @@ fn draw(frame: &mut Frame, app: &App) {
             popup::render_popup(frame, area, &popup);
         }
     }
+    // Confirm выхода — поверх всего (и попапа невозможен: Running ≠ Config).
+    if app.confirm_open() {
+        widgets::render_confirm(frame, area);
+    }
 }
 
 fn is_too_small(area: Rect) -> bool {
     area.width < MIN_WIDTH || area.height < MIN_HEIGHT
 }
 
-/// Взгляд на кадр из состояния App (шапка из конфига прогона, таблица,
-/// сводка в footer; Details-панель — этап 05).
+/// Взгляд на кадр из состояния App: шапка из конфига прогона, активный таб
+/// (Files/Dedup/Log/Help), таблица, журнал, сводка в footer.
 fn screen_view(app: &App) -> ScreenView {
+    let (dedup_pairs, dedup_unparseable) = app
+        .outcome()
+        .map(|outcome| (outcome.dedup.pairs.clone(), outcome.dedup.unparseable.clone()))
+        .unwrap_or_default();
+    let log_filter_input = app
+        .log_filter_input()
+        .map(|field| (field.as_str().to_string(), field.cursor()));
     ScreenView {
         header: header_view(app),
-        tab: Tab::Files,
+        tab: app.active_tab(),
         files: app.files().iter().map(file_row_view).collect(),
         selected: (!app.files().is_empty()).then_some(app.selected_index()),
+        // Details-панель — отдельный этап (таб Files, полный режим).
         details: None,
         footer: FooterView { summary: footer_summary(app) },
+        dedup_pairs,
+        dedup_unparseable,
+        log: app.log().clone(),
+        log_filter_input,
     }
 }
 
@@ -465,6 +541,55 @@ mod tests {
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::empty(),
         ))
+    }
+
+    /// Нажатие клавиши без модификаторов.
+    fn key(code: crossterm::event::KeyCode) -> AppEvent {
+        AppEvent::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+    }
+
+    /// Событие через ту же пару вызовов, что и в event loop
+    /// (on_internal_event): обновить App + дописать журнал.
+    fn feed(app: &mut App, event: AppEvent) {
+        app.handle(&event);
+        log_event(app, &event);
+    }
+
+    /// Запущенный прогон (Running, план из plan_fixture).
+    fn running_app() -> App {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_fixture() });
+        app
+    }
+
+    /// Итог с одной парой дедупликации (для таба Dedup и журнала).
+    fn outcome_with_dedup() -> BatchOutcome {
+        BatchOutcome {
+            total: 2,
+            ok: 1,
+            failed: 0,
+            results: Vec::new(),
+            dedup: crate::dedup::DedupSummary {
+                pairs: vec![crate::dedup::PairReport {
+                    duplicate: "unknown 3.wav".into(),
+                    kept: "unknown 2.wav".into(),
+                    corr: [0.985, 0.999, 0.991],
+                    gain_db: 11.1,
+                    crest_kept_db: 28.2,
+                    crest_dup_db: 23.0,
+                    kept_clipping: false,
+                    dup_clipping: false,
+                    renamed: true,
+                    rename_error: None,
+                    reason: crate::dedup::KeeperReason::Louder { margin_db: 11.1 },
+                }],
+                unparseable: vec!["broken.wav".into()],
+            },
+            elapsed: std::time::Duration::from_secs(65),
+        }
     }
 
     fn plan_fixture() -> PlanSummary {
@@ -672,5 +797,146 @@ mod tests {
         // Синхронная часть: без прогона код 0 (обёртка в tokio для await).
         let code = tokio::runtime::Runtime::new().unwrap().block_on(finish_run(None));
         assert_eq!(code, 0);
+    }
+
+    // --- табы / журнал / confirm (seq 05) ---------------------------------------
+
+    #[test]
+    fn confirm_dialog_renders_over_running_screen() {
+        let mut app = running_app();
+        app.handle(&key(crossterm::event::KeyCode::Char('q')));
+        assert!(app.confirm_open());
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("Подтверждение"), "модал поверх экрана");
+        assert!(text.contains("Прервать прогон и выйти?"));
+        assert!(text.contains("границе файлов"), "предупреждение о границе отмены");
+        assert!(text.contains("Esc"), "путь отказа виден текстом");
+    }
+
+    #[test]
+    fn dedup_tab_renders_pairs_from_last_outcome() {
+        let mut app = running_app();
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_with_dedup() });
+        app.handle(&key(crossterm::event::KeyCode::Char('2')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("DUP"), "заголовок таблицы");
+        assert!(text.contains("unknown 3.wav"), "дубль");
+        assert!(text.contains("unknown 2.wav"), "хранитель");
+        assert!(text.contains("0.99/1.00/0.99"), "corr по окнам");
+        assert!(text.contains("+11.1"), "gain");
+        assert!(text.contains("28.2/23.0"), "crest");
+        assert!(text.contains("громче на 11.1 дБ"), "причина KeeperReason");
+        assert!(text.contains("не разобраны как WAV: broken.wav"), "примечание");
+    }
+
+    #[test]
+    fn dedup_tab_without_outcome_shows_empty_state() {
+        let mut app = App::new();
+        app.handle(&key(crossterm::event::KeyCode::Char('2')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("дублей не найдено"));
+    }
+
+    #[test]
+    fn log_tab_renders_pipeline_events() {
+        let mut app = running_app();
+        feed(
+            &mut app,
+            AppEvent::FileFailed { name: "a.wav".into(), error: "engine boom".into() },
+        );
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("прогон начат: 1 файлов"), "старт прогона");
+        assert!(text.contains("ОШИБКА: a.wav: engine boom"), "ошибка файла");
+        assert!(text.contains("f — фильтр"), "подсказки журнала");
+    }
+
+    #[test]
+    fn log_tab_batch_summary_includes_dedup_reasons() {
+        let mut app = running_app();
+        feed(&mut app, AppEvent::BatchFinished { outcome: outcome_with_dedup() });
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("прогон завершён: 1 ок, 0 ошибок, 1 дублей"));
+        assert!(text.contains("дубль unknown 3.wav → хранитель unknown 2.wav: громче на 11.1 дБ"));
+    }
+
+    #[test]
+    fn log_tab_empty_state() {
+        let mut app = App::new();
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("журнал пуст"));
+    }
+
+    #[test]
+    fn log_tab_filter_input_renders_cursor() {
+        let mut app = App::new();
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+        app.handle(&key(crossterm::event::KeyCode::Char('f')));
+        app.handle(&key(crossterm::event::KeyCode::Char('x')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("фильтр:"), "строка ввода");
+        assert!(text.contains("x▌"), "курсор после текста");
+        assert!(text.contains("Enter — применить"));
+    }
+
+    #[test]
+    fn help_tab_overlays_keybinds_over_files() {
+        let mut app = App::new();
+        app.handle(&key(crossterm::event::KeyCode::Char('4')));
+
+        let text = render(100, 30, &app);
+
+        assert!(text.contains("Справка"));
+        assert!(text.contains("[1–4]/Tab"), "навигация табов");
+        assert!(text.contains("PgUp/PgDn"), "прокрутка журнала");
+        assert!(text.contains("зарезервировано"), "m/o помечены");
+        assert!(text.contains("нет файлов"), "фон (таблица Files) жив под оверлеем");
+    }
+
+    #[test]
+    fn event_log_messages_map_pipeline_events() {
+        let mut app = App::new();
+        log_event(&mut app, &AppEvent::RunStarted { plan: plan_fixture() });
+        log_event(
+            &mut app,
+            &AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Separate },
+        );
+        log_event(&mut app, &AppEvent::FileDone { name: "a.wav".into() });
+        log_event(&mut app, &AppEvent::FileDuplicate { name: "z.wav".into() });
+        log_event(&mut app, &AppEvent::BatchFinished { outcome: outcome_with_dedup() });
+
+        let messages: Vec<String> = app.log().visible().iter().map(|e| e.message.clone()).collect();
+        assert_eq!(messages.len(), 4 + 3, "старт + стадия + done + dup + сводка + пара + unparseable");
+        assert!(messages[0].contains("прогон начат: 1 файлов"));
+        assert!(messages[1].contains("a.wav: separate"));
+        assert!(messages[2].contains("a.wav: готово"));
+        assert!(messages[3].contains("z.wav: дубль"));
+        assert!(messages[4].starts_with("прогон завершён"));
+    }
+
+    #[test]
+    fn event_log_skips_gpu_progress_and_resize() {
+        let mut app = App::new();
+        log_event(&mut app, &AppEvent::ModelProgress { pct: 42.0 });
+        log_event(&mut app, &AppEvent::Resize { width: 100, height: 30 });
+        log_event(&mut app, &AppEvent::Tick);
+
+        assert!(app.log().is_empty(), "шум не журналируем");
     }
 }

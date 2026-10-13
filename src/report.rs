@@ -307,6 +307,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::dedup::KeeperReason;
     use crate::pipeline::summarize_with_dedup;
     use crate::smb::SmbEntry;
 
@@ -346,6 +347,7 @@ mod tests {
             dup_clipping: false,
             renamed: true,
             rename_error: None,
+            reason: KeeperReason::Louder { margin_db: 11.1 },
         }
     }
 

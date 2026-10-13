@@ -15,9 +15,10 @@ use crate::config::Model;
 use crate::pipeline::FileStatus;
 use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
 use crate::tui::gpu::{GpuEvent, GpuInfo};
+use crate::tui::log::{LogBuffer, PAGE_LINES};
 use crate::tui::persist::TuiSettings;
 use crate::tui::popup::{PopupView, TextFieldView};
-use crate::tui::widgets::GpuView;
+use crate::tui::widgets::{GpuView, Tab, TABS};
 
 /// Статус валидации полей попапа запуска.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +389,16 @@ pub struct App {
     pending_start: Option<RunSpec>,
     /// Снимок GPU-поллера для шапки.
     gpu: Option<GpuView>,
+    /// Активный таб нижней навигации.
+    active_tab: Tab,
+    /// Таб, из которого открыли Help (для возврата повторным `?`).
+    tab_before_help: Option<Tab>,
+    /// Открыт модальный диалог выхода во время прогона.
+    confirm_quit: bool,
+    /// Кольцевой буфер журнала (таб Log).
+    log: LogBuffer,
+    /// Режим ввода фильтра журнала (`Some` — клавиши идут в поле).
+    log_filter_input: Option<TextField>,
 }
 
 impl App {
@@ -477,6 +488,31 @@ impl App {
         self.gpu.as_ref()
     }
 
+    /// Активный таб (для рендера и кликов по строке табов).
+    pub fn active_tab(&self) -> Tab {
+        self.active_tab
+    }
+
+    /// Открыт ли модальный confirm выхода (рендер поверх экрана).
+    pub fn confirm_open(&self) -> bool {
+        self.confirm_quit
+    }
+
+    /// Буфер журнала (рендер таба Log).
+    pub fn log(&self) -> &LogBuffer {
+        &self.log
+    }
+
+    /// Мутабельный доступ для event loop: дописать события пайплайна.
+    pub fn log_mut(&mut self) -> &mut LogBuffer {
+        &mut self.log
+    }
+
+    /// Ввод фильтра журнала в активном режиме (`None` — режим выключен).
+    pub fn log_filter_input(&self) -> Option<&TextField> {
+        self.log_filter_input.as_ref()
+    }
+
     /// Единственная точка изменения состояния: чистый переход по событию.
     pub fn handle(&mut self, event: &AppEvent) {
         match event {
@@ -525,17 +561,35 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if self.state == State::Config {
+            self.on_key_config(key);
+            return;
+        }
+        // Confirm-диалог модален: поглощает все клавиши.
+        if self.confirm_quit {
+            self.on_key_confirm(key);
+            return;
+        }
+        // Ввод фильтра журнала — тоже модальный режим.
+        if self.log_filter_input.is_some() {
+            self.on_key_log_filter(key);
+            return;
+        }
+        if self.on_key_global(key) {
+            return;
+        }
         match self.state {
+            // Config обработан ранним выходом (on_key_config).
+            State::Config => {}
             State::Idle => match key.code {
-                KeyCode::Enter => self.state = State::Config,
+                KeyCode::Enter | KeyCode::Char('s') => self.state = State::Config,
                 KeyCode::Char('q') | KeyCode::Esc => self.quit_requested = true,
                 _ => {}
             },
-            State::Config => self.on_key_config(key),
             State::Running => match key.code {
-                // Esc — запрос кооперативной отмены (не выход): состояние
-                // меняет только BatchFinished/RunFailed от раннера.
-                KeyCode::Esc => self.cancel_requested = true,
+                // q/Esc — confirm выхода: отмена применяется на границе
+                // файлов, решение остаётся за пользователем (Enter в диалоге).
+                KeyCode::Char('q') | KeyCode::Esc => self.confirm_quit = true,
                 KeyCode::Char('p') => self.paused = !self.paused,
                 KeyCode::Char('r') => self.request_retry_selected(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
@@ -550,6 +604,141 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 _ => {}
             },
+        }
+    }
+
+    /// Глобальные клавиши вне попапа: Help, табы, клавиши журнала.
+    /// Возвращает `true`, если клавиша поглощена.
+    fn on_key_global(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('?') => {
+                self.toggle_help();
+                return true;
+            }
+            // Esc на табе Help закрывает справку, а не выходит из TUI.
+            KeyCode::Esc if self.active_tab == Tab::Help => {
+                self.close_help();
+                return true;
+            }
+            KeyCode::Tab => {
+                self.cycle_tab(1);
+                return true;
+            }
+            KeyCode::BackTab => {
+                self.cycle_tab(-1);
+                return true;
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                let index = c as usize - '1' as usize;
+                if let Some(tab) = Tab::from_index(index) {
+                    self.select_tab(tab);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if self.active_tab == Tab::Log {
+            return self.on_key_log(key);
+        }
+        false
+    }
+
+    /// `?` открывает Help поверх текущего таба и возвращает обратно.
+    fn toggle_help(&mut self) {
+        if self.active_tab == Tab::Help {
+            self.close_help();
+        } else {
+            self.tab_before_help = Some(self.active_tab);
+            self.active_tab = Tab::Help;
+        }
+    }
+
+    /// Закрыть справку: исходный таб, а если Help открыт «напрямую»
+    /// (клавишей 4) — Files.
+    fn close_help(&mut self) {
+        self.active_tab = self.tab_before_help.take().unwrap_or_default();
+    }
+
+    fn select_tab(&mut self, tab: Tab) {
+        self.tab_before_help = None;
+        self.active_tab = tab;
+    }
+
+    /// Циклический сдвиг по четырём табам (Tab вперёд, BackTab назад).
+    fn cycle_tab(&mut self, delta: isize) {
+        let count = TABS.len() as isize;
+        let current = self.active_tab as isize;
+        let next = (current + delta).rem_euclid(count) as usize;
+        self.active_tab = Tab::from_index(next).unwrap_or_default();
+    }
+
+    /// Клавиши журнала (активен таб Log): фильтр, очистка, прокрутка.
+    /// Нераспознанные отдаются состоянию (False).
+    fn on_key_log(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('f') => {
+                self.log_filter_input = Some(TextField::default());
+                true
+            }
+            KeyCode::Char('c') => {
+                self.log.clear();
+                true
+            }
+            KeyCode::PageUp => {
+                self.log.scroll_up(PAGE_LINES);
+                true
+            }
+            KeyCode::PageDown => {
+                self.log.scroll_down(PAGE_LINES);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Модальный ввод фильтра журнала: Enter — применить, Esc — отменить.
+    fn on_key_log_filter(&mut self, key: KeyEvent) {
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return; // системные комбинации в поле не вводим
+        }
+        match key.code {
+            KeyCode::Enter => {
+                let filter = self.log_filter_input.take().map(|t| t.as_str().to_string());
+                self.log.set_filter(filter);
+                return;
+            }
+            KeyCode::Esc => {
+                self.log_filter_input = None;
+                return;
+            }
+            _ => {}
+        }
+        let Some(input) = self.log_filter_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Delete => input.delete(),
+            KeyCode::Left => input.left(),
+            KeyCode::Right => input.right(),
+            KeyCode::Home => input.to_start(),
+            KeyCode::End => input.to_end(),
+            KeyCode::Char(c) => input.insert(c),
+            _ => {}
+        }
+    }
+
+    /// Confirm выхода во время прогона: Enter — подтвердить (кооперативная
+    /// отмена + выход из TUI), Esc/q — остаться. Прочие клавиши поглощаются.
+    fn on_key_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => {
+                self.cancel_requested = true;
+                self.quit_requested = true;
+                self.confirm_quit = false;
+            }
+            KeyCode::Char('q') | KeyCode::Esc => self.confirm_quit = false,
+            _ => {}
         }
     }
 
@@ -570,6 +759,8 @@ impl App {
         self.outcome = None;
         self.run_error = None;
         self.retry_requests.clear();
+        self.confirm_quit = false;
+        self.log_filter_input = None;
     }
 
     /// Авторитетная сверка статусов из [`BatchResult`] (в т.ч. kept дублей)
@@ -843,11 +1034,13 @@ mod tests {
     }
 
     #[test]
-    fn running_q_is_ignored_quit_confirm_comes_later() {
+    fn running_q_opens_quit_confirm() {
         let mut app = App::new();
         start_run(&mut app);
         app.handle(&press(KeyCode::Char('q')));
-        assert!(!app.should_quit());
+        assert!(app.confirm_open());
+        assert!(!app.should_quit(), "выход только после подтверждения");
+        assert!(!app.cancel_requested(), "отмена только после подтверждения");
         assert_eq!(app.state(), State::Running);
     }
 
@@ -1086,14 +1279,217 @@ mod tests {
     // --- cancel / pause / retry / выбор -----------------------------------------
 
     #[test]
-    fn running_esc_requests_cancel_and_stays_running() {
+    fn running_esc_opens_quit_confirm() {
         let mut app = App::new();
         start_run(&mut app);
 
         app.handle(&press(KeyCode::Esc));
 
-        assert!(app.cancel_requested());
-        assert_eq!(app.state(), State::Running, "отмена кооперативная: завершает раннер");
+        assert!(app.confirm_open());
+        assert!(!app.cancel_requested(), "отмена — только через confirm");
+        assert_eq!(app.state(), State::Running);
+    }
+
+    #[test]
+    fn confirm_enter_requests_cancel_and_quit() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+        assert!(app.confirm_open());
+
+        app.handle(&press(KeyCode::Enter));
+
+        assert!(app.cancel_requested(), "раннер доигрывает файл и останавливается");
+        assert!(app.should_quit());
+        assert!(!app.confirm_open());
+    }
+
+    #[test]
+    fn confirm_esc_dismisses_and_stays_running() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Char('q')));
+
+        app.handle(&press(KeyCode::Esc));
+
+        assert!(!app.confirm_open());
+        assert!(!app.should_quit());
+        assert!(!app.cancel_requested());
+        assert_eq!(app.state(), State::Running);
+    }
+
+    #[test]
+    fn confirm_q_dismisses_and_absorbs_other_keys() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Esc));
+
+        app.handle(&press(KeyCode::Char('p'))); // поглощена: не пауза
+        assert!(app.confirm_open());
+        assert!(!app.paused());
+
+        app.handle(&press(KeyCode::Char('q')));
+        assert!(!app.confirm_open());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn confirm_state_resets_on_new_run() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&press(KeyCode::Char('q')));
+        assert!(app.confirm_open());
+
+        start_run(&mut app);
+
+        assert!(!app.confirm_open());
+    }
+
+    // --- табы / help / журнал -----------------------------------------------------
+
+    #[test]
+    fn number_keys_switch_tabs() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('2')));
+        assert_eq!(app.active_tab(), Tab::Dedup);
+        app.handle(&press(KeyCode::Char('3')));
+        assert_eq!(app.active_tab(), Tab::Log);
+        app.handle(&press(KeyCode::Char('1')));
+        assert_eq!(app.active_tab(), Tab::Files);
+    }
+
+    #[test]
+    fn tab_key_cycles_forward_and_backtab_backward() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Tab));
+        assert_eq!(app.active_tab(), Tab::Dedup);
+        app.handle(&press(KeyCode::Tab));
+        assert_eq!(app.active_tab(), Tab::Log);
+        app.handle(&press(KeyCode::Tab));
+        assert_eq!(app.active_tab(), Tab::Help);
+        app.handle(&press(KeyCode::Tab));
+        assert_eq!(app.active_tab(), Tab::Files);
+
+        app.handle(&press(KeyCode::BackTab));
+        assert_eq!(app.active_tab(), Tab::Help);
+    }
+
+    #[test]
+    fn help_toggle_opens_and_returns_to_previous_tab() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('2'))); // Dedup
+
+        app.handle(&press(KeyCode::Char('?')));
+        assert_eq!(app.active_tab(), Tab::Help);
+
+        app.handle(&press(KeyCode::Char('?')));
+        assert_eq!(app.active_tab(), Tab::Dedup);
+    }
+
+    #[test]
+    fn help_esc_closes_instead_of_quitting() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('4')));
+        assert_eq!(app.active_tab(), Tab::Help);
+
+        app.handle(&press(KeyCode::Esc));
+
+        assert_eq!(app.active_tab(), Tab::Files, "вернулись на исходный таб");
+        assert!(!app.should_quit(), "Esc на справке не выходит из TUI");
+    }
+
+    #[test]
+    fn help_number_key_switches_out_and_clears_return() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('4')));
+        assert_eq!(app.active_tab(), Tab::Help);
+
+        app.handle(&press(KeyCode::Char('1')));
+
+        assert_eq!(app.active_tab(), Tab::Files);
+        app.handle(&press(KeyCode::Char('?')));
+        assert_eq!(app.active_tab(), Tab::Help, "возврат на Files, а не на старый Help");
+    }
+
+    #[test]
+    fn idle_s_alias_opens_config() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('s')));
+        assert_eq!(app.state(), State::Config);
+    }
+
+    #[test]
+    fn log_clear_with_c_on_log_tab() {
+        let mut app = App::new();
+        app.log_mut().push("00:00:00", "event");
+        app.handle(&press(KeyCode::Char('3')));
+
+        app.handle(&press(KeyCode::Char('c')));
+
+        assert!(app.log().is_empty());
+    }
+
+    #[test]
+    fn log_keys_ignored_on_other_tabs() {
+        let mut app = App::new();
+        app.log_mut().push("00:00:00", "event");
+
+        app.handle(&press(KeyCode::Char('c'))); // таб Files — не очистка
+
+        assert_eq!(app.log().len(), 1);
+    }
+
+    #[test]
+    fn log_filter_input_flow_apply_and_cancel() {
+        let mut app = App::new();
+        app.log_mut().push("00:00:01", "download a.wav");
+        app.log_mut().push("00:00:02", "separate b.wav");
+        app.handle(&press(KeyCode::Char('3')));
+
+        app.handle(&press(KeyCode::Char('f')));
+        assert!(app.log_filter_input().is_some(), "режим ввода открыт");
+        app.handle(&press(KeyCode::Char('d')));
+        app.handle(&press(KeyCode::Char('o')));
+        app.handle(&press(KeyCode::Backspace));
+        app.handle(&press(KeyCode::Char('o')));
+        app.handle(&press(KeyCode::Char('w')));
+        app.handle(&press(KeyCode::Char('n')));
+        app.handle(&press(KeyCode::Enter));
+
+        assert!(app.log_filter_input().is_none());
+        assert_eq!(app.log().filter(), Some("down"));
+        assert_eq!(app.log().visible_len(), 1);
+
+        // Повторный Esc без режима ввода — поведение состояния (Idle: выход).
+        let mut idle = App::new();
+        idle.handle(&press(KeyCode::Enter));
+        idle.handle(&press(KeyCode::Esc));
+        assert_eq!(idle.state(), State::Idle);
+    }
+
+    #[test]
+    fn log_filter_input_esc_cancels_without_applying() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('3')));
+        app.handle(&press(KeyCode::Char('f')));
+        app.handle(&press(KeyCode::Char('x')));
+
+        app.handle(&press(KeyCode::Esc));
+
+        assert!(app.log_filter_input().is_none());
+        assert_eq!(app.log().filter(), None);
+    }
+
+    #[test]
+    fn log_scroll_pgup_pgdn() {
+        let mut app = App::new();
+        app.handle(&press(KeyCode::Char('3')));
+
+        app.handle(&press(KeyCode::PageUp));
+        assert_eq!(app.log().scroll(), PAGE_LINES);
+
+        app.handle(&press(KeyCode::PageDown));
+        assert_eq!(app.log().scroll(), 0);
     }
 
     #[test]
