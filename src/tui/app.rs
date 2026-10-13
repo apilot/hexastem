@@ -517,6 +517,9 @@ impl App {
     pub fn handle(&mut self, event: &AppEvent) {
         match event {
             AppEvent::Key(key) => self.on_key(*key),
+            // Геометрия кадра App не знает: клики мышью маршрутизирует
+            // event loop (`mod.rs::handle_mouse`) через set_tab/select_row.
+            AppEvent::Mouse(_) => {}
             AppEvent::Paste { text } => self.on_paste(text),
             AppEvent::Gpu(event) => self.on_gpu(event.clone()),
             AppEvent::ValidationFinished { spec, error } => {
@@ -662,6 +665,21 @@ impl App {
     fn select_tab(&mut self, tab: Tab) {
         self.tab_before_help = None;
         self.active_tab = tab;
+    }
+
+    /// Таб кликом мыши (маршрутизация `handle_mouse`): поведение как у
+    /// клавиш 1–4 (вход в Help из него же вернёт прежний таб по Esc).
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.select_tab(tab);
+    }
+
+    /// Строка таблицы кликом мыши; индекс обрезается в диапазон,
+    /// пустая таблица — игнор.
+    pub fn select_row(&mut self, index: usize) {
+        if self.files.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.files.len() - 1);
     }
 
     /// Циклический сдвиг по четырём табам (Tab вперёд, BackTab назад).

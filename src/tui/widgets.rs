@@ -927,9 +927,16 @@ pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView) {
 
 /// Классический вид таба Files: таблица + DETAILS в полном режиме.
 fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView) {
-    let (files_area, details_area) = content_split(zones.content, view.details.is_some());
+    let has_details = view.details.is_some();
+    let (files_area, details_area) = content_split(zones.content, has_details);
     render_files(frame, files_area, &view.files, view.selected);
     render_details_or_empty(frame, details_area, view.details.as_ref());
+}
+
+/// Зона таблицы файлов внутри контента (мышь — [`file_row_at`] по ней же);
+/// `has_details` — полный режим с DETAILS-панелью справа.
+pub fn files_table_area(content: Rect, has_details: bool) -> Rect {
+    content_split(content, has_details).0
 }
 
 /// Зоны кадра: шапка 3, табы 1, контент Min(1), footer 1.

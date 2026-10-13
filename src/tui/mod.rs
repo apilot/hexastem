@@ -16,8 +16,8 @@
 //! пользователь не уйдёт с него (shutdown) или не выйдет из TUI — итог серии
 //! ([`runner::exit_code`]) становится кодом завершения процесса.
 //!
-//! Bracketed paste: `EnableBracketedPaste` при старте, `Disable` — при любом
-//! выходе, включая панику (panic hook цепочкой поверх хука ratatui).
+//! Bracketed paste и захват мыши: `Enable*` при старте, `Disable*` — при
+//! любом выходе, включая панику (panic hook цепочкой поверх хука ratatui).
 
 pub mod app;
 pub mod event;
@@ -33,7 +33,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::ExecutableCommand;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -76,10 +79,14 @@ pub async fn run() -> io::Result<i32> {
     let terminal = ratatui::init();
     wrap_panic_hook_with_paste_restore();
     let paste_enabled = enable_bracketed_paste().is_ok();
+    let mouse_enabled = enable_mouse_capture().is_ok();
     let result = event_loop(terminal).await;
     ratatui::restore();
     if paste_enabled {
         let _ = disable_bracketed_paste();
+    }
+    if mouse_enabled {
+        let _ = disable_mouse_capture();
     }
     result
 }
@@ -103,6 +110,10 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
         terminal.draw(|frame| draw(frame, &app))?;
         tokio::select! {
             maybe_event = rx_input.recv() => match maybe_event {
+                // Мышь маршрутизируется по зонам кадра: App геометрии не знает.
+                Some(AppEvent::Mouse(mouse)) => {
+                    handle_mouse(&mut app, mouse, terminal.size()?.into())
+                }
                 Some(event) => app.handle(&event),
                 None => quit = true, // читатель умер — завершаемся чисто
             },
@@ -153,8 +164,7 @@ fn on_internal_event(
     tx_gpu: &UnboundedSender<GpuEvent>,
     run: &mut Option<ActiveRun>,
 ) {
-    app.handle(&event);
-    log_event(app, &event);
+    apply_event(app, &event);
     let AppEvent::ValidationFinished { spec, error: None } = &event else {
         return;
     };
@@ -163,6 +173,14 @@ fn on_internal_event(
     }
     let _ = persist::save(&settings_of_spec(spec));
     *run = Some(start_run(spec.clone(), tx_events.clone(), tx_gpu.clone()));
+}
+
+/// Единая точка применения события (путь внутреннего канала event loop'а):
+/// обновление App + журнал. Публично для интеграционных тестов — мок-прогон
+/// гонит события через ту же пару вызовов, что и живой цикл.
+pub fn apply_event(app: &mut App, event: &AppEvent) {
+    app.handle(event);
+    log_event(app, event);
 }
 
 /// Единая точка журналирования: события пайплайна (стадии/ошибки/итог/дедуп)
@@ -302,7 +320,8 @@ fn spawn_validation(spec: RunSpec, tx: UnboundedSender<AppEvent>) {
 }
 
 /// Проверки спеки: `None` — всё в порядке, `Some(текст)` — ошибка для попапа.
-fn validate_spec(spec: &RunSpec) -> Option<String> {
+/// Публично для интеграционных тестов (та же валидация, что перед стартом).
+pub fn validate_spec(spec: &RunSpec) -> Option<String> {
     if spec.remote_dir.as_os_str().is_empty() {
         return Some("исходная директория не указана".to_string());
     }
@@ -350,7 +369,7 @@ fn driver_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/separator_driver.py")
 }
 
-// --- bracketed paste -----------------------------------------------------------
+// --- bracketed paste и захват мыши ------------------------------------------------
 
 fn enable_bracketed_paste() -> io::Result<()> {
     io::stdout().execute(EnableBracketedPaste).map(|_| ())
@@ -360,21 +379,64 @@ fn disable_bracketed_paste() -> io::Result<()> {
     io::stdout().execute(DisableBracketedPaste).map(|_| ())
 }
 
-/// Panic hook цепочкой: сначала гасим paste, затем прежний hook (ratatui
-/// восстанавливает raw mode/альтернативный экран).
+fn enable_mouse_capture() -> io::Result<()> {
+    io::stdout().execute(EnableMouseCapture).map(|_| ())
+}
+
+fn disable_mouse_capture() -> io::Result<()> {
+    io::stdout().execute(DisableMouseCapture).map(|_| ())
+}
+
+/// Panic hook цепочкой: сначала гасим paste и захват мыши, затем прежний
+/// hook (ratatui восстанавливает raw mode/альтернативный экран).
 fn wrap_panic_hook_with_paste_restore() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_bracketed_paste();
+        let _ = disable_mouse_capture();
         previous(info);
     }));
+}
+
+// --- маршрутизация мыши ------------------------------------------------------------
+
+/// Клик мышью (только `Up(Left)`): таб → переключение таба, строка таблицы
+/// Files → выбор файла. Модальные состояния (попап, confirm, мелкий экран)
+/// клики не получают — зоны перекрыты модалом.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
+    if mouse.kind != MouseEventKind::Up(MouseButton::Left)
+        || is_too_small(area)
+        || app.state() == State::Config
+        || app.confirm_open()
+    {
+        return;
+    }
+    let zones = widgets::compute_zones(area);
+    if covers(zones.tabs, mouse.row) {
+        if let Some(tab) = widgets::tab_at(mouse.column, zones.tabs) {
+            app.set_tab(tab);
+        }
+        return;
+    }
+    if covers(zones.content, mouse.row) && app.active_tab() == widgets::Tab::Files {
+        let files_area = widgets::files_table_area(zones.content, false);
+        if let Some(row) = widgets::file_row_at(mouse.row, files_area) {
+            app.select_row(row);
+        }
+    }
+}
+
+/// Строка `y` попадает в прямоугольник по вертикали.
+fn covers(rect: Rect, y: u16) -> bool {
+    rect.height > 0 && y >= rect.y && y < rect.y + rect.height
 }
 
 // --- композиция кадра ------------------------------------------------------------
 
 /// Выбор кадра: слишком маленький терминал → заглушка, иначе основной UI
-/// (+ попап поверх в состоянии Config).
-fn draw(frame: &mut Frame, app: &App) {
+/// (+ попап поверх в состоянии Config). Публично для интеграционных тестов
+/// (TestBackend рендерит тот же кадр, что и живой event loop).
+pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     if is_too_small(area) {
         draw_too_small(frame, area);
@@ -938,5 +1000,120 @@ mod tests {
         log_event(&mut app, &AppEvent::Tick);
 
         assert!(app.log().is_empty(), "шум не журналируем");
+    }
+
+    // --- мышь (seq 07): клики по зонам кадра ------------------------------------
+
+    const SCREEN: ratatui::layout::Rect = ratatui::layout::Rect::new(0, 0, 100, 30);
+
+    /// Клик «отпущена левая кнопка» в координате кадра.
+    fn click_up(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    /// Клик «нажата левая кнопка» (не триггерит действия).
+    fn click_down(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    fn plan_with_three_files() -> PlanSummary {
+        PlanSummary {
+            pending: ["a.wav", "b.wav", "c.wav"]
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+            ..PlanSummary::default()
+        }
+    }
+
+    #[test]
+    fn mouse_click_on_tab_bar_switches_tab() {
+        let mut app = running_app();
+
+        handle_mouse(&mut app, click_up(30, 3), SCREEN); // зона Dedup (25..49)
+
+        assert_eq!(app.active_tab(), widgets::Tab::Dedup);
+    }
+
+    #[test]
+    fn mouse_click_on_file_row_selects_it() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
+
+        // Контент с y=4; строка таблицы 0 — с y=6 (рамка+заголовок).
+        handle_mouse(&mut app, click_up(10, 7), SCREEN);
+
+        assert_eq!(app.selected_index(), 1, "клик по второй строке таблицы");
+        assert_eq!(app.selected_file().map(|file| file.name.as_str()), Some("b.wav"));
+    }
+
+    #[test]
+    fn mouse_click_beyond_last_row_clamps_to_last_file() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
+
+        handle_mouse(&mut app, click_up(10, 20), SCREEN); // пустая зона таблицы
+
+        assert_eq!(app.selected_index(), 2, "курсор не выходит за последнюю строку");
+    }
+
+    #[test]
+    fn mouse_press_without_release_is_ignored() {
+        let mut app = running_app();
+
+        handle_mouse(&mut app, click_down(30, 3), SCREEN);
+
+        assert_eq!(app.active_tab(), widgets::Tab::Files, "действие — только на Up");
+    }
+
+    #[test]
+    fn mouse_click_outside_zones_is_noop() {
+        let mut app = running_app();
+
+        handle_mouse(&mut app, click_up(10, 29), SCREEN); // footer
+
+        assert_eq!(app.active_tab(), widgets::Tab::Files);
+        assert_eq!(app.selected_index(), 0);
+    }
+
+    #[test]
+    fn mouse_click_is_ignored_while_popup_open() {
+        let mut app = App::new();
+        app.handle(&enter()); // Idle → Config
+        app.open_config(persist::load());
+
+        handle_mouse(&mut app, click_up(30, 3), SCREEN);
+
+        assert_eq!(app.active_tab(), widgets::Tab::Files, "попап модален");
+    }
+
+    #[test]
+    fn mouse_click_is_ignored_while_confirm_open() {
+        let mut app = running_app();
+        app.handle(&key(crossterm::event::KeyCode::Char('q')));
+        assert!(app.confirm_open());
+
+        handle_mouse(&mut app, click_up(10, 7), SCREEN);
+
+        assert_eq!(app.selected_index(), 0, "confirm модален");
+    }
+
+    #[test]
+    fn mouse_click_on_too_small_screen_is_ignored() {
+        let mut app = running_app();
+
+        handle_mouse(&mut app, click_up(30, 3), ratatui::layout::Rect::new(0, 0, 40, 12));
+
+        assert_eq!(app.active_tab(), widgets::Tab::Files);
     }
 }

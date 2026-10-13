@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{read, Event, KeyEvent, KeyEventKind};
+use crossterm::event::{read, Event, KeyEvent, KeyEventKind, MouseEvent};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Model;
@@ -108,13 +108,16 @@ pub struct RunSpec {
 pub enum AppEvent {
     /// Нажатие клавиши (только `KeyEventKind::Press`, см. `From<Event>`).
     Key(KeyEvent),
+    /// Событие мыши (crossterm): маршрутизацией по зонам кадра занимается
+    /// event loop (`mod.rs::handle_mouse`), `App::handle` его игнорирует.
+    Mouse(MouseEvent),
     /// Текст вставлен из буфера (bracketed paste: drag&drop пути из ФМ).
     Paste { text: String },
     /// Изменение размера терминала.
     Resize { width: u16, height: u16 },
     /// Регулярный тик (перерисовка, поллеры).
     Tick,
-    /// Прочие события crossterm (mouse/focus) — отбрасываются.
+    /// Прочие события crossterm (focus) — отбрасываются.
     Ignored,
     /// Снимок GPU-поллера (маппинг в `GpuView` шапки).
     Gpu(GpuEvent),
@@ -149,6 +152,7 @@ impl From<Event> for AppEvent {
         match event {
             // Windows шлёт Release/Repeat; реагируем только на Press.
             Event::Key(key) if key.kind == KeyEventKind::Press => AppEvent::Key(key),
+            Event::Mouse(mouse) => AppEvent::Mouse(mouse),
             Event::Paste(text) => AppEvent::Paste { text },
             Event::Resize(width, height) => AppEvent::Resize { width, height },
             _ => AppEvent::Ignored,
@@ -230,16 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn mouse_event_is_ignored() {
+    fn mouse_event_is_forwarded_to_event_loop() {
         let mouse = crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(
-                crossterm::event::MouseButton::Left,
-            ),
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             column: 1,
             row: 1,
             modifiers: KeyModifiers::empty(),
         };
-        assert_eq!(AppEvent::from(Event::Mouse(mouse)), AppEvent::Ignored);
+        // Мышь не отбрасывается: маршрутизация по зонам — в mod.rs::handle_mouse.
+        assert_eq!(AppEvent::from(Event::Mouse(mouse)), AppEvent::Mouse(mouse));
+    }
+
+    #[test]
+    fn focus_events_are_still_ignored() {
+        assert_eq!(AppEvent::from(Event::FocusGained), AppEvent::Ignored);
+        assert_eq!(AppEvent::from(Event::FocusLost), AppEvent::Ignored);
     }
 
     /// Фикстура BatchResult (поля pub) для проверки снимка.
