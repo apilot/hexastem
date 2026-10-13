@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod dedup;
+pub mod envelope;
 pub mod error;
 pub mod local_fs;
 pub mod pipeline;

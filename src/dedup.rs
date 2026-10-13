@@ -449,7 +449,8 @@ fn scan_clip<R: Read + Seek>(reader: &mut R, info: &WavInfo) -> std::io::Result<
 }
 
 /// Чтение `bytes` байт данных и декодирование в f32 (буферы переиспользуются).
-fn read_samples<R: Read>(
+/// `pub(crate)`: переиспользуется потоковым чтением огибающей (envelope.rs).
+pub(crate) fn read_samples<R: Read>(
     reader: &mut R,
     bytes: u64,
     bits: u16,
@@ -466,7 +467,8 @@ fn read_samples<R: Read>(
 /// Декод PCM int (16/24/32) в нормированные f32 (−1..1, деление на максимум
 /// знакового диапазона); неполный хвостовой сэмпл отбрасывается. Биты
 /// валидированы при разборе заголовка, иная разрядность недостижима.
-fn decode_samples(bytes: &[u8], bits: u16, out: &mut Vec<f32>) {
+/// `pub(crate)`: переиспользуется огибающей (envelope.rs).
+pub(crate) fn decode_samples(bytes: &[u8], bits: u16, out: &mut Vec<f32>) {
     out.clear();
     match bits {
         16 => out.extend(

@@ -7,6 +7,8 @@
 
 pub mod app;
 pub mod event;
+pub mod runner;
+pub mod widgets;
 
 use std::io;
 use std::time::Duration;
