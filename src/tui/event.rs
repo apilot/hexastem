@@ -12,8 +12,10 @@ use std::time::Duration;
 use crossterm::event::{read, Event, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::config::Model;
 use crate::dedup::DedupSummary;
 use crate::pipeline::{BatchResult, FileResult};
+use crate::tui::gpu::GpuEvent;
 
 /// Стадия файла в UI-модели. Переходы детерминированы пайплайном:
 /// Queued → Download → Separate → Upload → Rename → (терминальный статус).
@@ -78,17 +80,47 @@ impl From<&BatchResult> for BatchOutcome {
     }
 }
 
+/// Спецификация старта из попапа: значения полей на момент Enter.
+///
+/// Не путать с [`crate::tui::runner::RunnerOptions`] (параметры раннера):
+/// `RunSpec` — то, что ввёл пользователь, и это же множество уходит в
+/// валидацию и persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSpec {
+    /// Хост SMB-сервера (в `local_mode` не используется).
+    pub host: String,
+    /// Имя шары (в `local_mode` не используется).
+    pub share: String,
+    /// Исходная директория на шаре/диске.
+    pub remote_dir: PathBuf,
+    /// Локальная рабочая директория.
+    pub local_dir: PathBuf,
+    /// Модель разделения.
+    pub model: Model,
+    /// Дедупликация включена.
+    pub dedup: bool,
+    /// Локальная папка вместо SMB: бэкенд — [`crate::local_fs::LocalFs`].
+    pub local_mode: bool,
+}
+
 /// Событие, обрабатываемое event loop'ом приложения.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
     /// Нажатие клавиши (только `KeyEventKind::Press`, см. `From<Event>`).
     Key(KeyEvent),
+    /// Текст вставлен из буфера (bracketed paste: drag&drop пути из ФМ).
+    Paste { text: String },
     /// Изменение размера терминала.
     Resize { width: u16, height: u16 },
     /// Регулярный тик (перерисовка, поллеры).
     Tick,
-    /// Прочие события crossterm (mouse/paste/focus) — отбрасываются.
+    /// Прочие события crossterm (mouse/focus) — отбрасываются.
     Ignored,
+    /// Снимок GPU-поллера (маппинг в `GpuView` шапки).
+    Gpu(GpuEvent),
+    /// Валидация полей попапа завершена (spawn_blocking): `None` — все
+    /// проверки пройдены, конфигурация готова к старту прогона.
+    ValidationFinished { spec: RunSpec, error: Option<String> },
     /// Runner собрал план прогона: засев таблицы файлов, Running.
     RunStarted { plan: PlanSummary },
     /// Runner не смог начать прогон (скан/сеть/отмена до старта).
@@ -117,6 +149,7 @@ impl From<Event> for AppEvent {
         match event {
             // Windows шлёт Release/Repeat; реагируем только на Press.
             Event::Key(key) if key.kind == KeyEventKind::Press => AppEvent::Key(key),
+            Event::Paste(text) => AppEvent::Paste { text },
             Event::Resize(width, height) => AppEvent::Resize { width, height },
             _ => AppEvent::Ignored,
         }
@@ -170,6 +203,30 @@ mod tests {
     fn resize_event_carries_dimensions() {
         let mapped = AppEvent::from(Event::Resize(100, 30));
         assert_eq!(mapped, AppEvent::Resize { width: 100, height: 30 });
+    }
+
+    #[test]
+    fn paste_event_carries_text_and_is_not_dropped() {
+        let mapped = AppEvent::from(Event::Paste("/mnt/nas/записи".into()));
+
+        assert_eq!(mapped, AppEvent::Paste { text: "/mnt/nas/записи".into() });
+        assert_ne!(mapped, AppEvent::Ignored, "paste обязан доходить до event loop");
+    }
+
+    #[test]
+    fn run_spec_equality_covers_all_fields() {
+        let spec = RunSpec {
+            host: "nas.local".into(),
+            share: "media".into(),
+            remote_dir: PathBuf::from("/rec"),
+            local_dir: PathBuf::from("/tmp/w"),
+            model: crate::config::Model::SixS,
+            dedup: false,
+            local_mode: true,
+        };
+
+        assert_eq!(spec, spec.clone());
+        assert!(matches!(&spec, RunSpec { local_mode: true, model: crate::config::Model::SixS, .. }));
     }
 
     #[test]

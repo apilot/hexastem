@@ -17,8 +17,10 @@ serde_json = "1"
 # (тот же крейт, что в deps ratatui 0.30 — единая версия), версии сверены crates.io 2026-10-13
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"
-# Асинхронный event loop TUI: tokio::select, tick-интервал, mpsc, многопоточный рантайм
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Асинхронный event loop TUI: tokio::select, tick-интервал, mpsc, многопоточный рантайм;
+# process — GPU-поллер (tokio::process::Command → nvidia-smi, tui/gpu.rs)
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+toml = "1.1.8"
 
 [[bin]]
 name = "audio_split_tui"

@@ -6,13 +6,31 @@
 //! (cancel/pause/retry) фиксируются флагами — event loop снимает их и
 //! передаёт раннеру (см. `runner::RunnerHandle`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::config::Model;
 use crate::pipeline::FileStatus;
-use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, Stage};
+use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
+use crate::tui::gpu::{GpuEvent, GpuInfo};
+use crate::tui::persist::TuiSettings;
+use crate::tui::popup::{PopupView, TextFieldView};
+use crate::tui::widgets::GpuView;
+
+/// Статус валидации полей попапа запуска.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationStatus {
+    /// Проверка ещё не запускалась.
+    Idle,
+    /// Идёт тяжёлая проверка (листинг шары в spawn_blocking).
+    Checking,
+    /// Проверки пройдены (прогон запускается).
+    Ok,
+    /// Ошибка (текст показывается в попапе).
+    Failed(String),
+}
 
 /// Экраны приложения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,6 +86,281 @@ pub struct FileView {
     pub outcome: Option<FileOutcome>,
 }
 
+/// Текстовое поле ввода с курсором (индекс в СИМВОЛАХ — unicode-safe).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextField {
+    value: String,
+    cursor: usize,
+}
+
+impl TextField {
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let cursor = value.chars().count();
+        Self { value, cursor }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// Позиция курсора в символах (для рендера и тестов).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn insert(&mut self, c: char) {
+        let byte = byte_index(&self.value, self.cursor);
+        self.value.insert(byte, c);
+        self.cursor += 1;
+    }
+
+    /// Вставка фрагмента (bracketed paste): символы добавляются по одному,
+    /// границы строки не ломаются.
+    pub fn insert_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let byte = byte_index(&self.value, self.cursor - 1);
+        self.value.remove(byte);
+        self.cursor -= 1;
+    }
+
+    pub fn delete(&mut self) {
+        if self.cursor < self.value.chars().count() {
+            let byte = byte_index(&self.value, self.cursor);
+            self.value.remove(byte);
+        }
+    }
+
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.value.chars().count());
+    }
+
+    pub fn to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn to_end(&mut self) {
+        self.cursor = self.value.chars().count();
+    }
+}
+
+/// Байтовый индекс символа с номером `char_index` (для `String::insert`).
+fn byte_index(value: &str, char_index: usize) -> usize {
+    value.char_indices().nth(char_index).map_or(value.len(), |(byte, _)| byte)
+}
+
+/// Фокус попапа запуска: четыре текстовых поля и три переключателя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Host,
+    Share,
+    RemoteDir,
+    LocalDir,
+    Model,
+    Dedup,
+    LocalMode,
+}
+
+/// Порядок обхода фокуса Tab/Shift-Tab (кольцевой).
+const FOCUS_ORDER: [Focus; 7] = [
+    Focus::Host,
+    Focus::Share,
+    Focus::RemoteDir,
+    Focus::LocalDir,
+    Focus::Model,
+    Focus::Dedup,
+    Focus::LocalMode,
+];
+
+impl Focus {
+    pub fn next(self) -> Self {
+        let index = FOCUS_ORDER.iter().position(|f| *f == self).unwrap_or_default();
+        FOCUS_ORDER[(index + 1) % FOCUS_ORDER.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let index = FOCUS_ORDER.iter().position(|f| *f == self).unwrap_or_default();
+        FOCUS_ORDER[(index + FOCUS_ORDER.len() - 1) % FOCUS_ORDER.len()]
+    }
+
+    /// Активный элемент — текстовое поле (принимает ввод/вставку).
+    pub fn is_text(self) -> bool {
+        matches!(self, Self::Host | Self::Share | Self::RemoteDir | Self::LocalDir)
+    }
+}
+
+/// Состояние попапа запуска: поля ввода, переключатели, фокус, валидация.
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    pub host: TextField,
+    pub share: TextField,
+    pub remote_dir: TextField,
+    pub local_dir: TextField,
+    pub model: Model,
+    pub dedup: bool,
+    pub local_mode: bool,
+    pub focus: Focus,
+    pub validation: ValidationStatus,
+}
+
+impl ConfigState {
+    /// Преффилл из пресета (`~/.config/audio_split/tui.toml`).
+    pub fn from_preset(preset: &TuiSettings) -> Self {
+        Self {
+            host: TextField::new(preset.host.clone()),
+            share: TextField::new(preset.share.clone()),
+            remote_dir: TextField::new(preset.remote_dir.clone()),
+            local_dir: TextField::new(preset.local_dir.clone()),
+            model: preset.model(),
+            dedup: preset.dedup,
+            local_mode: preset.local_mode,
+            focus: Focus::default(),
+            validation: ValidationStatus::Idle,
+        }
+    }
+
+    pub fn focused_field_mut(&mut self) -> Option<&mut TextField> {
+        match self.focus {
+            Focus::Host => Some(&mut self.host),
+            Focus::Share => Some(&mut self.share),
+            Focus::RemoteDir => Some(&mut self.remote_dir),
+            Focus::LocalDir => Some(&mut self.local_dir),
+            Focus::Model | Focus::Dedup | Focus::LocalMode => None,
+        }
+    }
+
+    pub fn focused_field(&self) -> Option<&TextField> {
+        match self.focus {
+            Focus::Host => Some(&self.host),
+            Focus::Share => Some(&self.share),
+            Focus::RemoteDir => Some(&self.remote_dir),
+            Focus::LocalDir => Some(&self.local_dir),
+            Focus::Model | Focus::Dedup | Focus::LocalMode => None,
+        }
+    }
+
+    /// Быстрые проверки до тяжёлой валидации (spawn_blocking с сетью):
+    /// директории указаны, в SMB-режиме заданы хост и шара.
+    pub fn local_error(&self) -> Option<String> {
+        if self.remote_dir.as_str().trim().is_empty() {
+            return Some("укажите исходную директорию".to_string());
+        }
+        if self.local_dir.as_str().trim().is_empty() {
+            return Some("укажите локальную директорию".to_string());
+        }
+        if !self.local_mode {
+            if self.host.as_str().trim().is_empty() {
+                return Some("укажите хост SMB-сервера".to_string());
+            }
+            if self.share.as_str().trim().is_empty() {
+                return Some("укажите имя шары".to_string());
+            }
+        }
+        None
+    }
+
+    /// Снимок значений полей для валидации/старта.
+    pub fn to_spec(&self) -> RunSpec {
+        RunSpec {
+            host: self.host.as_str().trim().to_string(),
+            share: self.share.as_str().trim().to_string(),
+            remote_dir: PathBuf::from(self.remote_dir.as_str().trim()),
+            local_dir: PathBuf::from(self.local_dir.as_str().trim()),
+            model: self.model,
+            dedup: self.dedup,
+            local_mode: self.local_mode,
+        }
+    }
+
+    /// Клавиатура попапа: навигация фокуса, редактирование, переключатели.
+    fn on_key(&mut self, key: KeyEvent) {
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return; // системные комбинации в поля не вводим
+        }
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.focus.prev()
+                } else {
+                    self.focus.next()
+                };
+            }
+            KeyCode::Backspace => {
+                if let Some(field) = self.focused_field_mut() {
+                    field.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(field) = self.focused_field_mut() {
+                    field.delete();
+                }
+            }
+            KeyCode::Left => self.on_horizontal(false),
+            KeyCode::Right => self.on_horizontal(true),
+            KeyCode::Home => {
+                if let Some(field) = self.focused_field_mut() {
+                    field.to_start();
+                }
+            }
+            KeyCode::End => {
+                if let Some(field) = self.focused_field_mut() {
+                    field.to_end();
+                }
+            }
+            KeyCode::Char(c) => self.on_char(c),
+            _ => {}
+        }
+    }
+
+    /// Left/Right: в текстовом поле — курсор, на модели — переключение.
+    fn on_horizontal(&mut self, forward: bool) {
+        if self.focus == Focus::Model {
+            self.toggle_model();
+            return;
+        }
+        if let Some(field) = self.focused_field_mut() {
+            if forward {
+                field.right();
+            } else {
+                field.left();
+            }
+        }
+    }
+
+    fn on_char(&mut self, c: char) {
+        match self.focus {
+            Focus::Model if c == ' ' => self.toggle_model(),
+            Focus::Dedup if c == ' ' => self.dedup = !self.dedup,
+            Focus::LocalMode if c == ' ' => self.local_mode = !self.local_mode,
+            _ => {
+                if let Some(field) = self.focused_field_mut() {
+                    field.insert(c);
+                }
+            }
+        }
+    }
+
+    fn toggle_model(&mut self) {
+        self.model = match self.model {
+            Model::Sw => Model::SixS,
+            Model::SixS => Model::Sw,
+        };
+    }
+}
+
 /// Состояние приложения: экран, модель прогона, управляющие флаги.
 #[derive(Debug, Default)]
 pub struct App {
@@ -89,6 +382,12 @@ pub struct App {
     run_error: Option<String>,
     /// Запрошенные retry'и (drain'ится event loop'ом в RunnerHandle).
     retry_requests: Vec<String>,
+    /// Попап запуска: `Some` пока открыты настройки (State::Config).
+    config: Option<ConfigState>,
+    /// Запрос на старт прогона (drain'ится event loop'ом → валидация).
+    pending_start: Option<RunSpec>,
+    /// Снимок GPU-поллера для шапки.
+    gpu: Option<GpuView>,
 }
 
 impl App {
@@ -141,10 +440,52 @@ impl App {
         std::mem::take(&mut self.retry_requests)
     }
 
+    /// Попап запуска, пока открыты настройки.
+    pub fn config(&self) -> Option<&ConfigState> {
+        self.config.as_ref()
+    }
+
+    /// Открыть попап с преффиллом из пресета (вызывает event loop).
+    pub fn open_config(&mut self, preset: TuiSettings) {
+        self.config = Some(ConfigState::from_preset(&preset));
+    }
+
+    /// Вид попапа для рендера (`None` — настройки не открыты).
+    pub fn popup_view(&self) -> Option<PopupView> {
+        let cfg = self.config.as_ref()?;
+        let field = |f: &TextField| TextFieldView { value: f.as_str().to_string(), cursor: f.cursor() };
+        Some(PopupView {
+            host: field(&cfg.host),
+            share: field(&cfg.share),
+            remote_dir: field(&cfg.remote_dir),
+            local_dir: field(&cfg.local_dir),
+            model: cfg.model,
+            dedup: cfg.dedup,
+            local_mode: cfg.local_mode,
+            focus: cfg.focus,
+            validation: cfg.validation.clone(),
+        })
+    }
+
+    /// Запрос на старт прогона (очищается: валидация — в event loop).
+    pub fn take_start_request(&mut self) -> Option<RunSpec> {
+        std::mem::take(&mut self.pending_start)
+    }
+
+    /// Снимок GPU для шапки (`None` — «GPU: n/a»).
+    pub fn gpu(&self) -> Option<&GpuView> {
+        self.gpu.as_ref()
+    }
+
     /// Единственная точка изменения состояния: чистый переход по событию.
     pub fn handle(&mut self, event: &AppEvent) {
         match event {
             AppEvent::Key(key) => self.on_key(*key),
+            AppEvent::Paste { text } => self.on_paste(text),
+            AppEvent::Gpu(event) => self.on_gpu(event.clone()),
+            AppEvent::ValidationFinished { spec, error } => {
+                self.on_validation_finished(spec.clone(), error.clone());
+            }
             AppEvent::RunStarted { plan } => self.on_run_started(plan),
             AppEvent::RunFailed { error } => {
                 self.run_error = Some(error.clone());
@@ -190,12 +531,7 @@ impl App {
                 KeyCode::Char('q') | KeyCode::Esc => self.quit_requested = true,
                 _ => {}
             },
-            State::Config => match key.code {
-                // 'q' в Config занято под ввод полей — выход только через Esc.
-                KeyCode::Enter => self.state = State::Running,
-                KeyCode::Esc => self.state = State::Idle,
-                _ => {}
-            },
+            State::Config => self.on_key_config(key),
             State::Running => match key.code {
                 // Esc — запрос кооперативной отмены (не выход): состояние
                 // меняет только BatchFinished/RunFailed от раннера.
@@ -218,8 +554,7 @@ impl App {
     }
 
     /// Засев таблицы из плана; сброс состояния прошлого прогона.
-    fn on_run_started(&mut self, plan: &PlanSummary) {
-        self.files = plan
+    fn on_run_started(&mut self, plan: &PlanSummary) {        self.files = plan
             .pending
             .iter()
             .map(|name| FileView { name: name.clone(), ..FileView::default() })
@@ -290,6 +625,83 @@ impl App {
         }
         self.selected = (self.selected as isize + delta).clamp(0, len - 1) as usize;
     }
+
+    /// Клавиатура попапа запуска: Enter — старт, Esc — отмена, остальное —
+    /// редактирование активного элемента.
+    fn on_key_config(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.config = None;
+                self.pending_start = None;
+                self.state = State::Idle;
+            }
+            KeyCode::Enter => self.begin_start(),
+            _ => {
+                if let Some(cfg) = self.config.as_mut() {
+                    cfg.on_key(key);
+                }
+            }
+        }
+    }
+
+    /// Enter в попапе: быстрые проверки → запрос старта + Checking.
+    /// Повторный Enter во время проверки игнорируется.
+    fn begin_start(&mut self) {
+        let Some(cfg) = self.config.as_ref() else {
+            return;
+        };
+        if cfg.validation == ValidationStatus::Checking {
+            return;
+        }
+        let (validation, pending) = match cfg.local_error() {
+            Some(message) => (ValidationStatus::Failed(message), None),
+            None => (ValidationStatus::Checking, Some(cfg.to_spec())),
+        };
+        if let Some(cfg) = self.config.as_mut() {
+            cfg.validation = validation;
+        }
+        self.pending_start = pending;
+    }
+
+    /// Вставка из буфера (bracketed paste): в активное текстовое поле,
+    /// вне попапа и на переключателях — игнорируется.
+    fn on_paste(&mut self, text: &str) {
+        if self.state != State::Config {
+            return;
+        }
+        let Some(cfg) = self.config.as_mut() else {
+            return;
+        };
+        if let Some(field) = cfg.focused_field_mut() {
+            field.insert_str(&sanitize_paste(text));
+        }
+    }
+
+    /// Снимок GPU-поллера: `None` — GPU недоступна («GPU: n/a» в шапке).
+    fn on_gpu(&mut self, event: GpuEvent) {
+        let GpuEvent::Info(info) = event;
+        self.gpu = info.as_ref().map(gpu_view);
+    }
+
+    /// Итог валидации: ok → Running (конфиг остаётся для шапки), ошибка →
+    /// остаёмся в попапе с сообщением. Пока шла проверка, попап могли
+    /// закрыть — устаревший результат игнорируется.
+    fn on_validation_finished(&mut self, _spec: RunSpec, error: Option<String>) {
+        self.pending_start = None;
+        if self.state != State::Config {
+            return;
+        }
+        let Some(cfg) = self.config.as_mut() else {
+            return;
+        };
+        match error {
+            Some(message) => cfg.validation = ValidationStatus::Failed(message),
+            None => {
+                cfg.validation = ValidationStatus::Ok;
+                self.state = State::Running;
+            }
+        }
+    }
 }
 
 /// Строка пропущенного файла (терминальный исход сразу).
@@ -298,6 +710,21 @@ fn skipped_view(name: &str, reason: SkipReason) -> FileView {
         name: name.to_string(),
         outcome: Some(FileOutcome::Skipped { reason }),
         ..FileView::default()
+    }
+}
+
+/// Paste из ФМ может нести перевод строки — в путь он не нужен.
+fn sanitize_paste(text: &str) -> String {
+    text.chars().filter(|c| *c != '\n' && *c != '\r').collect()
+}
+
+/// Снимок nvidia-smi → view шапки (MiB → GiB, `[N/A]`-утилизация → 0).
+fn gpu_view(info: &GpuInfo) -> GpuView {
+    GpuView {
+        name: info.name.clone(),
+        used_gib: info.mem_used_mib as f32 / 1024.0,
+        total_gib: info.mem_total_mib as f32 / 1024.0,
+        util_pct: info.util_percent.map_or(0.0, f64::from),
     }
 }
 
@@ -389,11 +816,13 @@ mod tests {
     }
 
     #[test]
-    fn config_enter_starts_running() {
+    fn config_enter_without_open_popup_stays_in_config() {
+        // Попап открывает event loop (преффилл из пресета); без него Enter
+        // в Config — no-op, из настроек не выходим.
         let mut app = App::new();
         app.handle(&press(KeyCode::Enter));
         app.handle(&press(KeyCode::Enter));
-        assert_eq!(app.state(), State::Running);
+        assert_eq!(app.state(), State::Config);
     }
 
     #[test]
@@ -416,8 +845,7 @@ mod tests {
     #[test]
     fn running_q_is_ignored_quit_confirm_comes_later() {
         let mut app = App::new();
-        app.handle(&press(KeyCode::Enter));
-        app.handle(&press(KeyCode::Enter));
+        start_run(&mut app);
         app.handle(&press(KeyCode::Char('q')));
         assert!(!app.should_quit());
         assert_eq!(app.state(), State::Running);

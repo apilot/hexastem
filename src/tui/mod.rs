@@ -1,79 +1,330 @@
-//! TUI-бинарник `audio_split_tui`: каркас — init/restore, event loop, отрисовка.
+//! TUI-бинарник `audio_split_tui`: event loop, интеграция раннера и GPU,
+//! композиция кадра (экран + попап старта).
 //!
-//! Скелет (subtask 01): терминал через `ratatui::init`/`restore`
-//! (panic-safe: ratatui ставит panic hook, восстанавливающий терминал),
-//! event loop на `tokio::select` (crossterm-события по mpsc + tick),
-//! автомат `Idle → Config → Running → Finished` без бизнес-логики.
+//! Потоки данных:
+//! - ввод crossterm → поток-читатель → канал `AppEvent` (клавиши/paste);
+//! - раннер (`runner::spawn`) и валидация попапа (spawn_blocking) → второй
+//!   канал `AppEvent`;
+//! - GPU-поллер (`gpu::spawn_poller`) → канал `GpuEvent` → `AppEvent::Gpu`.
+//!
+//! Все три источника мультиплексируются `tokio::select!` вместе с tick.
+//!
+//! Жизненный цикл прогона: Enter в попапе → локальные проверки → тяжёлая
+//! валидация (листинг шары через реальный бэкенд) → [`runner::spawn`] с
+//! `SmbClient`/`EngineRunner` (или `LocalFs` в local mode) + GPU-поллер;
+//! `BatchFinished` → State::Finished; retry'и из экрана Finished живут, пока
+//! пользователь не уйдёт с него (shutdown) или не выйдет из TUI — итог серии
+//! ([`runner::exit_code`]) становится кодом завершения процесса.
+//!
+//! Bracketed paste: `EnableBracketedPaste` при старте, `Disable` — при любом
+//! выходе, включая панику (panic hook цепочкой поверх хука ratatui).
 
 pub mod app;
 pub mod event;
+pub mod gpu;
+pub mod persist;
+pub mod popup;
 pub mod runner;
 pub mod widgets;
 
-use std::io;
+use std::io::{self};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::ExecutableCommand;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::task::JoinHandle;
 
-pub use app::{App, State};
-use event::{spawn_input_thread, AppEvent};
+use crate::config::Model;
+use crate::local_fs::LocalFs;
+use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
+use crate::smb::SmbClient;
+use crate::tui::event::{spawn_input_thread, AppEvent, RunSpec, Stage};
+use crate::tui::gpu::GpuEvent;
+use crate::tui::persist::TuiSettings;
+use crate::tui::runner::{RunnerHandle, RunnerOptions};
+use crate::tui::widgets::{FileBadge, FileRowView, FooterView, HeaderView, ScreenView, Tab};
+
+use app::{App, FileOutcome, FileView, State};
 
 /// Минимально поддерживаемый размер терминала.
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
 /// Период tick-событий event loop.
 const TICK_MILLIS: u64 = 250;
+/// Формат стемов и расширение для resume-плана (как у CLI по умолчанию).
+const OUTPUT_FORMAT: &str = "flac";
+/// Колонки waveform-огибающей (сжимается под ширину Details при рендере).
+const ENVELOPE_COLUMNS: usize = 48;
+/// Кооперативная пауза при включённой паузе (применяется на границе файлов).
+const PAUSE_WHEN_PAUSED: Duration = Duration::from_secs(30);
 
-/// Точка входа TUI: `init → event loop → restore`.
+/// Точка входа TUI: `init → event loop → restore`, возвращает код выхода
+/// последнего прогона (`runner::exit_code`; 0 — прогонов не было).
 ///
 /// Panic-safe: `ratatui::init` ставит panic hook, восстанавливающий
-/// терминал до паники; `restore` выполняется при любом обычном выходе
-/// (quit, ошибка event loop).
-pub async fn run() -> io::Result<()> {
+/// терминал; поверх него цепочкой ставится hook, гасящий bracketed paste.
+pub async fn run() -> io::Result<i32> {
     let terminal = ratatui::init();
+    wrap_panic_hook_with_paste_restore();
+    let paste_enabled = enable_bracketed_paste().is_ok();
     let result = event_loop(terminal).await;
     ratatui::restore();
+    if paste_enabled {
+        let _ = disable_bracketed_paste();
+    }
     result
 }
 
-/// Основной цикл: отрисовать кадр → ждать событие (ключ/тик) → обновить App.
+/// Основной цикл: отрисовать кадр → ждать событие (ввод/внутренние/GPU/tick)
+/// → обновить App → синхронизировать флаги управления с раннером.
 ///
-/// Выход: `app.should_quit()` после обработки события либо закрытие
-/// канала ввода (поток-читатель умер).
-async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
-    spawn_input_thread(tx);
+/// Выход: quit по клавише либо закрытие канала ввода (читатель умер).
+async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
+    let (tx_input, mut rx_input) = mpsc::unbounded_channel::<AppEvent>();
+    spawn_input_thread(tx_input);
+    let (tx_events, mut rx_events) = mpsc::unbounded_channel::<AppEvent>();
+    let (tx_gpu, mut rx_gpu) = mpsc::unbounded_channel::<GpuEvent>();
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_MILLIS));
     let mut app = App::new();
+    let mut run: Option<ActiveRun> = None;
+    let mut popup_open = false;
+    let mut quit = false;
 
-    loop {
+    while !quit {
         terminal.draw(|frame| draw(frame, &app))?;
         tokio::select! {
-            maybe_event = rx.recv() => match maybe_event {
+            maybe_event = rx_input.recv() => match maybe_event {
                 Some(event) => app.handle(&event),
-                None => break, // читатель закрыл канал — завершаемся чисто
+                None => quit = true, // читатель умер — завершаемся чисто
+            },
+            maybe_event = rx_events.recv() => if let Some(event) = maybe_event {
+                on_internal_event(&mut app, event, &tx_events, &tx_gpu, &mut run);
+            },
+            maybe_gpu = rx_gpu.recv() => if let Some(event) = maybe_gpu {
+                app.handle(&AppEvent::Gpu(event));
             },
             _ = tick.tick() => app.handle(&AppEvent::Tick),
         }
-        if app.should_quit() {
-            break;
+        // Попап открыт только что перешедшему в Config: преффилл из пресета.
+        if app.state() == State::Config && !popup_open {
+            popup_open = true;
+            app.open_config(persist::load());
         }
+        if app.state() != State::Config {
+            popup_open = false;
+        }
+        // Уход с экрана Finished (в Idle/Config) гасит серию retry'ев
+        // прежнего прогона; в Running run — сам активный прогон.
+        if matches!(app.state(), State::Idle | State::Config) {
+            if let Some(active) = run.take() {
+                discard_run(active);
+            }
+        }
+        sync_run_controls(&mut app, run.as_ref());
+        if let Some(spec) = app.take_start_request() {
+            spawn_validation(spec, tx_events.clone());
+        }
+        quit |= app.should_quit();
     }
-    Ok(())
+    Ok(finish_run(run.take()).await)
 }
 
-/// Выбор кадра: слишком маленький терминал → заглушка, иначе основной UI.
+/// Активный прогон: ручка раннера + хэндл GPU-поллера.
+struct ActiveRun {
+    handle: RunnerHandle,
+    gpu: JoinHandle<()>,
+}
+
+/// Обработка внутреннего события: в App, затем — запуск прогона на
+/// успешной валидации (App уже перешёл в Running).
+fn on_internal_event(
+    app: &mut App,
+    event: AppEvent,
+    tx_events: &UnboundedSender<AppEvent>,
+    tx_gpu: &UnboundedSender<GpuEvent>,
+    run: &mut Option<ActiveRun>,
+) {
+    app.handle(&event);
+    let AppEvent::ValidationFinished { spec, error: None } = &event else {
+        return;
+    };
+    if app.state() != State::Running {
+        return; // попап закрыли, пока шла проверка — старт отменён
+    }
+    let _ = persist::save(&settings_of_spec(spec));
+    *run = Some(start_run(spec.clone(), tx_events.clone(), tx_gpu.clone()));
+}
+
+/// Управление активным прогоном по флагам App (cancel/pause/retry).
+fn sync_run_controls(app: &mut App, run: Option<&ActiveRun>) {
+    let Some(active) = run else {
+        return;
+    };
+    if app.cancel_requested() {
+        active.handle.cancel();
+    }
+    active.handle.set_pause(app.paused().then_some(PAUSE_WHEN_PAUSED));
+    for name in app.take_retry_requests() {
+        active.handle.request_retry(name);
+    }
+}
+
+/// Запустить серию: бэкенды по спеке (LocalFs / SmbClient + EngineRunner),
+/// раннер и GPU-поллер. Прежний прогон к этому моменту погашен.
+fn start_run(spec: RunSpec, tx_events: UnboundedSender<AppEvent>, tx_gpu: UnboundedSender<GpuEvent>) -> ActiveRun {
+    let smb: Arc<dyn SmbOps + Send + Sync> = if spec.local_mode {
+        Arc::new(LocalFs)
+    } else {
+        Arc::new(SmbClient::new(spec.host.clone(), spec.share.clone(), None))
+    };
+    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(EngineRunner::new(
+        &venv_path(),
+        &driver_script(),
+        spec.model.checkpoint(),
+        OUTPUT_FORMAT,
+    ));
+    let deps = runner::RunnerDeps { smb, engine };
+    let opts = RunnerOptions {
+        remote_dir: spec.remote_dir.clone(),
+        local_dir: spec.local_dir.clone(),
+        stem_ext: OUTPUT_FORMAT.to_string(),
+        dedup: spec.dedup,
+        pause_between_files: None,
+        envelope_columns: ENVELOPE_COLUMNS,
+    };
+    let handle = runner::spawn(deps, opts, tx_events);
+    let gpu = gpu::spawn_poller(tx_gpu);
+    ActiveRun { handle, gpu }
+}
+
+/// Погасить серию без ожидания итога (уход с экрана Finished, новый старт).
+fn discard_run(active: ActiveRun) {
+    active.handle.cancel();
+    active.handle.shutdown();
+    active.gpu.abort();
+}
+
+/// Итог серии при выходе: shutdown → объединённый [`crate::pipeline::BatchResult`]
+/// → exit-code. Ошибка (прогон не состоялся) — код 1.
+async fn finish_run(run: Option<ActiveRun>) -> i32 {
+    let Some(active) = run else {
+        return 0;
+    };
+    active.handle.shutdown();
+    active.gpu.abort();
+    match active.handle.finish().await {
+        Ok(result) => runner::exit_code(&result),
+        Err(_) => 1,
+    }
+}
+
+/// Тяжёлая валидация полей попапа в spawn_blocking: локальная директория
+/// существует/создаётся, удалённая листится реальным бэкендом (ошибка
+/// NT_STATUS возвращается текстом — видна в попапе).
+fn spawn_validation(spec: RunSpec, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let error = tokio::task::spawn_blocking({
+            let spec = spec.clone();
+            move || validate_spec(&spec)
+        })
+        .await
+        .unwrap_or_else(|err| Some(format!("validation task crashed: {err}")));
+        let _ = tx.send(AppEvent::ValidationFinished { spec, error });
+    });
+}
+
+/// Проверки спеки: `None` — всё в порядке, `Some(текст)` — ошибка для попапа.
+fn validate_spec(spec: &RunSpec) -> Option<String> {
+    if spec.remote_dir.as_os_str().is_empty() {
+        return Some("исходная директория не указана".to_string());
+    }
+    if !spec.local_mode {
+        if spec.host.trim().is_empty() {
+            return Some("хост SMB-сервера не указан".to_string());
+        }
+        if spec.share.trim().is_empty() {
+            return Some("имя шары не указано".to_string());
+        }
+    }
+    if !spec.local_dir.exists() {
+        if let Err(err) = std::fs::create_dir_all(&spec.local_dir) {
+            return Some(format!("локальная директория: {err}"));
+        }
+    }
+    let listing = if spec.local_mode {
+        LocalFs.list(&spec.remote_dir)
+    } else {
+        SmbClient::new(&spec.host, &spec.share, None).list(&spec.remote_dir)
+    };
+    listing.err().map(|err| err.to_string())
+}
+
+/// Пресет из спеки для записи в `tui.toml`.
+fn settings_of_spec(spec: &RunSpec) -> TuiSettings {
+    TuiSettings {
+        host: spec.host.clone(),
+        share: spec.share.clone(),
+        remote_dir: spec.remote_dir.to_string_lossy().into_owned(),
+        local_dir: spec.local_dir.to_string_lossy().into_owned(),
+        model: persist::model_label(spec.model).to_string(),
+        dedup: spec.dedup,
+        local_mode: spec.local_mode,
+    }
+}
+
+/// venv с audio-separator (как дефолт CLI).
+fn venv_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv")
+}
+
+/// Python-драйвер относительно крейта (путь фиксируется при сборке).
+fn driver_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/separator_driver.py")
+}
+
+// --- bracketed paste -----------------------------------------------------------
+
+fn enable_bracketed_paste() -> io::Result<()> {
+    io::stdout().execute(EnableBracketedPaste).map(|_| ())
+}
+
+fn disable_bracketed_paste() -> io::Result<()> {
+    io::stdout().execute(DisableBracketedPaste).map(|_| ())
+}
+
+/// Panic hook цепочкой: сначала гасим paste, затем прежний hook (ratatui
+/// восстанавливает raw mode/альтернативный экран).
+fn wrap_panic_hook_with_paste_restore() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_bracketed_paste();
+        previous(info);
+    }));
+}
+
+// --- композиция кадра ------------------------------------------------------------
+
+/// Выбор кадра: слишком маленький терминал → заглушка, иначе основной UI
+/// (+ попап поверх в состоянии Config).
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     if is_too_small(area) {
         draw_too_small(frame, area);
-    } else {
-        draw_main(frame, app, area);
+        return;
+    }
+    widgets::render_screen(frame, area, &screen_view(app));
+    if app.state() == State::Config {
+        if let Some(popup) = app.popup_view() {
+            popup::render_popup(frame, area, &popup);
+        }
     }
 }
 
@@ -81,14 +332,96 @@ fn is_too_small(area: Rect) -> bool {
     area.width < MIN_WIDTH || area.height < MIN_HEIGHT
 }
 
-/// Основной кадр: рамка, текущий экран автомата, подсказки клавиш.
-fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
-    let text = vec![
-        Line::from(format!("Экран: {:?}", app.state())),
-        Line::from("Enter: настроить · q: выход"),
-    ];
-    let block = Block::bordered().title("audio_split_tui");
-    frame.render_widget(Paragraph::new(text).block(block), area);
+/// Взгляд на кадр из состояния App (шапка из конфига прогона, таблица,
+/// сводка в footer; Details-панель — этап 05).
+fn screen_view(app: &App) -> ScreenView {
+    ScreenView {
+        header: header_view(app),
+        tab: Tab::Files,
+        files: app.files().iter().map(file_row_view).collect(),
+        selected: (!app.files().is_empty()).then_some(app.selected_index()),
+        details: None,
+        footer: FooterView { summary: footer_summary(app) },
+    }
+}
+
+/// Шапка: подключение/дир/модель из открытого конфига, GPU-слот из поллера.
+fn header_view(app: &App) -> HeaderView {
+    let Some(cfg) = app.config() else {
+        return HeaderView { gpu: app.gpu().cloned(), ..HeaderView::default() };
+    };
+    HeaderView {
+        host: cfg.host.as_str().to_string(),
+        share: cfg.share.as_str().to_string(),
+        remote_dir: cfg.remote_dir.as_str().to_string(),
+        model: model_label(cfg.model).to_string(),
+        gpu: app.gpu().cloned(),
+    }
+}
+
+/// Метка модели как в CLI (`sw` | `6s`).
+fn model_label(model: Model) -> &'static str {
+    persist::model_label(model)
+}
+
+/// Строка таблицы из модели прогона: бейдж по исходу, стадия текстом.
+fn file_row_view(view: &FileView) -> FileRowView {
+    FileRowView {
+        badge: file_badge(view),
+        name: view.name.clone(),
+        stage: stage_label(view.stage).to_string(),
+        pct: view.pct.unwrap_or(0.0),
+        stems_done: 0,
+    }
+}
+
+/// Бейдж: терминальный исход приоритетен, иначе RUN.
+fn file_badge(view: &FileView) -> FileBadge {
+    match &view.outcome {
+        Some(FileOutcome::Ok) => FileBadge::Ok,
+        Some(FileOutcome::Failed { .. }) => FileBadge::Fail,
+        Some(FileOutcome::Duplicate { .. }) => FileBadge::Dup,
+        Some(FileOutcome::Skipped { .. }) => FileBadge::Skip,
+        None => FileBadge::Run,
+    }
+}
+
+/// Метка стадии (совпадает с терминологией пайплайна).
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Queued => "queued",
+        Stage::Download => "download",
+        Stage::Separate => "separate",
+        Stage::Upload => "upload",
+        Stage::Rename => "rename",
+    }
+}
+
+/// Сводка footer: счётчики исходов; после завершения — длительность,
+/// при батчевой ошибке прогона — её текст.
+fn footer_summary(app: &App) -> String {
+    if let Some(error) = app.run_error() {
+        return format!("ошибка: {error}");
+    }
+    let mut counts = [0_usize; 4]; // ok, fail, dup, skip
+    for file in app.files() {
+        let slot = match &file.outcome {
+            Some(FileOutcome::Ok) => Some(0),
+            Some(FileOutcome::Failed { .. }) => Some(1),
+            Some(FileOutcome::Duplicate { .. }) => Some(2),
+            Some(FileOutcome::Skipped { .. }) => Some(3),
+            None => None,
+        };
+        if let Some(slot) = slot {
+            counts[slot] += 1;
+        }
+    }
+    let [ok, fail, dup, skip] = counts;
+    let mut summary = format!("OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}");
+    if let Some(outcome) = app.outcome() {
+        summary.push_str(&format!(" · {}", widgets::format_mmss(outcome.elapsed.as_secs_f64())));
+    }
+    summary
 }
 
 /// Заглушка при недостаточном размере (нужно `MIN_WIDTH`×`MIN_HEIGHT`).
@@ -109,6 +442,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::event::PlanSummary;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -126,17 +460,34 @@ mod tests {
             .collect()
     }
 
+    fn enter() -> AppEvent {
+        AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+    }
+
+    fn plan_fixture() -> PlanSummary {
+        PlanSummary {
+            pending: ["a.wav".to_string()].into_iter().collect(),
+            ..PlanSummary::default()
+        }
+    }
+
+    // --- рендеры ------------------------------------------------------------
+
     #[test]
-    fn testbackend_smoke_renders_idle_frame() {
+    fn idle_screen_renders_frame_with_empty_state() {
         let text = render(100, 30, &App::new());
-        assert!(text.contains("audio_split_tui"));
-        assert!(text.contains("Idle"));
+        assert!(text.contains("audio_split"));
+        assert!(text.contains("нет файлов — Esc → настройка"));
+        assert!(text.contains("[s]tart"));
     }
 
     #[test]
     fn min_size_still_renders_main_ui() {
         let text = render(MIN_WIDTH, MIN_HEIGHT, &App::new());
-        assert!(text.contains("audio_split_tui"));
+        assert!(text.contains("audio_split"));
         assert!(!text.contains("маленький"));
     }
 
@@ -148,17 +499,178 @@ mod tests {
     }
 
     #[test]
-    fn running_state_is_rendered() {
+    fn config_state_renders_popup_over_screen() {
         let mut app = App::new();
-        app.handle(&AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::empty(),
-        )));
-        app.handle(&AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::empty(),
-        )));
+        app.handle(&enter()); // Idle → Config (попап откроет event loop)
+        app.open_config(persist::load());
+
         let text = render(100, 30, &app);
-        assert!(text.contains("Running"));
+        assert!(text.contains("Запуск прогона"));
+        assert!(text.contains("Host:"));
+        assert!(text.contains("[1]Files"), "экран за попапом жив");
+    }
+
+    #[test]
+    fn running_state_renders_table_with_run_badge() {
+        let mut app = App::new();
+        app.handle(&AppEvent::RunStarted { plan: plan_fixture() });
+        let text = render(100, 30, &app);
+        assert!(text.contains("FILES"));
+        assert!(text.contains("RUN"));
+        assert!(text.contains("a.wav"));
+    }
+
+    #[test]
+    fn gpu_snapshot_renders_in_header_and_na_without_it() {
+        let mut app = App::new();
+        let text = render(100, 30, &app);
+        assert!(text.contains("GPU: n/a"));
+
+        app.handle(&AppEvent::Gpu(GpuEvent::Info(Some(crate::tui::gpu::GpuInfo {
+            name: "RTX".into(),
+            util_percent: Some(10),
+            mem_used_mib: 1024,
+            mem_total_mib: 8192,
+        }))));
+        let text = render(100, 30, &app);
+        assert!(text.contains("1.0/8.0GiB"));
+        assert!(!text.contains("n/a"));
+    }
+
+    // --- валидация спеки (реальный диск, без сети) ----------------------------
+
+    #[test]
+    fn validate_local_spec_with_existing_dirs_is_ok() {
+        let base = std::env::temp_dir().join(format!("audio_split_mod_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let spec = RunSpec {
+            host: String::new(),
+            share: String::new(),
+            remote_dir: base.clone(),
+            local_dir: base.join("work"),
+            model: Model::Sw,
+            dedup: true,
+            local_mode: true,
+        };
+
+        let error = validate_spec(&spec);
+
+        assert_eq!(error, None);
+        assert!(spec.local_dir.exists(), "локальная директория создана при проверке");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_reports_missing_remote_directory() {
+        let base = std::env::temp_dir().join(format!("audio_split_mod_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let spec = RunSpec {
+            host: String::new(),
+            share: String::new(),
+            remote_dir: base.join("nope"),
+            local_dir: base.clone(),
+            model: Model::Sw,
+            dedup: true,
+            local_mode: true,
+        };
+
+        let error = validate_spec(&spec);
+
+        assert!(error.is_some_and(|message| message.contains("no such file") || message.contains("No such file")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_smb_without_host_fails_before_spawn() {
+        let spec = RunSpec {
+            host: String::new(),
+            share: "media".into(),
+            remote_dir: "/rec".into(),
+            local_dir: std::env::temp_dir(),
+            model: Model::Sw,
+            dedup: true,
+            local_mode: false,
+        };
+
+        let error = validate_spec(&spec);
+
+        assert!(error.is_some(), "пустой хост — ошибка до запуска smbclient");
+        assert!(error.unwrap().contains("хост"));
+    }
+
+    // --- жизненный цикл прогона (реальный раннер на LocalFs) --------------------
+
+    /// Движок-заглушка: пайплайн с пустым планом его не вызывает.
+    #[allow(dead_code)]
+    struct IdleEngine;
+
+    impl EngineOps for IdleEngine {
+        fn separate_batch(
+            &self,
+            _files: &[std::path::PathBuf],
+            _output_dir: &std::path::Path,
+            _on_event: &mut dyn FnMut(crate::pipeline::EngineEvent),
+        ) -> Result<(), crate::error::AppError> {
+            Err(crate::error::AppError::Pipeline("движок не должен зваться".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_run_completes_with_zero_files_and_exit_code_zero() {
+        let base = std::env::temp_dir().join(format!("audio_split_mod_run_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let (tx_events, mut rx_events) = mpsc::unbounded_channel();
+        let (tx_gpu, _rx_gpu) = mpsc::unbounded_channel();
+        let spec = RunSpec {
+            host: String::new(),
+            share: String::new(),
+            remote_dir: base.clone(),
+            local_dir: base.join("work"),
+            model: Model::Sw,
+            dedup: true,
+            local_mode: true,
+        };
+
+        let active = start_run(spec, tx_events, tx_gpu);
+        let event = tokio::time::timeout(Duration::from_secs(30), rx_events.recv())
+            .await
+            .expect("раннер завис")
+            .expect("канал закрыт");
+        let code = finish_run(Some(active)).await;
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(matches!(event, AppEvent::RunStarted { ref plan } if plan.pending.is_empty()));
+        assert_eq!(code, 0, "пустой прогон без отказов — код 0");
+    }
+
+    #[test]
+    fn settings_and_model_labels_roundtrip_through_spec() {
+        let spec = RunSpec {
+            host: "nas".into(),
+            share: "media".into(),
+            remote_dir: "/rec".into(),
+            local_dir: "/tmp/w".into(),
+            model: Model::SixS,
+            dedup: false,
+            local_mode: true,
+        };
+
+        let settings = settings_of_spec(&spec);
+
+        assert_eq!(settings.model, "6s");
+        assert_eq!(settings.model(), Model::SixS);
+        assert!(!settings.dedup);
+        assert!(settings.local_mode);
+        assert_eq!(settings.remote_dir, "/rec");
+    }
+
+    #[test]
+    fn finish_run_without_active_run_is_zero() {
+        // Синхронная часть: без прогона код 0 (обёртка в tokio для await).
+        let code = tokio::runtime::Runtime::new().unwrap().block_on(finish_run(None));
+        assert_eq!(code, 0);
     }
 }
