@@ -14,12 +14,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Model;
 use crate::pipeline::FileStatus;
-use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
+use crate::tui::event::{AppEvent, BatchOutcome, EMPTY_PLAN_HINT, PlanSummary, RunSpec, Stage};
 use crate::tui::gpu::{GpuEvent, GpuInfo};
 use crate::tui::log::{format_hhmmss, now_unix_secs, LogBuffer, PAGE_LINES};
+use crate::tui::pathmode::normalize_pasted_path;
 use crate::tui::persist::TuiSettings;
 use crate::tui::popup::{PopupView, TextFieldView};
 use crate::tui::widgets::{GpuView, Tab, TABS};
+
+/// Статус-строка попапа после распознавания SMB/GVFS-пути из paste.
+const SMB_HINT_STATUS: &str = "Распознан SMB/GVFS путь — host/share/папка заполнены";
 
 /// Статус валидации полей попапа запуска.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +32,10 @@ pub enum ValidationStatus {
     Idle,
     /// Идёт тяжёлая проверка (листинг шары в spawn_blocking).
     Checking,
-    /// Проверки пройдены (прогон запускается).
-    Ok,
+    /// Проверки пройдены; `wav_count` — найдено .wav листингом директории.
+    /// Старт не блокируется даже при нуле, но факт виден до запуска:
+    /// прогон подтверждается повторным Enter.
+    Ok { wav_count: usize },
     /// Ошибка (текст показывается в попапе).
     Failed(String),
 }
@@ -218,6 +224,8 @@ pub struct ConfigState {
     pub local_mode: bool,
     pub focus: Focus,
     pub validation: ValidationStatus,
+    /// Статус-строка распознанного SMB/GVFS-paste (`None` — обычная вставка).
+    pub hint: Option<String>,
 }
 
 impl ConfigState {
@@ -233,6 +241,44 @@ impl ConfigState {
             local_mode: preset.local_mode,
             focus: Focus::default(),
             validation: ValidationStatus::Idle,
+            hint: None,
+        }
+    }
+
+    /// Вставка в попапе: SMB/GVFS-путь разбирается на поля (host/share/
+    /// remote_dir, local mode выключается) со статус-строкой; иначе — текст
+    /// в активное поле по фокусу.
+    pub fn paste_text(&mut self, text: &str) {
+        if self.apply_smb_hint(text) {
+            return;
+        }
+        self.hint = None;
+        if let Some(field) = self.focused_field_mut() {
+            field.insert_str(&sanitize_paste(text));
+        }
+        self.invalidate_validation();
+    }
+
+    /// Распознать SMB/GVFS-путь и заполнить поля. `true` — распознан.
+    pub fn apply_smb_hint(&mut self, text: &str) -> bool {
+        let Some(found) = normalize_pasted_path(text) else {
+            return false;
+        };
+        self.host = TextField::new(found.host);
+        self.share = TextField::new(found.share);
+        self.remote_dir = TextField::new(found.remote_dir);
+        self.local_mode = false;
+        self.focus = Focus::RemoteDir;
+        self.hint = Some(SMB_HINT_STATUS.to_string());
+        self.invalidate_validation();
+        true
+    }
+
+    /// Успешная валидация устаревает при любом изменении полей: следующий
+    /// Enter перепроверит факты, подтверждённого старта не будет.
+    fn invalidate_validation(&mut self) {
+        if matches!(self.validation, ValidationStatus::Ok { .. }) {
+            self.validation = ValidationStatus::Idle;
         }
     }
 
@@ -306,11 +352,13 @@ impl ConfigState {
                 if let Some(field) = self.focused_field_mut() {
                     field.backspace();
                 }
+                self.invalidate_validation();
             }
             KeyCode::Delete => {
                 if let Some(field) = self.focused_field_mut() {
                     field.delete();
                 }
+                self.invalidate_validation();
             }
             KeyCode::Left => self.on_horizontal(false),
             KeyCode::Right => self.on_horizontal(true),
@@ -324,7 +372,10 @@ impl ConfigState {
                     field.to_end();
                 }
             }
-            KeyCode::Char(c) => self.on_char(c),
+            KeyCode::Char(c) => {
+                self.on_char(c);
+                self.invalidate_validation();
+            }
             _ => {}
         }
     }
@@ -333,6 +384,7 @@ impl ConfigState {
     fn on_horizontal(&mut self, forward: bool) {
         if self.focus == Focus::Model {
             self.toggle_model();
+            self.invalidate_validation();
             return;
         }
         if let Some(field) = self.focused_field_mut() {
@@ -404,6 +456,9 @@ pub struct App {
     force_kill: bool,
     /// Paste вне попапа: путь для преффилла Remote dir (drain event loop'ом).
     paste_prefill: Option<String>,
+    /// Подтверждённый старт (повторный Enter после успешной валидации):
+    /// спека для event loop'а — запустить прогон (drain).
+    confirmed_start: Option<RunSpec>,
     /// Момент старта прогона: общий таймер и ETA в футере.
     run_started_at: Option<Instant>,
     /// Счётчик тиков: анимация indeterminate-баров и спиннеров.
@@ -451,18 +506,27 @@ impl App {
         std::mem::take(&mut self.paste_prefill)
     }
 
+    /// Забрать подтверждённую спеку (event loop запускает по ней прогон).
+    pub fn take_confirmed_start(&mut self) -> Option<RunSpec> {
+        self.confirmed_start.take()
+    }
+
     /// Забрать запрос форс-kill'а (drain: event loop дёргает RunnerHandle).
     pub fn take_force_kill(&mut self) -> bool {
         std::mem::take(&mut self.force_kill)
     }
 
-    /// Преффилл поля Remote dir и фокус на нём (paste пути вне попапа).
+    /// Преффилл попапа из paste вне попапа: SMB/GVFS-путь разбирается на
+    /// поля (host/share/remote_dir, SMB-режим), локальный — в Remote dir
+    /// с фокусом на нём.
     pub fn prefill_remote_dir(&mut self, dir: &str) {
         let Some(cfg) = self.config.as_mut() else {
             return;
         };
-        cfg.remote_dir = TextField::new(dir);
-        cfg.focus = Focus::RemoteDir;
+        if !cfg.apply_smb_hint(dir) {
+            cfg.remote_dir = TextField::new(dir);
+            cfg.focus = Focus::RemoteDir;
+        }
     }
 
     /// Ручная очистка списка файлов (Idle/Finished, клавиша `x`).
@@ -528,6 +592,7 @@ impl App {
             local_mode: cfg.local_mode,
             focus: cfg.focus,
             validation: cfg.validation.clone(),
+            hint: cfg.hint.clone(),
         })
     }
 
@@ -575,8 +640,8 @@ impl App {
             AppEvent::Mouse(_) => {}
             AppEvent::Paste { text } => self.on_paste(text),
             AppEvent::Gpu(event) => self.on_gpu(event.clone()),
-            AppEvent::ValidationFinished { spec, error } => {
-                self.on_validation_finished(spec.clone(), error.clone());
+            AppEvent::ValidationFinished { spec, error, wav_count } => {
+                self.on_validation_finished(spec.clone(), error.clone(), *wav_count);
             }
             AppEvent::RunStarted { plan } => self.on_run_started(plan),
             AppEvent::RunFailed { error } => {
@@ -901,6 +966,10 @@ impl App {
         self.paste_prefill = None;
         self.run_started_at = Some(Instant::now());
         self.tick_count = 0;
+        // Пустой план — не «тихое отработало»: явная подсказка в журнале.
+        if plan.is_empty() {
+            self.push_log(EMPTY_PLAN_HINT);
+        }
     }
 
     /// Авторитетная сверка статусов из [`BatchResult`] (в т.ч. kept дублей)
@@ -981,13 +1050,18 @@ impl App {
         }
     }
 
-    /// Enter в попапе: быстрые проверки → запрос старта + Checking.
+    /// Enter в попапе: без валидации — быстрые проверки → запрос проверки;
+    /// после успешной проверки (факт уже показан) — подтверждение старта.
     /// Повторный Enter во время проверки игнорируется.
     fn begin_start(&mut self) {
         let Some(cfg) = self.config.as_ref() else {
             return;
         };
         if cfg.validation == ValidationStatus::Checking {
+            return;
+        }
+        if matches!(cfg.validation, ValidationStatus::Ok { .. }) {
+            self.confirm_start();
             return;
         }
         let (validation, pending) = match cfg.local_error() {
@@ -998,6 +1072,16 @@ impl App {
             cfg.validation = validation;
         }
         self.pending_start = pending;
+    }
+
+    /// Повторный Enter после успешной валидации: спека снимается и уходит
+    /// event loop'у на запуск (`take_confirmed_start`).
+    fn confirm_start(&mut self) {
+        let Some(cfg) = self.config.as_ref() else {
+            return;
+        };
+        self.confirmed_start = Some(cfg.to_spec());
+        self.state = State::Running;
     }
 
     /// Вставка из буфера (bracketed paste):
@@ -1012,9 +1096,7 @@ impl App {
         }
         if self.state == State::Config {
             if let Some(cfg) = self.config.as_mut() {
-                if let Some(field) = cfg.focused_field_mut() {
-                    field.insert_str(&sanitize_paste(text));
-                }
+                cfg.paste_text(text);
             }
             return;
         }
@@ -1033,10 +1115,10 @@ impl App {
         self.gpu = info.as_ref().map(gpu_view);
     }
 
-    /// Итог валидации: ok → Running (конфиг остаётся для шапки), ошибка →
-    /// остаёмся в попапе с сообщением. Пока шла проверка, попап могли
-    /// закрыть — устаревший результат игнорируется.
-    fn on_validation_finished(&mut self, _spec: RunSpec, error: Option<String>) {
+    /// Итог валидации: факт (число .wav) показывается в попапе, старт —
+    /// повторным Enter; ошибка — остаёмся в попапе с сообщением. Пока шла
+    /// проверка, попап могли закрыть — устаревший результат игнорируется.
+    fn on_validation_finished(&mut self, _spec: RunSpec, error: Option<String>, wav_count: usize) {
         self.pending_start = None;
         if self.state != State::Config {
             return;
@@ -1046,10 +1128,7 @@ impl App {
         };
         match error {
             Some(message) => cfg.validation = ValidationStatus::Failed(message),
-            None => {
-                cfg.validation = ValidationStatus::Ok;
-                self.state = State::Running;
-            }
+            None => cfg.validation = ValidationStatus::Ok { wav_count },
         }
     }
 }

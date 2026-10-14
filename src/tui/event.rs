@@ -49,6 +49,16 @@ pub struct PlanSummary {
     pub skipped_done: Vec<String>,
 }
 
+impl PlanSummary {
+    /// План без единого файла: в директории не нашлось .wav (проверь remote-dir).
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+            && self.skipped_converted.is_empty()
+            && self.skipped_duplicate.is_empty()
+            && self.skipped_done.is_empty()
+    }
+}
+
 /// Итог батча для UI: снимок [`BatchResult`] без рантайм-полей (`Instant`),
 /// поэтому `PartialEq`/`Clone` — пригоден для событий и состояния App.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +89,10 @@ impl From<&BatchResult> for BatchOutcome {
         }
     }
 }
+
+/// Подсказка при пустом плане/итоге: «отработало», не сделав ничего —
+/// причина почти всегда в remote-dir. Одна формулировка для Log и футера.
+pub const EMPTY_PLAN_HINT: &str = "0 .wav в директории — проверь remote-dir";
 
 /// Спецификация старта из попапа: значения полей на момент Enter.
 ///
@@ -122,8 +136,9 @@ pub enum AppEvent {
     /// Снимок GPU-поллера (маппинг в `GpuView` шапки).
     Gpu(GpuEvent),
     /// Валидация полей попапа завершена (spawn_blocking): `None` — все
-    /// проверки пройдены, конфигурация готова к старту прогона.
-    ValidationFinished { spec: RunSpec, error: Option<String> },
+    /// проверки пройдены (`wav_count` — найдено .wav листингом), спека ждёт
+    /// подтверждения старта повторным Enter.
+    ValidationFinished { spec: RunSpec, error: Option<String>, wav_count: usize },
     /// Runner собрал план прогона: засев таблицы файлов, Running.
     RunStarted { plan: PlanSummary },
     /// Runner не смог начать прогон (скан/сеть/отмена до старта).

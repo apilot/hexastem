@@ -393,9 +393,12 @@ async fn e2e_popup_to_finished_with_summary_dedup_log_and_gpu() {
     // Попап: paste путей → спека → та же валидация, что в event loop.
     let mut app = App::new();
     let spec = start_from_popup(&mut app, &base, &work);
-    assert_eq!(validate_spec(&spec), None, "валидация реальных директорий проходит");
-    apply_event(&mut app, &AppEvent::ValidationFinished { spec: spec.clone(), error: None });
+    let wav_count = validate_spec(&spec).expect("валидация реальных директорий проходит");
+    apply_event(&mut app, &AppEvent::ValidationFinished { spec: spec.clone(), error: None, wav_count });
+    assert_eq!(app.state(), State::Config, "после проверки попап ждёт подтверждения");
+    app.handle(&key(KeyCode::Enter)); // подтверждение старта после показа факта
     assert_eq!(app.state(), State::Running);
+    assert_eq!(app.take_confirmed_start().as_ref(), Some(&spec));
 
     // GPU-поллер (мок-вывод nvidia-smi) → шапка.
     assert!(render(&app).contains("GPU: n/a"), "без данных — заглушка n/a");
@@ -667,10 +670,10 @@ async fn e2e_validation_rejects_missing_remote_dir_and_stays_in_popup() {
     let mut app = App::new();
 
     let spec = start_from_popup(&mut app, &base.join("nope"), &work);
-    let error = validate_spec(&spec).expect("несуществующая директория — ошибка");
+    let error = validate_spec(&spec).expect_err("несуществующая директория — ошибка");
     assert!(error.contains("No such file") || error.contains("no such file"), "{error}");
 
-    apply_event(&mut app, &AppEvent::ValidationFinished { spec, error: Some(error) });
+    apply_event(&mut app, &AppEvent::ValidationFinished { spec, error: Some(error), wav_count: 0 });
     assert_eq!(app.state(), State::Config, "прогон не стартовал");
     let text = render(&app);
     assert!(text.contains("Запуск прогона"), "попап открыт");

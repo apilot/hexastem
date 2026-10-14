@@ -13,9 +13,9 @@
 //!
 //! Поля: Host / Share / Remote dir / Local dir (текст с курсором),
 //! Model (sw|6s), Dedup и Local mode (переключатели пробелом). Таб/Shift-Tab
-//! — фокус, Enter — старт, Esc — отмена. Для сфокусированного текстового
-//! поля ставится терминальный курсор; длинные значения скроллятся так,
-//! чтобы курсор оставался виден.
+//! — фокус, Enter — проверка и старт, Esc — отмена. Для сфокусированного
+//! текстового поля ставится терминальный курсор; длинные значения скроллятся
+//! так, чтобы курсор оставался виден.
 
 use crossterm::event::KeyCode;
 
@@ -38,6 +38,9 @@ const POPUP_HEIGHT: u16 = 13;
 const STYLE_DIM: Style = Style::new().fg(Color::DarkGray);
 const STYLE_HINT: Style = Style::new().fg(Color::Gray);
 const STYLE_ACTIVE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+const STYLE_INFO: Style = Style::new().fg(Color::Cyan);
+const STYLE_OK: Style = Style::new().fg(Color::Green);
+const STYLE_WARN: Style = Style::new().fg(Color::Yellow);
 
 /// Значение текстового поля (снимок из [`crate::tui::app::TextField`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -65,6 +68,8 @@ pub struct PopupView {
     pub focus: Focus,
     /// Статус валидации.
     pub validation: ValidationStatus,
+    /// Статус-строка распознанного SMB/GVFS-paste (`None` — нет).
+    pub hint: Option<String>,
 }
 
 /// Прямоугольник попапа: по центру экрана, не больше [`POPUP_WIDTH`]×[`POPUP_HEIGHT`].
@@ -106,9 +111,15 @@ fn strip_y(inner: Rect, y: u16) -> Rect {
     Rect { x: inner.x, y, width: inner.width, height: 1 }
 }
 
-/// Строки попапа: поля, пустая строка, статус, две строки подсказок.
+/// Строки попапа: поля, пустая строка (или статус SMB/GVFS-paste), статус
+/// валидации, две строки подсказок.
 fn field_rows(inner: Rect, view: &PopupView) -> Vec<Line<'static>> {
     let value_width = (inner.width as usize).saturating_sub(LABEL_WIDTH);
+    let hint_row = view
+        .hint
+        .as_ref()
+        .map(|text| Line::from(Span::styled(text.clone(), STYLE_INFO)))
+        .unwrap_or_default();
     let mut rows = vec![
         text_row("Host:", &view.host, view.focus == Focus::Host, value_width),
         text_row("Share:", &view.share, view.focus == Focus::Share, value_width),
@@ -123,10 +134,10 @@ fn field_rows(inner: Rect, view: &PopupView) -> Vec<Line<'static>> {
             "smb-шара",
             view.focus == Focus::LocalMode,
         ),
-        Line::default(),
+        hint_row,
         status_row(&view.validation),
         Line::from(Span::styled("Tab/Shift-Tab — фокус · Space/←→ — переключить", STYLE_HINT)),
-        Line::from(Span::styled("Enter — старт прогона · Esc — отмена", STYLE_HINT)),
+        Line::from(Span::styled("Enter — проверить и старт · Esc — отмена", STYLE_HINT)),
     ];
     rows.truncate(inner.height as usize);
     rows
@@ -180,14 +191,22 @@ fn model_row(view: &PopupView) -> Line<'static> {
     ])
 }
 
-/// Строка статуса валидации (пустая до первой проверки).
+/// Строка статуса валидации: после успешного листинга — факт (сколько .wav
+/// найдено); ноль — жёлтый варнинг (старт не блокируется, но путь под вопросом).
 fn status_row(validation: &ValidationStatus) -> Line<'static> {
     match validation {
         ValidationStatus::Idle => Line::default(),
         ValidationStatus::Checking => {
-            Line::from(Span::styled("проверка директорий…", Style::new().fg(Color::Cyan)))
+            Line::from(Span::styled("проверка директорий…", STYLE_INFO))
         }
-        ValidationStatus::Ok => Line::from(Span::styled("ok", Style::new().fg(Color::Green))),
+        ValidationStatus::Ok { wav_count } if *wav_count > 0 => Line::from(Span::styled(
+            format!("✓ директория доступна · .wav: {wav_count}"),
+            STYLE_OK,
+        )),
+        ValidationStatus::Ok { .. } => Line::from(Span::styled(
+            "✓ директория доступна · .wav: 0 · .wav не найдены — проверь путь",
+            STYLE_WARN,
+        )),
         ValidationStatus::Failed(message) => {
             Line::from(Span::styled(format!("✗ {message}"), Style::new().fg(Color::Red)))
         }
@@ -263,6 +282,7 @@ mod tests {
             local_mode: false,
             focus: Focus::RemoteDir,
             validation: ValidationStatus::Idle,
+            hint: None,
         }
     }
 
@@ -291,7 +311,7 @@ mod tests {
         assert!(text.contains("nas.local"));
         assert!(text.contains("/recordings"));
         assert!(text.contains("/tmp/work"));
-        assert!(text.contains("Enter — старт прогона"));
+        assert!(text.contains("Enter — проверить и старт"));
         assert!(text.contains("Esc — отмена"));
     }
 
@@ -335,12 +355,45 @@ mod tests {
         assert!(text.contains("✗ NT_STATUS_LOGON_FAILURE"));
 
         let mut ok = view();
-        ok.validation = ValidationStatus::Ok;
-        assert!(buffer_text(&render_popup_frame(100, 30, &ok)).contains("ok"));
+        ok.validation = ValidationStatus::Ok { wav_count: 1 };
+        assert!(buffer_text(&render_popup_frame(100, 30, &ok)).contains("директория доступна"));
 
         // Idle — строка статуса пуста (подсказки на месте).
         let text = buffer_text(&render_popup_frame(100, 30, &view()));
         assert!(!text.contains("✗") && !text.contains("проверка"));
+    }
+
+    /// Успешная валидация показывает факт: сколько .wav нашлось в директории.
+    #[test]
+    fn status_row_reports_wav_count_after_validation() {
+        let mut ok = view();
+        ok.validation = ValidationStatus::Ok { wav_count: 47 };
+        let text = buffer_text(&render_popup_frame(100, 30, &ok));
+        assert!(text.contains("✓ директория доступна · .wav: 47"), "{text}");
+    }
+
+    /// Ноль .wav — жёлтый варнинг до запуска: путь, скорее всего, неверный.
+    #[test]
+    fn status_row_warns_when_no_wav_found() {
+        let mut empty = view();
+        empty.validation = ValidationStatus::Ok { wav_count: 0 };
+        let text = buffer_text(&render_popup_frame(100, 30, &empty));
+        assert!(text.contains(".wav: 0"), "{text}");
+        assert!(text.contains(".wav не найдены — проверь путь"), "{text}");
+    }
+
+    /// Распознанный SMB/GVFS-paste виден статус-строкой (на месте пустой
+    /// строки-разделителя, подсказки клавиш не уезжают).
+    #[test]
+    fn hint_line_reports_recognized_smb_path() {
+        let mut hinted = view();
+        hinted.hint = Some("Распознан SMB/GVFS путь — host/share/папка заполнены".into());
+        let text = buffer_text(&render_popup_frame(100, 30, &hinted));
+        assert!(text.contains("Распознан SMB/GVFS путь"), "{text}");
+        assert!(text.contains("Enter — проверить и старт"), "{text}");
+
+        let text = buffer_text(&render_popup_frame(100, 30, &view()));
+        assert!(!text.contains("Распознан"), "без hint строки нет");
     }
 
     #[test]

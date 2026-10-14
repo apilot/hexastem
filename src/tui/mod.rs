@@ -10,7 +10,8 @@
 //! Все три источника мультиплексируются `tokio::select!` вместе с tick.
 //!
 //! Жизненный цикл прогона: Enter в попапе → локальные проверки → тяжёлая
-//! валидация (листинг шары через реальный бэкенд) → [`runner::spawn`] с
+//! валидация (листинг шары через реальный бэкенд, с фактом «сколько .wav»)
+//! → повторный Enter подтверждает старт → [`runner::spawn`] с
 //! `SmbClient`/`EngineRunner` (или `LocalFs` в local mode) + GPU-поллер;
 //! `BatchFinished` → State::Finished; retry'и из экрана Finished живут, пока
 //! пользователь не уйдёт с него (shutdown) или не выйдет из TUI — итог серии
@@ -23,6 +24,7 @@ pub mod app;
 pub mod event;
 pub mod gpu;
 pub mod log;
+pub mod pathmode;
 pub mod persist;
 pub mod popup;
 pub mod runner;
@@ -50,7 +52,9 @@ use crate::config::Model;
 use crate::local_fs::LocalFs;
 use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
 use crate::smb::SmbClient;
-use crate::tui::event::{spawn_input_thread, AppEvent, BatchOutcome, RunSpec, Stage};
+use crate::tui::event::{
+    spawn_input_thread, AppEvent, BatchOutcome, EMPTY_PLAN_HINT, RunSpec, Stage,
+};
 use crate::tui::gpu::GpuEvent;
 use crate::tui::persist::TuiSettings;
 use crate::tui::runner::{RunnerHandle, RunnerOptions};
@@ -118,7 +122,7 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
                 None => quit = true, // читатель умер — завершаемся чисто
             },
             maybe_event = rx_events.recv() => if let Some(event) = maybe_event {
-                on_internal_event(&mut app, event, &tx_events, &tx_gpu, &mut run);
+                apply_event(&mut app, &event);
             },
             maybe_gpu = rx_gpu.recv() => if let Some(event) = maybe_gpu {
                 app.handle(&AppEvent::Gpu(event));
@@ -126,7 +130,7 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
             _ = tick.tick() => app.handle(&AppEvent::Tick),
         }
         // Попап открыт только что перешедшему в Config: преффилл из пресета,
-        // плюс путь из paste вне попапа (Remote dir + фокус на нём).
+        // плюс путь из paste вне попапа (SMB/GVFS → поля, иначе Remote dir).
         if app.state() == State::Config && !popup_open {
             popup_open = true;
             app.open_config(persist::load());
@@ -152,6 +156,12 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
                 spawn_validation(spec, tx_events.clone());
             }
         }
+        // Подтверждённый старт (повторный Enter после успешной валидации):
+        // спека уже проверена — сохранить пресет и запустить прогон.
+        if let Some(spec) = app.take_confirmed_start() {
+            let _ = persist::save(&settings_of_spec(&spec));
+            run = Some(start_run(spec, tx_events.clone(), tx_gpu.clone()));
+        }
         quit |= app.should_quit();
     }
     Ok(finish_run(run.take()).await)
@@ -161,26 +171,6 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
 struct ActiveRun {
     handle: RunnerHandle,
     gpu: JoinHandle<()>,
-}
-
-/// Обработка внутреннего события: в App, затем — запуск прогона на
-/// успешной валидации (App уже перешёл в Running).
-fn on_internal_event(
-    app: &mut App,
-    event: AppEvent,
-    tx_events: &UnboundedSender<AppEvent>,
-    tx_gpu: &UnboundedSender<GpuEvent>,
-    run: &mut Option<ActiveRun>,
-) {
-    apply_event(app, &event);
-    let AppEvent::ValidationFinished { spec, error: None } = &event else {
-        return;
-    };
-    if app.state() != State::Running {
-        return; // попап закрыли, пока шла проверка — старт отменён
-    }
-    let _ = persist::save(&settings_of_spec(spec));
-    *run = Some(start_run(spec.clone(), tx_events.clone(), tx_gpu.clone()));
 }
 
 /// Единая точка применения события (путь внутреннего канала event loop'а):
@@ -237,6 +227,10 @@ fn batch_log_messages(outcome: &BatchOutcome) -> Vec<String> {
         outcome.dedup.pairs.len(),
         widgets::format_mmss(outcome.elapsed.as_secs_f64())
     )];
+    // Пустой прогон не должен выглядеть как тихий успех: явная подсказка.
+    if outcome.total == 0 {
+        messages.push(EMPTY_PLAN_HINT.to_string());
+    }
     for pair in &outcome.dedup.pairs {
         messages.push(format!(
             "дубль {} → хранитель {}: {}",
@@ -327,36 +321,42 @@ async fn finish_run(run: Option<ActiveRun>) -> i32 {
 
 /// Тяжёлая валидация полей попапа в spawn_blocking: локальная директория
 /// существует/создаётся, удалённая листится реальным бэкендом (ошибка
-/// NT_STATUS возвращается текстом — видна в попапе).
+/// NT_STATUS возвращается текстом — видна в попапе); при успехе считается
+/// факт — сколько .wav в директории (нуль виден в попапе до старта).
 fn spawn_validation(spec: RunSpec, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let error = tokio::task::spawn_blocking({
+        let outcome = tokio::task::spawn_blocking({
             let spec = spec.clone();
             move || validate_spec(&spec)
         })
         .await
-        .unwrap_or_else(|err| Some(format!("validation task crashed: {err}")));
-        let _ = tx.send(AppEvent::ValidationFinished { spec, error });
+        .unwrap_or_else(|err| Err(format!("validation task crashed: {err}")));
+        let (error, wav_count) = match outcome {
+            Ok(wav_count) => (None, wav_count),
+            Err(message) => (Some(message), 0),
+        };
+        let _ = tx.send(AppEvent::ValidationFinished { spec, error, wav_count });
     });
 }
 
-/// Проверки спеки: `None` — всё в порядке, `Some(текст)` — ошибка для попапа.
-/// Публично для интеграционных тестов (та же валидация, что перед стартом).
-pub fn validate_spec(spec: &RunSpec) -> Option<String> {
+/// Проверки спеки: `Ok(N)` — всё в порядке, N — .wav найдено листингом;
+/// `Err(текст)` — ошибка для попапа. Публично для интеграционных тестов
+/// (та же валидация, что перед стартом).
+pub fn validate_spec(spec: &RunSpec) -> Result<usize, String> {
     if spec.remote_dir.as_os_str().is_empty() {
-        return Some("исходная директория не указана".to_string());
+        return Err("исходная директория не указана".to_string());
     }
     if !spec.local_mode {
         if spec.host.trim().is_empty() {
-            return Some("хост SMB-сервера не указан".to_string());
+            return Err("хост SMB-сервера не указан".to_string());
         }
         if spec.share.trim().is_empty() {
-            return Some("имя шары не указано".to_string());
+            return Err("имя шары не указано".to_string());
         }
     }
     if !spec.local_dir.exists() {
         if let Err(err) = std::fs::create_dir_all(&spec.local_dir) {
-            return Some(format!("локальная директория: {err}"));
+            return Err(format!("локальная директория: {err}"));
         }
     }
     let listing = if spec.local_mode {
@@ -364,7 +364,8 @@ pub fn validate_spec(spec: &RunSpec) -> Option<String> {
     } else {
         SmbClient::new(&spec.host, &spec.share, None).list(&spec.remote_dir)
     };
-    listing.err().map(|err| err.to_string())
+    let entries = listing.map_err(|err| err.to_string())?;
+    Ok(entries.iter().filter(|entry| entry.is_wav()).count())
 }
 
 /// Пресет из спеки для записи в `tui.toml`.
@@ -617,6 +618,10 @@ fn footer_summary(app: &App) -> String {
     if let Some(error) = app.run_error() {
         return format!("ошибка: {error}");
     }
+    // Пустой итог вместо незаметного «файлы 0/0» — явная подсказка.
+    if app.outcome().is_some_and(|outcome| outcome.total == 0) {
+        return EMPTY_PLAN_HINT.to_string();
+    }
     let mut counts = [0_usize; 4]; // ok, fail, dup, skip
     for file in app.files() {
         let slot = match &file.outcome {
@@ -671,7 +676,8 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::event::PlanSummary;
+    use crate::tui::app::{Focus, ValidationStatus};
+    use crate::tui::event::{BatchOutcome, PlanSummary};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -925,10 +931,34 @@ mod tests {
             local_mode: true,
         };
 
-        let error = validate_spec(&spec);
+        let wav_count = validate_spec(&spec).expect("локальная валидация проходит");
 
-        assert_eq!(error, None);
+        assert_eq!(wav_count, 0, "пустая директория — ноль .wav");
         assert!(spec.local_dir.exists(), "локальная директория создана при проверке");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_counts_wav_files_in_local_dir() {
+        let base = std::env::temp_dir().join(format!("audio_split_mod_wav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.wav"), b"x").unwrap();
+        std::fs::write(base.join("B.WAV"), b"x").unwrap();
+        std::fs::write(base.join("notes.txt"), b"x").unwrap();
+        let spec = RunSpec {
+            host: String::new(),
+            share: String::new(),
+            remote_dir: base.clone(),
+            local_dir: base.join("work"),
+            model: Model::Sw,
+            dedup: true,
+            local_mode: true,
+        };
+
+        let wav_count = validate_spec(&spec).expect("листинг проходит");
+
+        assert_eq!(wav_count, 2, "регистр расширения не важен, не-wav не считается");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -947,9 +977,9 @@ mod tests {
             local_mode: true,
         };
 
-        let error = validate_spec(&spec);
+        let error = validate_spec(&spec).expect_err("нет директории — ошибка");
 
-        assert!(error.is_some_and(|message| message.contains("no such file") || message.contains("No such file")));
+        assert!(error.contains("no such file") || error.contains("No such file"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -965,10 +995,115 @@ mod tests {
             local_mode: false,
         };
 
-        let error = validate_spec(&spec);
+        let error = validate_spec(&spec).expect_err("пустой хост — ошибка до запуска smbclient");
 
-        assert!(error.is_some(), "пустой хост — ошибка до запуска smbclient");
-        assert!(error.unwrap().contains("хост"));
+        assert!(error.contains("хост"));
+    }
+
+    // --- SMB/GVFS-paste → валидация с фактом → подтверждение старта -------------
+
+    /// Боевой сценарий: paste `smb://` в попапе заполняет host/share/remote_dir
+    /// и выключает local mode; валидация показывает факт, старт — вторым Enter.
+    #[test]
+    fn smb_paste_then_validate_then_confirm_starts_run() {
+        let mut app = App::new();
+        app.handle(&enter());
+        app.open_config(TuiSettings { local_mode: true, dedup: true, ..TuiSettings::default() });
+
+        app.handle(&AppEvent::Paste { text: "smb://nas/media/records".into() });
+        let cfg = app.config().expect("попап открыт");
+        assert_eq!(cfg.host.as_str(), "nas");
+        assert_eq!(cfg.share.as_str(), "media");
+        assert_eq!(cfg.remote_dir.as_str(), "records");
+        assert!(!cfg.local_mode, "SMB-путь выключает local mode");
+        assert_eq!(cfg.focus, Focus::RemoteDir);
+        assert!(cfg.hint.is_some(), "статус-строка распознанного пути");
+
+        app.handle(&key(crossterm::event::KeyCode::Tab)); // RemoteDir → LocalDir
+        app.handle(&AppEvent::Paste { text: "/tmp/work".into() });
+
+        // Enter №1 — запрос валидации; факт приходит из spawn_validation.
+        app.handle(&enter());
+        let spec = app.take_start_request().expect("валидация запрошена");
+        app.handle(&AppEvent::ValidationFinished { spec: spec.clone(), error: None, wav_count: 3 });
+
+        assert_eq!(app.state(), State::Config, "валидация показывает факт, но не стартует");
+        assert_eq!(app.config().unwrap().validation, ValidationStatus::Ok { wav_count: 3 });
+
+        // Enter №2 — подтверждение старта проверенной спеки.
+        app.handle(&enter());
+        assert_eq!(app.state(), State::Running);
+        assert_eq!(app.take_confirmed_start().as_ref(), Some(&spec));
+    }
+
+    /// Правка поля после успешной валидации устаревает факт: следующий Enter
+    /// перепроверяет, подтверждённого старта нет.
+    #[test]
+    fn editing_after_validation_ok_requires_revalidation() {
+        let mut app = App::new();
+        app.handle(&enter());
+        app.open_config(TuiSettings { local_mode: true, ..TuiSettings::default() });
+        app.handle(&AppEvent::Paste { text: "smb://nas/media/rec".into() });
+        app.handle(&key(crossterm::event::KeyCode::Tab));
+        app.handle(&AppEvent::Paste { text: "/tmp/work".into() });
+        app.handle(&enter());
+        let spec = app.take_start_request().expect("валидация запрошена");
+        app.handle(&AppEvent::ValidationFinished { spec, error: None, wav_count: 2 });
+
+        app.handle(&key(crossterm::event::KeyCode::Backspace));
+
+        assert_eq!(app.config().unwrap().validation, ValidationStatus::Idle, "факт устарел");
+        app.handle(&enter());
+        assert!(app.take_start_request().is_some(), "перепроверка после правки");
+        assert!(app.take_confirmed_start().is_none());
+    }
+
+    /// GVFS-paste вне попапа: event loop преффиллит попап — поля SMB заполнены.
+    #[test]
+    fn global_paste_prefill_applies_smb_hint() {
+        let mut app = App::new();
+        let gvfs = "/run/user/1000/gvfs/smb-share:server=192.168.1.88,share=public/from_share/ZOOM0003";
+        app.handle(&AppEvent::Paste { text: gvfs.to_string() });
+        assert_eq!(app.state(), State::Config, "paste пути открывает попап");
+        let dir = app.take_paste_prefill().expect("путь в преффилле");
+
+        // Как живой event loop: открыть попап и применить преффилл.
+        app.open_config(TuiSettings::default());
+        app.prefill_remote_dir(&dir);
+
+        let cfg = app.config().expect("попап открыт");
+        assert_eq!(cfg.host.as_str(), "192.168.1.88");
+        assert_eq!(cfg.share.as_str(), "public");
+        assert_eq!(cfg.remote_dir.as_str(), "from_share/ZOOM0003");
+        assert!(!cfg.local_mode, "GVFS-путь переключает в SMB-режим");
+        assert!(cfg.hint.is_some());
+    }
+
+    /// Пустой план и пустой итог — явная подсказка в футере и в табе Log.
+    #[test]
+    fn empty_plan_and_outcome_warn_about_directory() {
+        let mut app = App::new();
+        feed(&mut app, AppEvent::RunStarted { plan: PlanSummary::default() });
+        feed(
+            &mut app,
+            AppEvent::BatchFinished {
+                outcome: BatchOutcome {
+                    total: 0,
+                    ok: 0,
+                    failed: 0,
+                    results: Vec::new(),
+                    dedup: Default::default(),
+                    elapsed: std::time::Duration::ZERO,
+                },
+            },
+        );
+
+        let text = render(100, 30, &app);
+        assert!(text.contains("0 .wav в директории — проверь remote-dir"), "footer итога: {text}");
+
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+        let text = render(100, 30, &app);
+        assert!(text.contains("0 .wav в директории — проверь remote-dir"), "таб Log: {text}");
     }
 
     // --- жизненный цикл прогона (реальный раннер на LocalFs) --------------------
