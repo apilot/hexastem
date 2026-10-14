@@ -14,17 +14,15 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Model;
-use crate::pipeline::FileStatus;
-use crate::tui::event::{AppEvent, BatchOutcome, EMPTY_PLAN_HINT, PlanSummary, RunSpec, Stage};
+use crate::pipeline::{FileStatus, EXPECTED_STEM_COUNT};
+use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
 use crate::tui::gpu::{GpuEvent, GpuInfo};
+use crate::tui::i18n::{tr, Lang, StrTable};
 use crate::tui::log::{format_hhmmss, now_unix_secs, LogBuffer, PAGE_LINES};
 use crate::tui::pathmode::normalize_pasted_path;
 use crate::tui::persist::TuiSettings;
 use crate::tui::popup::{PopupView, TextFieldView};
 use crate::tui::widgets::{GpuView, Tab, TABS};
-
-/// Статус-строка попапа после распознавания SMB/GVFS-пути из paste.
-const SMB_HINT_STATUS: &str = "Распознан SMB/GVFS путь — host/share/папка заполнены";
 
 /// Глубина истории утилизации GPU для спарклайна шапки (btop-стиль).
 const GPU_HISTORY_CAP: usize = 40;
@@ -99,6 +97,9 @@ pub struct FileView {
     pub peaks: Option<Arc<[f32]>>,
     /// Терминальный исход (Ok/Failed/Duplicate/Skipped).
     pub outcome: Option<FileOutcome>,
+    /// Готовых стемов (факт от драйвера); `None` — счётчик неизвестен:
+    /// колонка STEMS рисует «—», а не врущее «0/6».
+    pub stems_done: Option<u8>,
     /// Момент входа в текущую стадию: тикающий таймер стадии в UI.
     pub stage_started: Option<Instant>,
 }
@@ -255,8 +256,8 @@ impl ConfigState {
     /// Вставка в попапе: SMB/GVFS-путь разбирается на поля (host/share/
     /// remote_dir, local mode выключается) со статус-строкой; иначе — текст
     /// в активное поле по фокусу.
-    pub fn paste_text(&mut self, text: &str) {
-        if self.apply_smb_hint(text) {
+    pub fn paste_text(&mut self, text: &str, smb_hint: &'static str) {
+        if self.apply_smb_hint(text, smb_hint) {
             return;
         }
         self.hint = None;
@@ -267,7 +268,8 @@ impl ConfigState {
     }
 
     /// Распознать SMB/GVFS-путь и заполнить поля. `true` — распознан.
-    pub fn apply_smb_hint(&mut self, text: &str) -> bool {
+    /// Текст статус-строки приходит снаружи (язык знает App, не ConfigState).
+    pub fn apply_smb_hint(&mut self, text: &str, hint: &'static str) -> bool {
         let Some(found) = normalize_pasted_path(text) else {
             return false;
         };
@@ -276,7 +278,7 @@ impl ConfigState {
         self.remote_dir = TextField::new(found.remote_dir);
         self.local_mode = false;
         self.focus = Focus::RemoteDir;
-        self.hint = Some(SMB_HINT_STATUS.to_string());
+        self.hint = Some(hint.to_string());
         self.invalidate_validation();
         true
     }
@@ -310,20 +312,21 @@ impl ConfigState {
     }
 
     /// Быстрые проверки до тяжёлой валидации (spawn_blocking с сетью):
-    /// директории указаны, в SMB-режиме заданы хост и шара.
-    pub fn local_error(&self) -> Option<String> {
+    /// директории указаны, в SMB-режиме заданы хост и шара. Тексты — по
+    /// таблице строк (язык интерфейса).
+    pub fn local_error(&self, table: &StrTable) -> Option<String> {
         if self.remote_dir.as_str().trim().is_empty() {
-            return Some("укажите исходную директорию".to_string());
+            return Some(table.err_empty_remote.to_string());
         }
         if self.local_dir.as_str().trim().is_empty() {
-            return Some("укажите локальную директорию".to_string());
+            return Some(table.err_empty_local.to_string());
         }
         if !self.local_mode {
             if self.host.as_str().trim().is_empty() {
-                return Some("укажите хост SMB-сервера".to_string());
+                return Some(table.err_empty_host.to_string());
             }
             if self.share.as_str().trim().is_empty() {
-                return Some("укажите имя шары".to_string());
+                return Some(table.err_empty_share.to_string());
             }
         }
         None
@@ -428,6 +431,10 @@ impl ConfigState {
 #[derive(Debug, Default)]
 pub struct App {
     state: State,
+    /// Язык интерфейса (переключается клавишей `l`, хранится в пресете).
+    lang: Lang,
+    /// Язык переключён и ещё не сохранён в пресет (drain event loop'ом).
+    lang_dirty: bool,
     quit_requested: bool,
     /// Запрошена отмена прогона (кооперативная — на границах стадий).
     cancel_requested: bool,
@@ -487,6 +494,28 @@ impl App {
         self.state
     }
 
+    /// Язык интерфейса (таблица строк — `tr(self.lang())`).
+    pub fn lang(&self) -> Lang {
+        self.lang
+    }
+
+    /// Установить язык без пометки «сохранить» (стартовая загрузка пресета).
+    pub fn set_lang(&mut self, lang: Lang) {
+        self.lang = lang;
+    }
+
+    /// Переключить язык (клавиша `l`): мгновенно влияет на все рендеры,
+    /// event loop сохранит выбор в пресет (`take_lang_dirty`).
+    pub fn toggle_lang(&mut self) {
+        self.lang = self.lang.toggle();
+        self.lang_dirty = true;
+    }
+
+    /// Язык переключён со времени прошлого drain'а (очищается).
+    pub fn take_lang_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.lang_dirty)
+    }
+
     pub fn should_quit(&self) -> bool {
         self.quit_requested
     }
@@ -532,7 +561,8 @@ impl App {
         let Some(cfg) = self.config.as_mut() else {
             return;
         };
-        if !cfg.apply_smb_hint(dir) {
+        let hint = tr(self.lang).smb_hint;
+        if !cfg.apply_smb_hint(dir, hint) {
             cfg.remote_dir = TextField::new(dir);
             cfg.focus = Focus::RemoteDir;
         }
@@ -687,6 +717,10 @@ impl App {
             AppEvent::ModelProgress { pct } => {
                 self.model_pct = if *pct >= 100.0 { None } else { Some(*pct) };
             }
+            // Живой счётчик стемов (список пришёл от драйвера).
+            AppEvent::FileStems { name, count } => {
+                self.update_file(name, |file| file.stems_done = Some(*count));
+            }
             AppEvent::FileDone { name } => self.update_file(name, |file| {
                 file.outcome = Some(FileOutcome::Ok);
                 file.pct = Some(100.0);
@@ -780,7 +814,8 @@ impl App {
 
     /// Страж старта: прогон уже идёт — клавиша не меняет состояние.
     fn log_start_guard(&mut self) {
-        self.push_log("прогон уже идёт — дождитесь завершения или прервите (q)");
+        let message = tr(self.lang).start_guard_log;
+        self.push_log(message);
     }
 
     /// Форс-отмена: убить движок немедленно и выйти (текущий файл останется
@@ -789,7 +824,8 @@ impl App {
         self.force_kill = true;
         self.cancel_requested = true;
         self.quit_requested = true;
-        self.push_log("форс: движок остановлен, текущий файл останется без rename (resume)");
+        let message = tr(self.lang).force_kill_log;
+        self.push_log(message);
     }
 
     /// Строка в журнал с меткой времени (системные отказы UI, стражи).
@@ -803,6 +839,11 @@ impl App {
         match key.code {
             KeyCode::Char('?') => {
                 self.toggle_help();
+                return true;
+            }
+            // Язык интерфейса — в любом немодальном состоянии.
+            KeyCode::Char('l') => {
+                self.toggle_lang();
                 return true;
             }
             // Esc на табе Help закрывает справку, а не выходит из TUI.
@@ -981,12 +1022,18 @@ impl App {
         self.tick_count = 0;
         // Пустой план — не «тихое отработало»: явная подсказка в журнале.
         if plan.is_empty() {
-            self.push_log(EMPTY_PLAN_HINT);
+            let hint = tr(self.lang).empty_plan_hint;
+            self.push_log(hint);
         }
     }
 
     /// Авторитетная сверка статусов из [`BatchResult`] (в т.ч. kept дублей)
-    /// и переход в Finished. При нескольких прогонах (retry) — итог последнего.
+    /// и переход в Finished. Счётчик стемов сверяется там же: Ok —
+    /// гарантированно полный набор; дубль — «—» (файл снят с обработки);
+    /// отказ — живой факт не перезаписывается (стемы могли быть созданы
+    /// до сбоя upload/rename). Строки без результата в итоге (отменённые
+    /// до обработки) сверка не трогает. При нескольких прогонах (retry) —
+    /// итог последнего.
     fn on_batch_finished(&mut self, outcome: &BatchOutcome) {
         for result in &outcome.results {
             self.update_file(&result.name, |file| {
@@ -997,6 +1044,11 @@ impl App {
                     },
                     FileStatus::Duplicate { kept } => FileOutcome::Duplicate { kept: kept.clone() },
                 });
+                file.stems_done = match &result.status {
+                    FileStatus::Ok => Some(u8::try_from(EXPECTED_STEM_COUNT).unwrap_or(u8::MAX)),
+                    FileStatus::Failed => file.stems_done,
+                    FileStatus::Duplicate { .. } => None,
+                };
                 file.stage_started = None;
             });
         }
@@ -1077,7 +1129,7 @@ impl App {
             self.confirm_start();
             return;
         }
-        let (validation, pending) = match cfg.local_error() {
+        let (validation, pending) = match cfg.local_error(tr(self.lang)) {
             Some(message) => (ValidationStatus::Failed(message), None),
             None => (ValidationStatus::Checking, Some(cfg.to_spec())),
         };
@@ -1104,12 +1156,14 @@ impl App {
     /// — во время прогона — отказ (строка в журнале).
     fn on_paste(&mut self, text: &str) {
         if self.state == State::Running {
-            self.push_log("paste отклонён: идёт прогон");
+            let message = tr(self.lang).paste_rejected_log;
+            self.push_log(message);
             return;
         }
         if self.state == State::Config {
             if let Some(cfg) = self.config.as_mut() {
-                cfg.paste_text(text);
+                let hint = tr(self.lang).smb_hint;
+                cfg.paste_text(text, hint);
             }
             return;
         }
@@ -1495,6 +1549,133 @@ mod tests {
 
         assert_eq!(app.files()[0].outcome, Some(FileOutcome::Ok));
         assert_eq!(app.files()[0].pct, Some(100.0));
+    }
+
+    // --- честный счётчик стемов (FileStems + сверка) ---------------------------
+
+    #[test]
+    fn file_stems_updates_live_counter() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::FileStems { name: "a.wav".into(), count: 6 });
+
+        assert_eq!(app.files()[0].stems_done, Some(6), "живой счётчик от драйвера");
+        assert_eq!(app.files()[0].outcome, None, "терминальный исход не тронут");
+    }
+
+    #[test]
+    fn file_stems_for_unknown_file_is_noop() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::FileStems { name: "ghost.wav".into(), count: 6 });
+
+        assert!(app.files().iter().all(|file| file.stems_done.is_none()));
+    }
+
+    #[test]
+    fn batch_finished_reconciles_stem_counters() {
+        let mut app = App::new();
+        start_run(&mut app);
+        // b.wav: separate прошёл (6 стемов создано), upload упал.
+        app.handle(&AppEvent::FileStems { name: "b.wav".into(), count: 6 });
+
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() }); // a ok, b failed
+
+        assert_eq!(app.files()[0].stems_done, Some(6), "Ok — авторитетно полный набор");
+        assert_eq!(app.files()[1].stems_done, Some(6), "Failed — живой факт не перезаписан");
+    }
+
+    #[test]
+    fn batch_finished_marks_dup_stems_unknown() {
+        let mut app = App::new();
+        start_run(&mut app);
+        let mut outcome = outcome_fixture();
+        outcome.results[1] = file_result("b.wav", FileStatus::Duplicate { kept: "a.wav".to_string() });
+
+        app.handle(&AppEvent::BatchFinished { outcome });
+
+        assert_eq!(app.files()[1].stems_done, None, "дубль — «—», а не 0/6");
+    }
+
+    #[test]
+    fn reconcile_does_not_touch_live_rows_of_current_run() {
+        let mut app = App::new();
+        app.handle(&AppEvent::RunStarted {
+            plan: PlanSummary {
+                pending: ["a.wav", "b.wav", "c.wav"].iter().map(|s| s.to_string()).collect(),
+                ..PlanSummary::default()
+            },
+        });
+        app.handle(&AppEvent::FileStems { name: "c.wav".into(), count: 6 });
+
+        // В итог попали только a (ok) и b (failed): c отменён до результата —
+        // строка живая, авторитетной сверке она не принадлежит.
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+
+        assert_eq!(app.files()[2].outcome, None, "живая строка остаётся живой");
+        assert_eq!(app.files()[2].stems_done, Some(6), "счётчик живой строки не сброшен");
+        assert_eq!(app.state(), State::Finished);
+    }
+
+    #[test]
+    fn reconcile_serial_run_starts_with_clean_counters() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+
+        start_run(&mut app); // новая серия — строки пересеяны
+
+        assert!(app.files().iter().all(|file| file.stems_done.is_none()), "счётчики не тянутся из прошлого прогона");
+    }
+
+    // --- i18n: переключатель языка ---------------------------------------------
+
+    #[test]
+    fn l_toggles_language_without_state_reset() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Download });
+
+        app.handle(&press(KeyCode::Char('l')));
+
+        assert_eq!(app.lang(), Lang::En);
+        assert_eq!(app.state(), State::Running, "состояние не сброшено");
+        assert_eq!(app.files()[0].stage, Stage::Download, "модель прогона жива");
+        assert_eq!(app.files().len(), 5, "строки таблицы на месте");
+        assert!(app.take_lang_dirty(), "event loop сохранит выбор в пресет");
+
+        app.handle(&press(KeyCode::Char('l')));
+        assert_eq!(app.lang(), Lang::Ru, "переключение работает в обе стороны");
+    }
+
+    #[test]
+    fn l_is_ignored_in_modal_states() {
+        // Попап запуска (Config): клавиша идёт в текстовое поле.
+        let mut popup = App::new();
+        popup.handle(&press(KeyCode::Enter));
+        popup.handle(&press(KeyCode::Char('l')));
+        assert_eq!(popup.lang(), Lang::Ru, "попап модален");
+        assert!(!popup.take_lang_dirty());
+
+        // Confirm выхода.
+        let mut confirm = App::new();
+        start_run(&mut confirm);
+        confirm.handle(&press(KeyCode::Esc));
+        confirm.handle(&press(KeyCode::Char('l')));
+        assert_eq!(confirm.lang(), Lang::Ru, "confirm модален");
+        assert!(confirm.confirm_open());
+
+        // Модальный ввод фильтра журнала.
+        let mut filter = App::new();
+        filter.handle(&press(KeyCode::Char('3')));
+        filter.handle(&press(KeyCode::Char('f')));
+        filter.handle(&press(KeyCode::Char('l')));
+        assert_eq!(filter.lang(), Lang::Ru, "ввод фильтра модален");
+        assert!(filter.log_filter_input().is_some());
+        let letter = filter.log_filter_input().map(|field| field.as_str().to_string());
+        assert_eq!(letter.as_deref(), Some("l"), "клавиша дошла до поля фильтра");
     }
 
     #[test]

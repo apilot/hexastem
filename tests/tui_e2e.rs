@@ -396,7 +396,7 @@ async fn e2e_popup_to_finished_with_summary_dedup_log_and_gpu() {
     // Попап: paste путей → спека → та же валидация, что в event loop.
     let mut app = App::new();
     let spec = start_from_popup(&mut app, &base, &work);
-    let wav_count = validate_spec(&spec).expect("валидация реальных директорий проходит");
+    let wav_count = validate_spec(&spec, audio_split::tui::i18n::Lang::Ru).expect("валидация реальных директорий проходит");
     apply_event(&mut app, &AppEvent::ValidationFinished { spec: spec.clone(), error: None, wav_count });
     assert_eq!(app.state(), State::Config, "после проверки попап ждёт подтверждения");
     app.handle(&key(KeyCode::Enter)); // подтверждение старта после показа факта
@@ -436,7 +436,7 @@ async fn e2e_popup_to_finished_with_summary_dedup_log_and_gpu() {
     // Кадр: сводка footer + GPU-шапка из мок-вывода (шапка показывает
     // бар + VRAM; имя в кадр не выводится — см. widgets::gpu_spans).
     let text = render(&app);
-    assert!(text.contains("OK 3 · FAIL 1 · DUP 1 · SKIP 0"), "сводка: {text}");
+    assert!(text.contains("ГОТ 3 · ОШБ 1 · ДУБЛ 1 · ПРОП 0"), "сводка: {text}");
     assert!(text.contains("2.1/24.0GiB"), "VRAM из nvidia-smi в шапке");
     assert!(!text.contains("GPU: n/a"), "заглушка сменилась данными поллера");
 
@@ -510,7 +510,7 @@ async fn e2e_retry_after_engine_failure_via_ui_makes_batch_clean() {
     // Итог в App — ПОСЛЕДНИЙ батч (только b), а не объединённая серия.
     assert_eq!(app.outcome().map(|outcome| outcome.ok), Some(1));
     let text = render(&app);
-    assert!(text.contains("OK 2 · FAIL 0 · DUP 0 · SKIP 0"), "{text}");
+    assert!(text.contains("ГОТ 2 · ОШБ 0 · ДУБЛ 0 · ПРОП 0"), "{text}");
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -572,7 +572,7 @@ async fn e2e_cancel_confirmed_through_quit_dialog_fails_run() {
         .all(|r| r.error.as_deref().is_some_and(|error| error.contains("cancelled"))));
     assert_eq!(app.state(), State::Finished);
     let text = render(&app);
-    assert!(text.contains("OK 0 · FAIL 2 · DUP 0 · SKIP 0"), "{text}");
+    assert!(text.contains("ГОТ 0 · ОШБ 2 · ДУБЛ 0 · ПРОП 0"), "{text}");
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -653,8 +653,8 @@ async fn e2e_second_run_skips_converted_duplicate_and_fully_stemmed() {
     assert_eq!(app.files().len(), 4);
     assert_eq!(app.state(), State::Finished);
     let text = render(&app);
-    assert!(text.contains("OK 1 · FAIL 0 · DUP 1 · SKIP 2"), "{text}");
-    assert!(text.contains("SKIP"));
+    assert!(text.contains("ГОТ 1 · ОШБ 0 · ДУБЛ 1 · ПРОП 2"), "{text}");
+    assert!(text.contains("ПРОП"));
     assert!(text.contains("дубль"), "prefix-дубль сеется DUP-строкой: {text}");
     assert!(text.contains("fresh.wav"));
     assert!(text.contains("CONVERTED_ok.wav"));
@@ -673,7 +673,7 @@ async fn e2e_validation_rejects_missing_remote_dir_and_stays_in_popup() {
     let mut app = App::new();
 
     let spec = start_from_popup(&mut app, &base.join("nope"), &work);
-    let error = validate_spec(&spec).expect_err("несуществующая директория — ошибка");
+    let error = validate_spec(&spec, audio_split::tui::i18n::Lang::Ru).expect_err("несуществующая директория — ошибка");
     assert!(error.contains("No such file") || error.contains("no such file"), "{error}");
 
     apply_event(&mut app, &AppEvent::ValidationFinished { spec, error: Some(error), wav_count: 0 });

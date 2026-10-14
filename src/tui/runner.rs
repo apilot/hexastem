@@ -614,12 +614,19 @@ impl EngineOps for TeeEngine<'_> {
                     };
                     let _ = events.send(event);
                 }
-                EngineEvent::FileDone { file, .. } => {
+                EngineEvent::FileDone { file, stems, .. } => {
+                    let name = file_name_of(file).to_string();
                     let _ = events.send(AppEvent::FileProgress {
-                        name: file_name_of(file).to_string(),
+                        name: name.clone(),
                         stage: Stage::Separate,
                         pct: 100.0,
                         estimated: false,
+                    });
+                    // Список стемов драйвера не теряем: живой счётчик STEMS
+                    // честен уже на upload/rename (раньше здесь был `..`).
+                    let _ = events.send(AppEvent::FileStems {
+                        name,
+                        count: stems.len().min(u8::MAX as usize) as u8,
                     });
                 }
                 EngineEvent::FileError { file, error } => {
@@ -874,6 +881,33 @@ mod tests {
         }
         assert_eq!(app.state(), State::Finished);
         assert_eq!(app.outcome().map(|outcome| outcome.ok), Some(2));
+    }
+
+    #[tokio::test]
+    async fn engine_done_reports_stem_count_to_ui() {
+        let dir = temp_dir("stems");
+        let rig = Rig {
+            smb: Arc::new(MockSmb::new().with_dir("/nas", &["a.wav"])),
+            engine: Arc::new(MockEngine::new(engine_events(&dir, &["a.wav"]))),
+            opts: opts(&dir, 0),
+        };
+
+        let (events, result) = run_full(&rig).await;
+
+        result.expect("батч успешен");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::FileStems { name, count: 6 } if name == "a.wav"
+            )),
+            "список стемов драйвера не теряется в маппинге: {events:?}"
+        );
+        // Живой счётчик доезжает до App раньше терминального Ok.
+        let mut app = App::new();
+        for event in &events {
+            app.handle(event);
+        }
+        assert_eq!(app.files()[0].stems_done, Some(6), "колонка STEMS честна в Finished");
     }
 
     #[tokio::test]

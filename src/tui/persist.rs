@@ -34,6 +34,8 @@ pub struct TuiSettings {
     pub dedup: bool,
     /// Локальная папка вместо SMB (remote читается с диска).
     pub local_mode: bool,
+    /// Язык интерфейса: `ru` | `en` (см. `i18n::Lang`).
+    pub lang: String,
 }
 
 impl Default for TuiSettings {
@@ -46,6 +48,7 @@ impl Default for TuiSettings {
             model: model_label(Model::Sw).to_string(),
             dedup: true,
             local_mode: false,
+            lang: crate::tui::i18n::Lang::default().label().to_string(),
         }
     }
 }
@@ -58,6 +61,11 @@ impl TuiSettings {
         } else {
             Model::Sw
         }
+    }
+
+    /// Язык из пресета: неизвестное значение → дефолт `Ru` (graceful).
+    pub fn lang(&self) -> crate::tui::i18n::Lang {
+        crate::tui::i18n::Lang::from_label(&self.lang)
     }
 }
 
@@ -127,6 +135,7 @@ mod tests {
             model: "6s".into(),
             dedup: false,
             local_mode: true,
+            lang: "en".into(),
         }
     }
 
@@ -188,6 +197,26 @@ mod tests {
 
         settings.model = "bogus".into();
         assert_eq!(settings.model(), Model::Sw, "неизвестное значение → sw");
+    }
+
+    #[test]
+    fn lang_roundtrip_and_graceful_fallback() {
+        // Выбор языка переживает сохранение/загрузку.
+        let path = temp_path("lang");
+        let settings = TuiSettings { lang: "en".into(), ..TuiSettings::default() };
+        save_to(&path, &settings).expect("save");
+        assert_eq!(load_from(&path).lang(), crate::tui::i18n::Lang::En);
+
+        // Дефолт — ru (решение владельца); неизвестное значение → ru.
+        assert_eq!(TuiSettings::default().lang(), crate::tui::i18n::Lang::Ru);
+        let bogus = TuiSettings { lang: "de".into(), ..TuiSettings::default() };
+        assert_eq!(bogus.lang(), crate::tui::i18n::Lang::Ru, "неизвестное → дефолт");
+
+        // Файл без поля lang (старый пресет) — дефолт.
+        let legacy = temp_path("lang_legacy");
+        fs::create_dir_all(legacy.parent().expect("parent")).unwrap();
+        fs::write(&legacy, "host = \"nas\"\n").unwrap();
+        assert_eq!(load_from(&legacy).lang(), crate::tui::i18n::Lang::Ru);
     }
 
     #[test]

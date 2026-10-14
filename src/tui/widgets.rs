@@ -17,6 +17,7 @@ use ratatui::Frame;
 
 use crate::dedup::{KeeperReason, PairReport};
 use crate::pipeline::EXPECTED_STEM_COUNT;
+use crate::tui::i18n::StrTable;
 use crate::tui::log::{LogBuffer, LogEntry};
 
 // --- глифы и геометрия ----------------------------------------------------------
@@ -38,8 +39,6 @@ const FULL_LAYOUT_MIN_WIDTH: u16 = 100;
 /// Ширина DETAILS-колонки: подпись waveform (40 символов) + рамка + запас.
 const DETAILS_WIDTH: u16 = 44;
 const TAB_COUNT: usize = 4;
-/// Подсказки клавиш footer (кейбинды утверждены владельцем, ТЗ).
-pub const KEYHINTS: &str = "[s]tart [p]ause [r]etry [m]odel [o]pen report [?]help [q]uit";
 
 const STYLE_DIM: Style = Style::new().fg(Color::DarkGray);
 const STYLE_FILL: Style = Style::new().fg(Color::Yellow);
@@ -65,15 +64,21 @@ pub enum FileBadge {
 }
 
 impl FileBadge {
-    /// Текст фиксированной ширины 4 — колонка таблицы не «пляшет».
-    pub fn label(self) -> &'static str {
+    /// Текст бейджа (локализованный; фикс. ширина — на рендере).
+    pub fn label(self, tr: &StrTable) -> &'static str {
         match self {
-            Self::Run => "RUN",
-            Self::Ok => "OK",
-            Self::Fail => "FAIL",
-            Self::Skip => "SKIP",
-            Self::Dup => "DUP",
+            Self::Run => tr.badge_run,
+            Self::Ok => tr.badge_ok,
+            Self::Fail => tr.badge_fail,
+            Self::Skip => tr.badge_skip,
+            Self::Dup => tr.badge_dup,
         }
+    }
+
+    /// Ячейка бейджа: ФИКСИРОВАННАЯ ширина 4 в обеих локалях — колонка
+    /// таблицы не «пляшет» (английские метки короче — добиваются пробелом).
+    pub fn cell(self, tr: &StrTable) -> String {
+        format!("{:<4}", self.label(tr))
     }
 
     /// Цвет статуса (дополняет текст, не заменяет его).
@@ -137,8 +142,9 @@ pub struct FileRowView {
     pub pct: f64,
     /// `true` — pct оценочный (драйвер): UI помечает тильдой «~NN%».
     pub estimated: bool,
-    /// Готовых стемов (из [`EXPECTED_STEM_COUNT`]).
-    pub stems_done: u8,
+    /// Готовых стемов (`Some(x)` — счётчик известен); `None` — неизвестен:
+    /// колонка STEMS рисует «—», а не врущее «0/6».
+    pub stems_done: Option<u8>,
     /// Секунд с входа в текущую стадию (`None` — таймер не идёт).
     pub stage_elapsed: Option<f64>,
     /// Фаза неопределённого прогресса (тики): `Some` — анимированный бар
@@ -241,13 +247,13 @@ pub enum Tab {
 pub const TABS: [Tab; TAB_COUNT] = [Tab::Files, Tab::Dedup, Tab::Log, Tab::Help];
 
 impl Tab {
-    /// Подпись таба с номером клавиши.
-    pub fn label(self) -> &'static str {
+    /// Подпись таба с номером клавиши (локализованная).
+    pub fn label(self, tr: &StrTable) -> &'static str {
         match self {
-            Self::Files => "[1]Files",
-            Self::Dedup => "[2]Dedup",
-            Self::Log => "[3]Log",
-            Self::Help => "[4]Help",
+            Self::Files => tr.tab_files,
+            Self::Dedup => tr.tab_dedup,
+            Self::Log => tr.tab_log,
+            Self::Help => tr.tab_help,
         }
     }
 
@@ -353,9 +359,9 @@ pub fn sparkline(history: &[u8], width: usize) -> String {
 
 /// Глобальная полоса футера по завершённым/всего: «файлы 1/3 ██░░░░ 33%».
 /// Заполнение округляется (не floor): 1/3 даёт 2 из 6 колонок, как в btop.
-pub fn files_progress(done: usize, total: usize) -> String {
+pub fn files_progress(tr: &StrTable, done: usize, total: usize) -> String {
     if total == 0 {
-        return "файлы 0/0".to_string();
+        return format!("{} 0/0", tr.files_word);
     }
     let pct = done as f64 / total as f64 * 100.0;
     let filled = (pct / 100.0 * FILES_BAR_WIDTH as f64).round() as usize;
@@ -364,7 +370,7 @@ pub fn files_progress(done: usize, total: usize) -> String {
         BAR_FILLED.to_string().repeat(filled),
         BAR_EMPTY.to_string().repeat(FILES_BAR_WIDTH - filled),
     );
-    format!("файлы {done}/{total} {bar} {:.0}%", pct)
+    format!("{} {done}/{total} {bar} {pct:.0}%", tr.files_word)
 }
 
 /// Неопределённый прогресс (download/upload без процента): бегущее окно
@@ -456,19 +462,19 @@ fn column_peak(peaks: &[f32], col: usize, columns: usize) -> f32 {
 // --- рендеры ---------------------------------------------------------------------
 
 /// Шапка: `audio_split ─ //host/share ─ dir ─ модель ─ GPU [бар] mem`.
-pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView) {
+pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView, tr: &StrTable) {
     let block = Block::bordered().border_type(BorderType::Rounded).title(" audio_split ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
-    let line = Line::from(header_spans(view));
+    let line = Line::from(header_spans(view, tr));
     frame.render_widget(Paragraph::new(line), inner);
 }
 
 /// Спаны шапки: подключение, директория, модель (+загрузка), GPU-слот.
-fn header_spans(view: &HeaderView) -> Vec<Span<'static>> {
+fn header_spans(view: &HeaderView, tr: &StrTable) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled("audio_split", STYLE_HEADER),
         Span::raw(" ─ "),
@@ -481,19 +487,19 @@ fn header_spans(view: &HeaderView) -> Vec<Span<'static>> {
     if let Some(pct) = view.model_pct {
         // Глобальная загрузка модели: видна только пока идёт (до 100%).
         spans.push(Span::raw(" ─ "));
-        spans.push(Span::styled(format!("модель: {pct:.0}%"), STYLE_FILL));
+        spans.push(Span::styled((tr.model_loading)(pct), STYLE_FILL));
     }
     spans.push(Span::raw(" ─ "));
-    spans.extend(gpu_spans(view.gpu.as_ref()));
+    spans.extend(gpu_spans(view.gpu.as_ref(), tr));
     spans
 }
 
 /// GPU-слот: `None` → `GPU: n/a` (graceful без поллера); иначе утилизация
 /// «NN%» + спарклайн истории (btop-стиль) + VRAM-бар `▓ X/Y GiB`. Без данных
 /// утилизации — «n/a», VRAM остаётся (поллер мог не дать util_percent).
-fn gpu_spans(gpu: Option<&GpuView>) -> Vec<Span<'static>> {
+fn gpu_spans(gpu: Option<&GpuView>, tr: &StrTable) -> Vec<Span<'static>> {
     let Some(gpu) = gpu else {
-        return vec![Span::styled("GPU: n/a", STYLE_DIM)];
+        return vec![Span::styled(tr.gpu_na.to_string(), STYLE_DIM)];
     };
     let mut spans = vec![Span::styled("GPU ", STYLE_DIM)];
     match gpu.util_pct {
@@ -520,7 +526,7 @@ fn gpu_spans(gpu: Option<&GpuView>) -> Vec<Span<'static>> {
 }
 
 /// Полоса табов: 4 равные зоны, активный подсвечен (зоны = [`tab_at`]).
-pub fn render_tab_bar(frame: &mut Frame, area: Rect, selected: Tab) {
+pub fn render_tab_bar(frame: &mut Frame, area: Rect, selected: Tab, tr: &StrTable) {
     let chunks = Layout::horizontal([Constraint::Fill(1); TAB_COUNT]).split(area);
     for (tab, chunk) in TABS.iter().zip(chunks.iter()) {
         let style = if *tab == selected {
@@ -528,20 +534,27 @@ pub fn render_tab_bar(frame: &mut Frame, area: Rect, selected: Tab) {
         } else {
             STYLE_DIM
         };
-        let line = Line::from(tab.label()).style(style).alignment(Alignment::Center);
+        let line = Line::from(tab.label(tr)).style(style).alignment(Alignment::Center);
         frame.render_widget(Paragraph::new(line), *chunk);
     }
 }
 
 /// Таблица файлов; пустой список → empty-state подсказка.
-pub fn render_files(frame: &mut Frame, area: Rect, files: &[FileRowView], selected: Option<usize>) {
+pub fn render_files(frame: &mut Frame, area: Rect, files: &[FileRowView], selected: Option<usize>, tr: &StrTable) {
     if files.is_empty() {
-        render_files_empty(frame, area);
+        render_files_empty(frame, area, tr);
         return;
     }
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" FILES ");
-    let header = Row::new(["ST", "STAGE", "FILE", "PROGRESS", "STEMS"]).style(STYLE_HEADER);
-    let rows: Vec<Row> = files.iter().map(file_row).collect();
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.files_title);
+    let header = Row::new([
+        tr.th_st,
+        tr.th_stage,
+        tr.th_file,
+        tr.th_progress,
+        tr.th_stems,
+    ])
+    .style(STYLE_HEADER);
+    let rows: Vec<Row> = files.iter().map(|view| file_row(view, tr)).collect();
     let widths = [
         Constraint::Length(5),
         Constraint::Length(16),
@@ -560,14 +573,14 @@ pub fn render_files(frame: &mut Frame, area: Rect, files: &[FileRowView], select
 }
 
 /// Empty-state таблицы: «нет файлов — Esc → настройка».
-fn render_files_empty(frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" FILES ");
+fn render_files_empty(frame: &mut Frame, area: Rect, tr: &StrTable) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.files_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
-    let hint = Line::from("нет файлов — Esc → настройка")
+    let hint = Line::from(tr.no_files_hint)
         .style(STYLE_DIM)
         .alignment(Alignment::Center);
     frame.render_widget(Paragraph::new(hint), inner);
@@ -575,8 +588,8 @@ fn render_files_empty(frame: &mut Frame, area: Rect) {
 
 /// Строка таблицы: бейдж / стадия(+таймер) / имя / прогресс или
 /// индeterminate-бар / стемы (моно-цифры).
-fn file_row(view: &FileRowView) -> Row<'static> {
-    let badge = Cell::from(Span::styled(view.badge.label(), view.badge.style()));
+fn file_row(view: &FileRowView, tr: &StrTable) -> Row<'static> {
+    let badge = Cell::from(Span::styled(view.badge.cell(tr), view.badge.style()));
     let stage = Cell::from(Span::styled(stage_cell(&view.stage, view.stage_elapsed), STYLE_DIM));
     let name = Cell::from(view.name.clone());
     let progress = match view.indeterminate {
@@ -600,21 +613,31 @@ fn file_row(view: &FileRowView) -> Row<'static> {
             ]))
         }
     };
-    let stems = Cell::from(format!("{}/{}", view.stems_done, EXPECTED_STEM_COUNT));
+    // Счётчик стемов: неизвестен — «—», а не врущее «0/6» (честная колонка).
+    let stems = Cell::from(stems_cell(view.stems_done, tr));
     Row::new([badge, stage, name, progress, stems])
 }
 
+/// Ячейка счётчика стемов: `x/6`; пока счётчик неизвестен — «—»
+/// (честная колонка: нет данных — не рисуем «0/6»).
+fn stems_cell(done: Option<u8>, tr: &StrTable) -> String {
+    match done {
+        Some(count) => format!("{count}/{EXPECTED_STEM_COUNT}"),
+        None => tr.stems_unknown.to_string(),
+    }
+}
+
 /// Панель Details выбранного файла; `None` → пустое состояние.
-pub fn render_details_or_empty(frame: &mut Frame, area: Rect, view: Option<&DetailsView>) {
+pub fn render_details_or_empty(frame: &mut Frame, area: Rect, view: Option<&DetailsView>, tr: &StrTable) {
     match view {
-        Some(details) => render_details(frame, area, details),
-        None => render_details_empty(frame, area),
+        Some(details) => render_details(frame, area, details, tr),
+        None => render_details_empty(frame, area, tr),
     }
 }
 
 /// Details: заголовок, стадия/ETA, источник, формат, стемы, события + waveform.
-pub fn render_details(frame: &mut Frame, area: Rect, view: &DetailsView) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" DETAILS ");
+pub fn render_details(frame: &mut Frame, area: Rect, view: &DetailsView, tr: &StrTable) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.details_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -622,23 +645,26 @@ pub fn render_details(frame: &mut Frame, area: Rect, view: &DetailsView) {
     }
     // Waveform — фикс. блок снизу (подпись + 3 строки + метки), текст — сверху.
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(5)]).split(inner);
-    frame.render_widget(Paragraph::new(details_lines(view, chunks[0].height as usize)), chunks[0]);
-    render_waveform(frame, chunks[1], &view.waveform);
+    frame.render_widget(
+        Paragraph::new(details_lines(view, tr, chunks[0].height as usize)),
+        chunks[0],
+    );
+    render_waveform(frame, chunks[1], &view.waveform, tr);
 }
 
 /// Строки текстовой части Details (без waveform).
-fn details_lines(view: &DetailsView, max_lines: usize) -> Vec<Line<'static>> {
+fn details_lines(view: &DetailsView, tr: &StrTable, max_lines: usize) -> Vec<Line<'static>> {
     let eta = match view.eta_secs {
         Some(secs) => format!(" · ETA {}", format_mmss(secs)),
         None => String::new(),
     };
     let mut lines = vec![
         Line::from(view.name.clone()).style(STYLE_HEADER),
-        Line::from(format!("стадия: {}{eta}", view.stage)),
-        Line::from(format!("источник: {}", view.source)),
-        Line::from(format!("формат: {}", view.format)),
+        Line::from(format!("{} {}{eta}", tr.details_stage, view.stage)),
+        Line::from(format!("{} {}", tr.details_source, view.source)),
+        Line::from(format!("{} {}", tr.details_format, view.format)),
         stems_line(&view.stems),
-        Line::from("события:").style(STYLE_DIM),
+        Line::from(tr.details_events).style(STYLE_DIM),
     ];
     // События — последние, сколько влезает (новые снизу).
     let free = max_lines.saturating_sub(lines.len());
@@ -669,28 +695,28 @@ fn stems_line(stems: &[StemView]) -> Line<'static> {
 }
 
 /// Пустое состояние Details (ничего не выбрано).
-fn render_details_empty(frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" DETAILS ");
+fn render_details_empty(frame: &mut Frame, area: Rect, tr: &StrTable) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.details_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
-    let hint = Line::from("нет выбранного файла").style(STYLE_DIM).alignment(Alignment::Center);
+    let hint = Line::from(tr.details_empty).style(STYLE_DIM).alignment(Alignment::Center);
     frame.render_widget(Paragraph::new(hint), inner);
 }
 
 /// Waveform-прогресс: подпись, 3 строки огибающей (или fallback-бар), метки.
-pub fn render_waveform(frame: &mut Frame, area: Rect, view: &WaveformView) {
+pub fn render_waveform(frame: &mut Frame, area: Rect, view: &WaveformView, tr: &StrTable) {
     if area.is_empty() {
         return;
     }
-    frame.render_widget(Paragraph::new(waveform_lines(view, area.width as usize)), area);
+    frame.render_widget(Paragraph::new(waveform_lines(view, tr, area.width as usize)), area);
 }
 
 /// Строки waveform-виджета: подпись с %/временем, бар-строки, метки 00:00.
-fn waveform_lines(view: &WaveformView, width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(waveform_label(view)).style(Style::new().fg(Color::Cyan))];
+fn waveform_lines(view: &WaveformView, tr: &StrTable, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(waveform_label(view, tr)).style(Style::new().fg(Color::Cyan))];
     if view.peaks.is_empty() {
         // Fallback: без огибающей — обычный прогресс-бар.
         let (filled, empty) = progress_bar_parts(view.pct, width);
@@ -711,11 +737,18 @@ fn waveform_lines(view: &WaveformView, width: usize) -> Vec<Line<'static>> {
 }
 
 /// Подпись «NN% · обработано MM:SS · осталось MM:SS» (или просто `NN%`).
-fn waveform_label(view: &WaveformView) -> String {
+fn waveform_label(view: &WaveformView, tr: &StrTable) -> String {
     match view.duration_secs {
         Some(duration) => {
             let (done, left) = split_progress(duration, view.pct);
-            format!("{:.0}% · обработано {} · осталось {}", view.pct, format_mmss(done), format_mmss(left))
+            format!(
+                "{:.0}% · {} {} · {} {}",
+                view.pct,
+                tr.wf_processed,
+                format_mmss(done),
+                tr.wf_left,
+                format_mmss(left)
+            )
         }
         None => format!("{:.0}%", view.pct),
     }
@@ -741,20 +774,21 @@ fn time_labels(duration: f64, width: usize) -> Line<'static> {
 }
 
 /// Footer: подсказки клавиш слева, сводка справа (не влезает — режется).
-pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView) {
+pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView, tr: &StrTable) {
     if area.is_empty() {
         return;
     }
+    let hints_width = tr.keyhints.chars().count();
     let mut spans = Vec::new();
     if view.summary.is_empty() {
         // Нечего показывать справа — место целиком подсказкам клавиш.
-        spans.push(Span::styled(KEYHINTS, Style::new().fg(Color::Gray)));
+        spans.push(Span::styled(tr.keyhints.to_string(), Style::new().fg(Color::Gray)));
     } else {
         // Сводка важнее подсказок: не влезают обе — только сводка.
-        let both_fit = area.width as usize > KEYHINTS.len() + view.summary.len();
+        let both_fit = area.width as usize > hints_width + view.summary.chars().count();
         if both_fit {
-            spans.push(Span::styled(KEYHINTS, Style::new().fg(Color::Gray)));
-            let gap = (area.width as usize).saturating_sub(KEYHINTS.len() + view.summary.len());
+            spans.push(Span::styled(tr.keyhints.to_string(), Style::new().fg(Color::Gray)));
+            let gap = (area.width as usize).saturating_sub(hints_width + view.summary.chars().count());
             spans.push(Span::raw(" ".repeat(gap.max(1))));
         }
         spans.push(Span::styled(view.summary.clone(), Style::new().fg(Color::Cyan)));
@@ -766,15 +800,13 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView) {
 
 /// Человекочитаемая причина выбора хранителя. Единственный источник текста:
 /// используют таблица Dedup и журнал (mod.rs).
-pub fn keeper_reason_label(reason: &KeeperReason) -> String {
+pub fn keeper_reason_label(reason: &KeeperReason, tr: &StrTable) -> String {
     match reason {
-        KeeperReason::SoleCandidate => "единственный кандидат".to_string(),
-        KeeperReason::OnlyNonClipped => "без клипа".to_string(),
-        KeeperReason::CleanerDynamics { margin_db } => format!("динамичнее на {margin_db:.1} дБ"),
-        KeeperReason::Louder { margin_db } => format!("громче на {margin_db:.1} дБ"),
-        KeeperReason::AllClipped { margin_db } => {
-            format!("макс. crest при клипе (+{margin_db:.1} дБ)")
-        }
+        KeeperReason::SoleCandidate => tr.reason_sole.to_string(),
+        KeeperReason::OnlyNonClipped => tr.reason_no_clip.to_string(),
+        KeeperReason::CleanerDynamics { margin_db } => (tr.reason_dynamic)(f64::from(*margin_db)),
+        KeeperReason::Louder { margin_db } => (tr.reason_louder)(f64::from(*margin_db)),
+        KeeperReason::AllClipped { margin_db } => (tr.reason_all_clipped)(f64::from(*margin_db)),
     }
 }
 
@@ -796,15 +828,22 @@ fn clip_flag(kept_clipping: bool, dup_clipping: bool) -> (&'static str, Style) {
 
 /// Таблица дедупликации (таб Dedup): пары дубль → хранитель; пустой итог —
 /// заглушка; под таблицей — примечание о нечитаемых WAV.
-pub fn render_dedup(frame: &mut Frame, area: Rect, pairs: &[PairReport], unparseable: &[String]) {
+pub fn render_dedup(
+    frame: &mut Frame,
+    area: Rect,
+    pairs: &[PairReport],
+    unparseable: &[String],
+    tr: &StrTable,
+) {
     let (content, note) = split_dedup_note(area, unparseable);
     if pairs.is_empty() {
-        render_dedup_empty(frame, content);
+        render_dedup_empty(frame, content, tr);
     } else {
-        render_dedup_table(frame, content, pairs);
+        render_dedup_table(frame, content, pairs, tr);
     }
     if let (Some(note_area), false) = (note, unparseable.is_empty()) {
-        let text = format!("! не разобраны как WAV: {}", unparseable.join(", "));
+        let names = unparseable.join(", ");
+        let text = (tr.unparseable_note)(&names);
         frame.render_widget(Paragraph::new(text).style(STYLE_FILL), note_area);
     }
 }
@@ -818,20 +857,29 @@ fn split_dedup_note(area: Rect, unparseable: &[String]) -> (Rect, Option<Rect>) 
     (rows[0], Some(rows[1]))
 }
 
-fn render_dedup_empty(frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" Dedup ");
+fn render_dedup_empty(frame: &mut Frame, area: Rect, tr: &StrTable) {
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.dedup_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
-    frame.render_widget(Paragraph::new("дублей не найдено").style(STYLE_DIM), inner);
+    frame.render_widget(Paragraph::new(tr.dedup_empty).style(STYLE_DIM), inner);
 }
 
-fn render_dedup_table(frame: &mut Frame, area: Rect, pairs: &[PairReport]) {
-    let header = Row::new(["DUP", "KEPT", "CORR", "GAIN дБ", "CREST дБ", "CLIP", "REN", "REASON"])
-        .style(STYLE_HEADER);
-    let rows: Vec<Row> = pairs.iter().map(dedup_row).collect();
+fn render_dedup_table(frame: &mut Frame, area: Rect, pairs: &[PairReport], tr: &StrTable) {
+    let header = Row::new([
+        tr.th_dup,
+        tr.th_kept,
+        tr.th_corr,
+        tr.th_gain,
+        tr.th_crest,
+        tr.th_clip,
+        tr.th_ren,
+        tr.th_reason,
+    ])
+    .style(STYLE_HEADER);
+    let rows: Vec<Row> = pairs.iter().map(|pair| dedup_row(pair, tr)).collect();
     let widths = [
         Constraint::Length(14),
         Constraint::Length(14),
@@ -845,7 +893,7 @@ fn render_dedup_table(frame: &mut Frame, area: Rect, pairs: &[PairReport]) {
     frame.render_widget(Table::new(rows, widths).header(header), area);
 }
 
-fn dedup_row(pair: &PairReport) -> Row<'static> {
+fn dedup_row(pair: &PairReport, tr: &StrTable) -> Row<'static> {
     let (clip, clip_style) = clip_flag(pair.kept_clipping, pair.dup_clipping);
     let (renamed, renamed_style) = if pair.rename_error.is_some() {
         ("!", Style::new().fg(Color::Red))
@@ -862,7 +910,7 @@ fn dedup_row(pair: &PairReport) -> Row<'static> {
         Cell::from(format!("{:.1}/{:.1}", pair.crest_kept_db, pair.crest_dup_db)),
         Cell::from(Span::styled(clip, clip_style)),
         Cell::from(Span::styled(renamed, renamed_style)),
-        Cell::from(Span::styled(keeper_reason_label(&pair.reason), STYLE_DIM)),
+        Cell::from(Span::styled(keeper_reason_label(&pair.reason, tr), STYLE_DIM)),
     ])
 }
 
@@ -873,30 +921,28 @@ pub fn render_log(
     area: Rect,
     log: &LogBuffer,
     filter_input: Option<&(String, usize)>,
+    tr: &StrTable,
 ) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" Log ");
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.log_title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    render_log_lines(frame, rows[0], log);
-    render_log_status(frame, rows[1], log, filter_input);
+    render_log_lines(frame, rows[0], log, tr);
+    render_log_status(frame, rows[1], log, filter_input, tr);
 }
 
 /// Окно журнала: `scroll` строк от хвоста вверх; 0 — последние строки.
-fn render_log_lines(frame: &mut Frame, area: Rect, log: &LogBuffer) {
+fn render_log_lines(frame: &mut Frame, area: Rect, log: &LogBuffer, tr: &StrTable) {
     if log.is_empty() {
-        frame.render_widget(
-            Paragraph::new("журнал пуст — события прогона появятся здесь").style(STYLE_DIM),
-            area,
-        );
+        frame.render_widget(Paragraph::new(tr.log_empty).style(STYLE_DIM), area);
         return;
     }
     let visible = log.visible();
     if visible.is_empty() {
-        frame.render_widget(Paragraph::new("нет записей по фильтру").style(STYLE_DIM), area);
+        frame.render_widget(Paragraph::new(tr.log_no_match).style(STYLE_DIM), area);
         return;
     }
     let height = area.height as usize;
@@ -921,43 +967,37 @@ fn render_log_status(
     area: Rect,
     log: &LogBuffer,
     filter_input: Option<&(String, usize)>,
+    tr: &StrTable,
 ) {
     let line = match filter_input {
-        Some((text, cursor)) => filter_input_line(text, *cursor),
+        Some((text, cursor)) => filter_input_line(text, *cursor, tr),
         None => match log.filter() {
             Some(filter) => Line::from(vec![
-                Span::raw(format!(
-                    "фильтр: \"{filter}\" — {} из {} · ",
-                    log.visible_len(),
-                    log.len()
-                )),
-                Span::styled("f — изменить · c — очистить", STYLE_DIM),
+                Span::raw((tr.log_filter_active)(filter, log.visible_len(), log.len())),
+                Span::styled(tr.log_filter_edit_hints.to_string(), STYLE_DIM),
             ]),
-            None => log_hints_line(log),
+            None => log_hints_line(log, tr),
         },
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Ввод фильтра: курсор `▌` вставлен по позиции (unicode-safe).
-fn filter_input_line(text: &str, cursor: usize) -> Line<'static> {
+fn filter_input_line(text: &str, cursor: usize, tr: &StrTable) -> Line<'static> {
     let mut value: String = text.chars().take(cursor).collect();
     value.push('▌');
     value.extend(text.chars().skip(cursor));
     Line::from(vec![
-        Span::raw("фильтр: "),
+        Span::raw(tr.log_filter_label.to_string()),
         Span::styled(value, STYLE_FILL),
-        Span::styled("  Enter — применить · Esc — отмена", STYLE_DIM),
+        Span::styled(tr.log_filter_apply_hints.to_string(), STYLE_DIM),
     ])
 }
 
-fn log_hints_line(log: &LogBuffer) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        "f — фильтр · c — очистить · PgUp/PgDn — прокрутка".to_string(),
-        STYLE_DIM,
-    )];
+fn log_hints_line(log: &LogBuffer, tr: &StrTable) -> Line<'static> {
+    let mut spans = vec![Span::styled(tr.log_hints.to_string(), STYLE_DIM)];
     if log.scroll() > 0 {
-        spans.push(Span::styled(format!("  ↑{} от хвоста", log.scroll()), STYLE_FILL));
+        spans.push(Span::styled((tr.log_scroll_back)(log.scroll()), STYLE_FILL));
     }
     Line::from(spans)
 }
@@ -973,70 +1013,73 @@ fn help_line(key: &str, desc: &str) -> Line<'static> {
 
 /// Справка: оверлей со всеми кейбиндами (истина — по коду app.rs/mod.rs:
 /// Tab-навигация, таб Log, confirm выхода, попап запуска).
-pub fn render_help(frame: &mut Frame, area: Rect) {
+pub fn render_help(frame: &mut Frame, area: Rect, tr: &StrTable) {
     let popup = centered(area, 86, 88);
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" Справка ");
+    let block = Block::bordered().border_type(BorderType::Rounded).title(tr.help_title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.is_empty() {
         return;
     }
-    let lines = vec![
-        help_line("[1–4]/Tab", "табы: Files, Dedup, Log, Help"),
-        help_line("?", "эта справка (повторно — назад)"),
-        help_line("Enter/s", "настройки прогона (Idle)"),
-        help_line("Enter", "новый цикл (Finished)"),
-        help_line("p", "пауза между файлами (Running)"),
-        help_line("r", "повтор выбранного упавшего файла"),
-        help_line("x", "очистить список файлов (Idle/Finished)"),
-        help_line("↑/↓, j/k", "выбор файла в таблице"),
-        help_line("f", "фильтр журнала по подстроке (Log)"),
-        help_line("c", "очистить журнал (Log)"),
-        help_line("PgUp/PgDn", "прокрутка журнала (Log)"),
-        help_line("Enter", "подтвердить в диалогах и попапе"),
-        help_line("Esc", "закрыть попап/справку/диалог"),
-        help_line("q/Esc", "выход; в Running — подтверждение отмены"),
-        help_line("m/o", "модель/отчёт — зарезервировано"),
-        Line::from(Span::styled(
-            " CLIP: K/D — клипует хранитель/дубль · REN: ✓ — переименован",
+    let lines: Vec<Line> = help_lines(tr)
+        .into_iter()
+        .map(|(key, desc)| help_line(key, desc))
+        .chain(std::iter::once(Line::from(Span::styled(
+            tr.help_clip_legend,
             STYLE_DIM,
-        )),
-    ];
+        ))))
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Пары «клавиша — описание» справки (клавиши языконезависимы).
+fn help_lines(tr: &StrTable) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("[1–4]/Tab", tr.help_tabs),
+        ("?", tr.help_self),
+        ("Enter/s", tr.help_start),
+        ("Enter", tr.help_new_cycle),
+        ("p", tr.help_pause),
+        ("r", tr.help_retry),
+        ("x", tr.help_clear_files),
+        ("↑/↓, j/k", tr.help_select),
+        ("f", tr.help_filter),
+        ("c", tr.help_clear_log),
+        ("PgUp/PgDn", tr.help_scroll),
+        ("l", tr.help_lang),
+        ("Enter", tr.help_confirm),
+        ("Esc", tr.help_close),
+        ("q/Esc", tr.help_quit),
+        ("m/o", tr.help_reserved),
+    ]
+}
+
 /// Модальный диалог выхода во время прогона (поверх всего кадра).
-pub fn render_confirm(frame: &mut Frame, area: Rect) {
+pub fn render_confirm(frame: &mut Frame, area: Rect, tr: &StrTable) {
     let popup = centered(area, 70, 44);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(STYLE_FILL)
-        .title(" Подтверждение ");
+        .title(tr.confirm_title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.is_empty() {
         return;
     }
     let lines = vec![
-        Line::from("Прервать прогон и выйти?"),
+        Line::from(tr.confirm_question),
         Line::from(String::new()),
-        Line::from(Span::styled("Мягкая отмена — на границе файлов:", STYLE_FILL)),
-        Line::from(Span::styled("текущий файл будет доигран раннером.", STYLE_FILL)),
+        Line::from(Span::styled(tr.confirm_soft_head, STYLE_FILL)),
+        Line::from(Span::styled(tr.confirm_soft_body, STYLE_FILL)),
         Line::from(String::new()),
         Line::from(vec![
             Span::styled("Enter", STYLE_FILL),
-            Span::raw(" — мягко: доиграть текущий файл и выйти · "),
+            Span::raw(tr.confirm_soft_action),
             Span::styled("Esc/q", STYLE_FILL),
-            Span::raw(" — остаться"),
+            Span::raw(tr.confirm_stay),
         ]),
-        Line::from(Span::styled(
-            "Повторный Enter/q в баннере «Прерывание…» — форс: движок будет убит,",
-            STYLE_DIM,
-        )),
-        Line::from(Span::styled(
-            "текущий файл останется без rename (resume подберёт его сам).",
-            STYLE_DIM,
-        )),
+        Line::from(Span::styled(tr.confirm_force_head, STYLE_DIM)),
+        Line::from(Span::styled(tr.confirm_force_body, STYLE_DIM)),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1062,32 +1105,32 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 // --- композиция кадра и карта для мыши ------------------------------------------
 
 /// Полный кадр: шапка → табы → статус-строка → контент активного таба → footer.
-pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView) {
+pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView, tr: &StrTable) {
     let zones = compute_zones(area);
-    render_header(frame, zones.header, &view.header);
-    render_tab_bar(frame, zones.tabs, view.tab);
+    render_header(frame, zones.header, &view.header, tr);
+    render_tab_bar(frame, zones.tabs, view.tab, tr);
     render_status_line(frame, zones.status, view.banner.as_deref(), view.current.as_ref());
     match view.tab {
-        Tab::Files => render_files_tab(frame, zones, view),
+        Tab::Files => render_files_tab(frame, zones, view, tr),
         Tab::Dedup => {
-            render_dedup(frame, zones.content, &view.dedup_pairs, &view.dedup_unparseable);
+            render_dedup(frame, zones.content, &view.dedup_pairs, &view.dedup_unparseable, tr);
         }
-        Tab::Log => render_log(frame, zones.content, &view.log, view.log_filter_input.as_ref()),
+        Tab::Log => render_log(frame, zones.content, &view.log, view.log_filter_input.as_ref(), tr),
         // Фон — таблица файлов, справка поверх.
         Tab::Help => {
-            render_files_tab(frame, zones, view);
-            render_help(frame, zones.content);
+            render_files_tab(frame, zones, view, tr);
+            render_help(frame, zones.content, tr);
         }
     }
-    render_footer(frame, zones.footer, &view.footer);
+    render_footer(frame, zones.footer, &view.footer, tr);
 }
 
 /// Классический вид таба Files: таблица + DETAILS в полном режиме.
-fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView) {
+fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView, tr: &StrTable) {
     let has_details = view.details.is_some();
     let (files_area, details_area) = content_split(zones.content, has_details);
-    render_files(frame, files_area, &view.files, view.selected);
-    render_details_or_empty(frame, details_area, view.details.as_ref());
+    render_files(frame, files_area, &view.files, view.selected, tr);
+    render_details_or_empty(frame, details_area, view.details.as_ref(), tr);
 }
 
 /// Статус-строка между табами и контентом: баннер отмены (приоритет) либо
@@ -1189,7 +1232,13 @@ pub fn file_row_at(y: u16, table_area: Rect) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::i18n::{self, Lang};
     use ratatui::Terminal;
+
+    /// Дефолтная (русская) таблица строк для golden-рендеров.
+    fn tr() -> &'static i18n::StrTable {
+        i18n::tr(Lang::Ru)
+    }
     use ratatui::backend::TestBackend;
 
     /// Рендер произвольной функции в буфер (текст + доступ к ячейкам).
@@ -1304,11 +1353,29 @@ mod tests {
 
     #[test]
     fn badge_labels_are_fixed_text() {
-        assert_eq!(FileBadge::Run.label(), "RUN");
-        assert_eq!(FileBadge::Ok.label(), "OK");
-        assert_eq!(FileBadge::Fail.label(), "FAIL");
-        assert_eq!(FileBadge::Skip.label(), "SKIP");
-        assert_eq!(FileBadge::Dup.label(), "DUP");
+        let ru = tr();
+        assert_eq!(FileBadge::Run.label(ru), "ПРЦ");
+        assert_eq!(FileBadge::Ok.label(ru), "ГОТ");
+        assert_eq!(FileBadge::Fail.label(ru), "ОШБ");
+        assert_eq!(FileBadge::Skip.label(ru), "ПРОП");
+        assert_eq!(FileBadge::Dup.label(ru), "ДУБЛ");
+
+        let en = i18n::tr(Lang::En);
+        assert_eq!(FileBadge::Run.label(en), "RUN");
+        assert_eq!(FileBadge::Ok.label(en), "OK");
+        assert_eq!(FileBadge::Fail.label(en), "FAIL");
+        assert_eq!(FileBadge::Skip.label(en), "SKIP");
+        assert_eq!(FileBadge::Dup.label(en), "DUP");
+    }
+
+    #[test]
+    fn badge_cells_are_padded_to_four_columns_in_both_locales() {
+        for lang in [Lang::Ru, Lang::En] {
+            let table = i18n::tr(lang);
+            for badge in [FileBadge::Run, FileBadge::Ok, FileBadge::Fail, FileBadge::Skip, FileBadge::Dup] {
+                assert_eq!(badge.cell(table).chars().count(), 4, "{lang:?}: {badge:?}");
+            }
+        }
     }
 
     #[test]
@@ -1402,12 +1469,24 @@ mod tests {
     #[test]
     fn header_shows_model_load_indicator_only_while_active() {
         let loading = HeaderView { model: "sw".into(), model_pct: Some(37.4), ..HeaderView::default() };
-        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading)));
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading, tr())));
         assert!(text.contains("модель: 37%"), "глобальная загрузка модели видна");
 
         let idle = HeaderView { model: "sw".into(), ..HeaderView::default() };
-        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &idle)));
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &idle, tr())));
         assert!(!text.contains("модель:"), "вне загрузки слот скрыт");
+    }
+
+    #[test]
+    fn header_model_loading_label_in_both_locales() {
+        let loading = HeaderView { model: "sw".into(), model_pct: Some(37.4), ..HeaderView::default() };
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading, tr())));
+        assert!(text.contains("модель: 37%"), "ru: {text}");
+
+        let en = i18n::tr(Lang::En);
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading, en)));
+        assert!(text.contains("model: 37%"), "en: {text}");
+        assert!(!text.contains("модель:"), "ru-строка ушла: {text}");
     }
 
     #[test]
@@ -1461,11 +1540,11 @@ mod tests {
             stage: "download".into(),
             pct: 0.0,
             estimated: false,
-            stems_done: 0,
+            stems_done: None,
             stage_elapsed: Some(65.0),
             indeterminate: Some(3),
         }];
-        let text = buffer_text(&render_frame(100, 8, |f, a| render_files(f, a, &rows, None)));
+        let text = buffer_text(&render_frame(100, 8, |f, a| render_files(f, a, &rows, None, tr())));
         assert!(text.contains("download · 01:05"));
         assert!(text.contains("··"), "индeterminate-бар");
         assert!(!text.contains("  0%"), "мёртвых 0% больше нет");
@@ -1483,7 +1562,7 @@ mod tests {
         }
     }
 
-    fn file_row_view(badge: FileBadge, name: &str, pct: f64, stems: u8) -> FileRowView {
+    fn file_row_view(badge: FileBadge, name: &str, pct: f64, stems: Option<u8>) -> FileRowView {
         FileRowView {
             badge,
             name: name.into(),
@@ -1503,7 +1582,7 @@ mod tests {
 
     #[test]
     fn header_renders_connection_model_and_gpu_placeholder() {
-        let terminal = render_frame(80, 3, |f, area| render_header(f, area, &header_view()));
+        let terminal = render_frame(80, 3, |f, area| render_header(f, area, &header_view(), tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("audio_split"));
         assert!(text.contains("//nas.local/media"));
@@ -1523,7 +1602,7 @@ mod tests {
             util_history: vec![10, 40, 63, 90],
         });
         // Широкий кадр: спарклайн (20) + VRAM должны помещаться в одну строку.
-        let terminal = render_frame(140, 3, |f, area| render_header(f, area, &view));
+        let terminal = render_frame(140, 3, |f, area| render_header(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         // 2.1/6.0 = 35% → 2 из 6 полуколонок заполнены.
         assert!(text.contains("GPU 63%"), "утилизация процентом: {text}");
@@ -1544,7 +1623,7 @@ mod tests {
             util_pct: None,
             util_history: Vec::new(),
         });
-        let terminal = render_frame(120, 3, |f, area| render_header(f, area, &view));
+        let terminal = render_frame(120, 3, |f, area| render_header(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("GPU n/a "), "утилизация неизвестна: {text}");
         assert!(text.contains("▓"), "VRAM-бар остаётся: {text}");
@@ -1562,22 +1641,22 @@ mod tests {
 
     #[test]
     fn files_progress_bar_over_done_total() {
-        assert_eq!(files_progress(0, 3), "файлы 0/3 ░░░░░░ 0%");
-        assert_eq!(files_progress(1, 3), "файлы 1/3 ██░░░░ 33%");
-        assert_eq!(files_progress(3, 3), "файлы 3/3 ██████ 100%");
-        assert_eq!(files_progress(0, 0), "файлы 0/0", "пустой план — без бара");
+        assert_eq!(files_progress(tr(), 0, 3), "файлы 0/3 ░░░░░░ 0%");
+        assert_eq!(files_progress(tr(), 1, 3), "файлы 1/3 ██░░░░ 33%");
+        assert_eq!(files_progress(tr(), 3, 3), "файлы 3/3 ██████ 100%");
+        assert_eq!(files_progress(tr(), 0, 0), "файлы 0/0", "пустой план — без бара");
     }
 
     #[test]
     fn table_marks_estimated_pct_with_tilde() {
-        let mut row = file_row_view(FileBadge::Run, "a.wav", 63.0, 0);
+        let mut row = file_row_view(FileBadge::Run, "a.wav", 63.0, None);
         row.estimated = true;
-        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[row], None));
+        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[row], None, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("~63%"), "оценка помечается тильдой: {text}");
 
-        let real = file_row_view(FileBadge::Run, "a.wav", 63.0, 0);
-        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[real], None));
+        let real = file_row_view(FileBadge::Run, "a.wav", 63.0, None);
+        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[real], None, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains(" 63%"), "фактический — без тильды: {text}");
     }
@@ -1585,45 +1664,53 @@ mod tests {
     #[test]
     fn table_renders_all_five_badges_and_numbers() {
         let files = [
-            file_row_view(FileBadge::Run, "a.wav", 63.0, 0),
-            file_row_view(FileBadge::Ok, "b.wav", 100.0, 6),
-            file_row_view(FileBadge::Fail, "c.wav", 0.0, 0),
-            file_row_view(FileBadge::Skip, "d.wav", 0.0, 0),
-            file_row_view(FileBadge::Dup, "e.wav", 0.0, 0),
+            file_row_view(FileBadge::Run, "a.wav", 63.0, None),
+            file_row_view(FileBadge::Ok, "b.wav", 100.0, Some(6)),
+            file_row_view(FileBadge::Fail, "c.wav", 0.0, None),
+            file_row_view(FileBadge::Skip, "d.wav", 0.0, None),
+            file_row_view(FileBadge::Dup, "e.wav", 0.0, None),
         ];
-        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &files, None));
+        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &files, None, tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("RUN"));
-        assert!(text.contains("OK"));
-        assert!(text.contains("FAIL"));
-        assert!(text.contains("SKIP"));
-        assert!(text.contains("DUP"));
+        assert!(text.contains("ПРЦ"));
+        assert!(text.contains("ГОТ"));
+        assert!(text.contains("ОШБ"));
+        assert!(text.contains("ПРОП"));
+        assert!(text.contains("ДУБЛ"));
         assert!(text.contains(" 63%"));
-        assert!(text.contains("6/6"));
+        assert!(text.contains("6/6"), "известный счётчик — числом");
+        assert!(text.contains("—"), "неизвестный счётчик — «—», не «0/6»");
         assert!(text.contains("████████████"));
     }
 
     #[test]
+    fn stems_cell_is_dash_until_count_known() {
+        assert_eq!(stems_cell(None, tr()), "—");
+        assert_eq!(stems_cell(Some(0), tr()), "0/6");
+        assert_eq!(stems_cell(Some(6), tr()), "6/6");
+    }
+
+    #[test]
     fn table_selected_row_is_marked_with_arrow() {
-        let files = [file_row_view(FileBadge::Run, "a.wav", 10.0, 0)];
-        let terminal = render_frame(60, 8, |f, area| render_files(f, area, &files, Some(0)));
+        let files = [file_row_view(FileBadge::Run, "a.wav", 10.0, None)];
+        let terminal = render_frame(60, 8, |f, area| render_files(f, area, &files, Some(0), tr()));
         assert!(buffer_text(&terminal).contains("▸"));
-        let unselected = render_frame(60, 8, |f, area| render_files(f, area, &files, None));
+        let unselected = render_frame(60, 8, |f, area| render_files(f, area, &files, None, tr()));
         assert!(!buffer_text(&unselected).contains("▸"));
     }
 
     #[test]
     fn empty_table_shows_hint() {
-        let terminal = render_frame(60, 8, |f, area| render_files(f, area, &[], None));
+        let terminal = render_frame(60, 8, |f, area| render_files(f, area, &[], None, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("нет файлов — Esc → настройка"));
-        assert!(!text.contains("RUN"));
+        assert!(!text.contains("ПРЦ"));
     }
 
     #[test]
     fn waveform_at_zero_percent_all_dim() {
         let view = WaveformView { pct: 0.0, duration_secs: Some(120.0), peaks: flat_peaks(80, 0.75) };
-        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view));
+        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("0% · обработано 00:00 · осталось 02:00"));
         // Ни одной яркой колонки во второй строке огибающей (y=1).
@@ -1634,7 +1721,7 @@ mod tests {
     #[test]
     fn waveform_at_fifty_percent_boundary_on_column() {
         let view = WaveformView { pct: 50.0, duration_secs: Some(120.0), peaks: flat_peaks(80, 0.75) };
-        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view));
+        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         assert!(buffer_text(&terminal).contains("50% · обработано 01:00 · осталось 01:00"));
         // Граница заливки ровно на полуколонке: 40 заполнено, 41-я — dim.
         assert_eq!(fg_at(&terminal, 39, 1), Color::Yellow);
@@ -1644,7 +1731,7 @@ mod tests {
     #[test]
     fn waveform_at_hundred_percent_all_bright() {
         let view = WaveformView { pct: 100.0, duration_secs: Some(120.0), peaks: flat_peaks(80, 0.75) };
-        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view));
+        let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("100% · обработано 02:00 · осталось 00:00"));
         assert_eq!(fg_at(&terminal, 0, 1), Color::Yellow);
@@ -1656,7 +1743,7 @@ mod tests {
     #[test]
     fn waveform_falls_back_to_plain_bar_without_peaks() {
         let view = WaveformView { pct: 40.0, duration_secs: Some(120.0), peaks: Vec::new() };
-        let terminal = render_frame(40, 5, |f, area| render_waveform(f, area, &view));
+        let terminal = render_frame(40, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains('█'));
         assert!(text.contains('░'));
@@ -1679,7 +1766,7 @@ mod tests {
             events: vec!["download ok".into(), "separate 45%".into()],
             waveform: WaveformView::default(),
         };
-        let terminal = render_frame(50, 14, |f, area| render_details(f, area, &view));
+        let terminal = render_frame(50, 14, |f, area| render_details(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("DETAILS"));
         assert!(text.contains("a.wav"));
@@ -1694,7 +1781,7 @@ mod tests {
 
     #[test]
     fn details_empty_state_when_nothing_selected() {
-        let terminal = render_frame(50, 10, |f, area| render_details_or_empty(f, area, None));
+        let terminal = render_frame(50, 10, |f, area| render_details_or_empty(f, area, None, tr()));
         assert!(buffer_text(&terminal).contains("нет выбранного файла"));
     }
 
@@ -1702,15 +1789,15 @@ mod tests {
     fn footer_renders_keyhints_and_summary() {
         let view = FooterView { summary: "OK 3 · FAIL 1 · DUP 2".into() };
         // 100 колонок: подсказки (60) + сводка (21) влезают с зазором.
-        let terminal = render_frame(100, 1, |f, area| render_footer(f, area, &view));
+        let terminal = render_frame(100, 1, |f, area| render_footer(f, area, &view, tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("[s]tart"));
-        assert!(text.contains("[p]ause"));
-        assert!(text.contains("[r]etry"));
-        assert!(text.contains("[m]odel"));
-        assert!(text.contains("[o]pen report"));
-        assert!(text.contains("[?]help"));
-        assert!(text.contains("[q]uit"));
+        assert!(text.contains("[s]тарт"));
+        assert!(text.contains("[p]ауза"));
+        assert!(text.contains("[r]етрай"));
+        assert!(text.contains("[m]одель"));
+        assert!(text.contains("[o]тчёт"));
+        assert!(text.contains("[?]справка"));
+        assert!(text.contains("[q]выход"));
         assert!(text.contains("OK 3 · FAIL 1 · DUP 2"));
     }
 
@@ -1729,24 +1816,24 @@ mod tests {
     #[test]
     fn screen_idle_renders_full_frame_with_empty_state() {
         let view = screen_view(Vec::new(), None);
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("audio_split"));
-        assert!(text.contains("[1]Files"));
-        assert!(text.contains("[4]Help"));
+        assert!(text.contains("[1]Файлы"));
+        assert!(text.contains("[4]Справка"));
         assert!(text.contains("нет файлов — Esc → настройка"));
-        assert!(text.contains("[q]uit"));
+        assert!(text.contains("[q]выход"));
         assert!(text.contains("ETA 04:12"));
     }
 
     #[test]
     fn screen_running_compact_hides_details_panel() {
-        let files = [file_row_view(FileBadge::Run, "a.wav", 63.0, 2)];
+        let files = [file_row_view(FileBadge::Run, "a.wav", 63.0, Some(2))];
         let view = screen_view(files.into(), None);
-        let terminal = render_frame(80, 24, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(80, 24, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("FILES"));
-        assert!(text.contains("RUN"));
+        assert!(text.contains("ФАЙЛЫ"));
+        assert!(text.contains("ПРЦ"));
         // Compact-режим: DETAILS-колонка скрыта на 80 колонках.
         assert!(!text.contains("DETAILS"));
         assert!(!text.contains("нет выбранного файла"));
@@ -1754,7 +1841,7 @@ mod tests {
 
     #[test]
     fn screen_running_full_shows_details_with_waveform() {
-        let files = [file_row_view(FileBadge::Run, "a.wav", 50.0, 3)];
+        let files = [file_row_view(FileBadge::Run, "a.wav", 50.0, Some(3))];
         let details = DetailsView {
             name: "a.wav".into(),
             stage: "separate".into(),
@@ -1770,7 +1857,7 @@ mod tests {
             },
         };
         let view = screen_view(files.into(), Some(details));
-        let terminal = render_frame(110, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(110, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("DETAILS"));
         assert!(text.contains("50% · обработано 01:00 · осталось 01:00"));
@@ -1780,13 +1867,13 @@ mod tests {
     #[test]
     fn screen_finished_renders_summary_and_badges() {
         let files = [
-            file_row_view(FileBadge::Ok, "a.wav", 100.0, 6),
-            file_row_view(FileBadge::Fail, "b.wav", 0.0, 0),
-            file_row_view(FileBadge::Dup, "c.wav", 0.0, 0),
+            file_row_view(FileBadge::Ok, "a.wav", 100.0, Some(6)),
+            file_row_view(FileBadge::Fail, "b.wav", 0.0, None),
+            file_row_view(FileBadge::Dup, "c.wav", 0.0, None),
         ];
         let mut view = screen_view(files.into(), None);
         view.footer.summary = "OK 1 · FAIL 1 · DUP 1".into();
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("OK 1 · FAIL 1 · DUP 1"));
         assert!(text.contains("FAIL"));
@@ -1795,11 +1882,11 @@ mod tests {
 
     #[test]
     fn screen_too_small_area_renders_without_panic() {
-        let files = [file_row_view(FileBadge::Run, "a.wav", 63.0, 1)];
+        let files = [file_row_view(FileBadge::Run, "a.wav", 63.0, Some(1))];
         let view = screen_view(files.into(), None);
         // Ниже минимума 80×24 — рендер не паникует; сводка важнее подсказок,
         // в 40 колонок влезает только она (новое правило приоритета footer).
-        let terminal = render_frame(40, 12, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(40, 12, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("audio_split"));
         assert!(text.contains("ETA 04:12"), "сводка видна даже в узком кадре");
@@ -1809,8 +1896,8 @@ mod tests {
     fn degenerate_areas_do_not_panic() {
         let view = screen_view(Vec::new(), None);
         // Нулевой и усечённый размеры не должны паниковать при сборке кадра.
-        render_frame(0, 0, |f, area| render_screen(f, area, &view));
-        render_frame(10, 2, |f, area| render_screen(f, area, &view));
+        render_frame(0, 0, |f, area| render_screen(f, area, &view, tr()));
+        render_frame(10, 2, |f, area| render_screen(f, area, &view, tr()));
     }
 
     // --- табы Dedup / Log / Help и confirm (seq 05) ------------------------------
@@ -1854,15 +1941,15 @@ mod tests {
 
     #[test]
     fn keeper_reason_labels_cover_all_variants() {
-        assert_eq!(keeper_reason_label(&KeeperReason::SoleCandidate), "единственный кандидат");
-        assert_eq!(keeper_reason_label(&KeeperReason::OnlyNonClipped), "без клипа");
+        assert_eq!(keeper_reason_label(&KeeperReason::SoleCandidate, tr()), "единственный кандидат");
+        assert_eq!(keeper_reason_label(&KeeperReason::OnlyNonClipped, tr()), "без клипа");
         assert_eq!(
-            keeper_reason_label(&KeeperReason::CleanerDynamics { margin_db: 3.25 }),
+            keeper_reason_label(&KeeperReason::CleanerDynamics { margin_db: 3.25 }, tr()),
             "динамичнее на 3.2 дБ"
         );
-        assert_eq!(keeper_reason_label(&KeeperReason::Louder { margin_db: 11.1 }), "громче на 11.1 дБ");
+        assert_eq!(keeper_reason_label(&KeeperReason::Louder { margin_db: 11.1 }, tr()), "громче на 11.1 дБ");
         assert_eq!(
-            keeper_reason_label(&KeeperReason::AllClipped { margin_db: 0.5 }),
+            keeper_reason_label(&KeeperReason::AllClipped { margin_db: 0.5 }, tr()),
             "макс. crest при клипе (+0.5 дБ)"
         );
     }
@@ -1878,13 +1965,13 @@ mod tests {
             v.dedup_pairs = vec![dedup_pair()];
             v.dedup_unparseable = vec!["broken.wav".into()];
         });
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
 
-        assert!(text.contains("DUP"), "заголовок");
-        assert!(text.contains("KEPT"));
+        assert!(text.contains("ДУБЛ"), "заголовок");
+        assert!(text.contains("ХРАН"));
         assert!(text.contains("CORR"));
-        assert!(text.contains("REASON"));
+        assert!(text.contains("ПРИЧИНА"));
         assert!(text.contains("unknown 3.wav"), "файл-дубль");
         assert!(text.contains("unknown 2.wav"), "хранитель");
         assert!(text.contains("0.99/1.00/0.99"), "corr по окнам");
@@ -1898,7 +1985,7 @@ mod tests {
     #[test]
     fn dedup_empty_state_shows_hint() {
         let view = tab_view(Tab::Dedup, |_| {});
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         assert!(buffer_text(&terminal).contains("дублей не найдено"));
     }
 
@@ -1910,7 +1997,7 @@ mod tests {
         pair.rename_error = Some("EACCES".into());
         let view = tab_view(Tab::Dedup, |v| v.dedup_pairs = vec![pair]);
 
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
 
         assert!(text.contains("KD"), "клипуют оба (текст, не только цвет)");
@@ -1920,10 +2007,10 @@ mod tests {
     #[test]
     fn log_tab_renders_entries_with_timestamps() {
         let view = tab_view(Tab::Log, |v| v.log = log_fixture());
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
 
-        assert!(text.contains("Log"), "заголовок");
+        assert!(text.contains("Журнал"), "заголовок");
         assert!(text.contains("00:00:01"), "timestamp");
         assert!(text.contains("download a.wav"));
         assert!(text.contains("separate b.wav"));
@@ -1933,7 +2020,7 @@ mod tests {
     #[test]
     fn log_empty_state_shows_hint() {
         let view = tab_view(Tab::Log, |_| {});
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         assert!(buffer_text(&terminal).contains("журнал пуст"));
     }
 
@@ -1943,7 +2030,7 @@ mod tests {
             v.log = log_fixture();
             v.log.set_filter(Some("нет-таких".into()));
         });
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("нет записей по фильтру"));
         assert!(text.contains("фильтр: \"нет-таких\""));
@@ -1952,7 +2039,7 @@ mod tests {
     #[test]
     fn log_filter_input_renders_cursor_in_text() {
         let view = tab_view(Tab::Log, |v| v.log_filter_input = Some(("do".into(), 1)));
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("фильтр:"), "строка ввода");
         assert!(text.contains("d▌o"), "курсор внутри текста");
@@ -1967,14 +2054,14 @@ mod tests {
         }
         let mut view = tab_view(Tab::Log, |v| v.log = log.clone());
 
-        let tail = render_frame(80, 24, |f, area| render_screen(f, area, &view));
+        let tail = render_frame(80, 24, |f, area| render_screen(f, area, &view, tr()));
         let tail_text = buffer_text(&tail);
         assert!(tail_text.contains("msg-29"), "автоскролл: хвост виден");
         assert!(!tail_text.contains("msg-00"), "голова за окном");
 
         log.scroll_up(100);
         view.log = log;
-        let head = render_frame(80, 24, |f, area| render_screen(f, area, &view));
+        let head = render_frame(80, 24, |f, area| render_screen(f, area, &view, tr()));
         let head_text = buffer_text(&head);
         assert!(head_text.contains("msg-00"), "прокрутка вверх: голова видна");
         assert!(head_text.contains("от хвоста"), "индикатор отступа");
@@ -1983,7 +2070,7 @@ mod tests {
     #[test]
     fn help_overlay_renders_all_keybind_groups() {
         let view = tab_view(Tab::Help, |_| {});
-        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view));
+        let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
 
         assert!(text.contains("Справка"));
@@ -1997,12 +2084,13 @@ mod tests {
         assert!(text.contains("PgUp/PgDn"), "прокрутка");
         assert!(text.contains("подтверждение отмены"), "q/Esc в Running");
         assert!(text.contains("зарезервировано"), "m/o");
+        assert!(text.contains("язык интерфейса"), "l — переключатель языка");
         assert!(text.contains("K/D — клипует"), "легенда CLIP");
     }
 
     #[test]
     fn confirm_renders_warning_and_both_actions() {
-        let terminal = render_frame(100, 30, render_confirm);
+        let terminal = render_frame(100, 30, |f, area| render_confirm(f, area, tr()));
         let text = buffer_text(&terminal);
 
         assert!(text.contains("Подтверждение"));
@@ -2017,8 +2105,8 @@ mod tests {
 
     #[test]
     fn confirm_and_help_survive_degenerate_areas() {
-        render_frame(0, 0, render_confirm);
-        render_frame(2, 2, render_confirm);
-        render_frame(2, 2, render_help);
+        render_frame(0, 0, |f, area| render_confirm(f, area, tr()));
+        render_frame(2, 2, |f, area| render_confirm(f, area, tr()));
+        render_frame(2, 2, |f, area| render_help(f, area, tr()));
     }
 }

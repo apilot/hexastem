@@ -150,6 +150,10 @@ pub enum AppEvent {
     FileProgress { name: String, stage: Stage, pct: f64, estimated: bool },
     /// Прогресс загрузки модели (глобальный, стадия `load` драйвера).
     ModelProgress { pct: f64 },
+    /// Драйвер сообщил список стемов файла (`EngineEvent::FileDone`):
+    /// живой счётчик x/6 в колонке STEMS — ещё до upload/rename.
+    /// Терминальный исход не меняет.
+    FileStems { name: String, count: u8 },
     /// Файл полностью готов: стемы залиты, исходник переименован.
     FileDone { name: String },
     /// Файл не обработан (download/engine/upload/rename — любая стадия).

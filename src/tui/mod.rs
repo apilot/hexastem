@@ -23,6 +23,7 @@
 pub mod app;
 pub mod event;
 pub mod gpu;
+pub mod i18n;
 pub mod log;
 pub mod pathmode;
 pub mod persist;
@@ -53,9 +54,10 @@ use crate::local_fs::LocalFs;
 use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
 use crate::smb::SmbClient;
 use crate::tui::event::{
-    spawn_input_thread, AppEvent, BatchOutcome, EMPTY_PLAN_HINT, RunSpec, Stage,
+    spawn_input_thread, AppEvent, BatchOutcome, RunSpec, Stage,
 };
 use crate::tui::gpu::GpuEvent;
+use crate::tui::i18n::{tr, Lang, StrTable};
 use crate::tui::persist::TuiSettings;
 use crate::tui::runner::{RunnerHandle, RunnerOptions};
 use crate::tui::widgets::{CurrentFileView, FileBadge, FileRowView, FooterView, HeaderView, ScreenView};
@@ -106,6 +108,8 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
     let (tx_gpu, mut rx_gpu) = mpsc::unbounded_channel::<GpuEvent>();
     let mut tick = tokio::time::interval(Duration::from_millis(TICK_MILLIS));
     let mut app = App::new();
+    // Язык интерфейса — из пресета (tui.toml); отсутствие файла = дефолт Ru.
+    app.set_lang(persist::load().lang());
     let mut run: Option<ActiveRun> = None;
     let mut popup_open = false;
     let mut quit = false;
@@ -149,17 +153,24 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
             }
         }
         sync_run_controls(&mut app, run.as_ref());
+        // Переключение языка (`l`): мгновенная перерисовка происходит сама
+        // (кадр на каждой итерации), выбор сохраняем в пресет.
+        if app.take_lang_dirty() {
+            let mut settings = persist::load();
+            settings.lang = app.lang().label().to_string();
+            let _ = persist::save(&settings);
+        }
         // Старт-страж: запрос старта учитывается только вне прогона
         // (App::on_key уже не пускает 's'/Enter в Running — двойная защита).
         if app.state() == State::Config {
             if let Some(spec) = app.take_start_request() {
-                spawn_validation(spec, tx_events.clone());
+                spawn_validation(spec, app.lang(), tx_events.clone());
             }
         }
         // Подтверждённый старт (повторный Enter после успешной валидации):
         // спека уже проверена — сохранить пресет и запустить прогон.
         if let Some(spec) = app.take_confirmed_start() {
-            let _ = persist::save(&settings_of_spec(&spec));
+            let _ = persist::save(&settings_of_spec(&spec, app.lang()));
             run = Some(start_run(spec, tx_events.clone(), tx_gpu.clone()));
         }
         quit |= app.should_quit();
@@ -186,64 +197,55 @@ pub fn apply_event(app: &mut App, event: &AppEvent) {
 /// не журналируем (шум).
 fn log_event(app: &mut App, event: &AppEvent) {
     let time = log::format_hhmmss(log::now_unix_secs());
-    for message in event_log_messages(event) {
+    for message in event_log_messages(event, tr(app.lang())) {
         app.log_mut().push(time.clone(), message);
     }
 }
 
 /// Сообщения журнала для события (пусто — событие не журналируется).
-fn event_log_messages(event: &AppEvent) -> Vec<String> {
+/// Текст — на языке интерфейса в момент события (исторические записи
+/// не переписываются задним числом при переключении `l`).
+fn event_log_messages(event: &AppEvent, table: &StrTable) -> Vec<String> {
     match event {
-        AppEvent::RunStarted { plan } => vec![format!(
-            "прогон начат: {} файлов к обработке",
-            plan.pending.len()
-        )],
-        AppEvent::RunFailed { error } => {
-            vec![format!("ОШИБКА: прогон не состоялся: {error}")]
-        }
+        AppEvent::RunStarted { plan } => vec![(table.run_started)(plan.pending.len())],
+        AppEvent::RunFailed { error } => vec![(table.run_failed)(error)],
         AppEvent::ValidationFinished { error: Some(error), .. } => {
-            vec![format!("ОШИБКА: валидация: {error}")]
+            vec![format!("{} валидация: {error}", table.error_log_prefix)]
         }
-        AppEvent::FileStage { name, stage } => vec![format!("{name}: {}", stage_label(*stage))],
-        AppEvent::FileDone { name } => vec![format!("{name}: готово")],
-        AppEvent::FileFailed { name, error } => vec![format!("ОШИБКА: {name}: {error}")],
-        AppEvent::FileDuplicate { name } => vec![format!("{name}: дубль (снят с обработки)")],
+        AppEvent::FileStage { name, stage } => {
+            vec![format!("{name}: {}", stage_label(*stage, table))]
+        }
+        AppEvent::FileStems { .. } => Vec::new(),
+        AppEvent::FileDone { name } => vec![(table.file_done_log)(name)],
+        AppEvent::FileFailed { name, error } => {
+            vec![format!("{} {name}: {error}", table.error_log_prefix)]
+        }
+        AppEvent::FileDuplicate { name } => vec![(table.file_duplicate_log)(name)],
         AppEvent::DuplicatesKnown { names } => {
-            vec![format!("дубли распознаны до разделения: {}", names.join(", "))]
+            vec![(table.dups_known_log)(&names.join(", "))]
         }
         // Строки `[engine]` (прогресс/сводка драйвера) — как есть в таб Log.
         AppEvent::EngineLog { line } => vec![line.clone()],
-        AppEvent::BatchFinished { outcome } => batch_log_messages(outcome),
+        AppEvent::BatchFinished { outcome } => batch_log_messages(outcome, table),
         _ => Vec::new(),
     }
 }
 
 /// Итог батча + решения дедупа с причинами (текст причин — widgets::keeper_reason_label).
-fn batch_log_messages(outcome: &BatchOutcome) -> Vec<String> {
-    let mut messages = vec![format!(
-        "прогон завершён: {} ок, {} ошибок, {} дублей за {}",
-        outcome.ok,
-        outcome.failed,
-        outcome.dedup.pairs.len(),
-        widgets::format_mmss(outcome.elapsed.as_secs_f64())
-    )];
+fn batch_log_messages(outcome: &BatchOutcome, table: &StrTable) -> Vec<String> {
+    let elapsed = widgets::format_mmss(outcome.elapsed.as_secs_f64());
+    let mut messages = vec![(table.batch_summary_log)(outcome.ok, outcome.failed, outcome.dedup.pairs.len(), &elapsed)];
     // Пустой прогон не должен выглядеть как тихий успех: явная подсказка.
     if outcome.total == 0 {
-        messages.push(EMPTY_PLAN_HINT.to_string());
+        messages.push(table.empty_plan_hint.to_string());
     }
     for pair in &outcome.dedup.pairs {
-        messages.push(format!(
-            "дубль {} → хранитель {}: {}",
-            pair.duplicate,
-            pair.kept,
-            widgets::keeper_reason_label(&pair.reason)
-        ));
+        let reason = widgets::keeper_reason_label(&pair.reason, table);
+        messages.push((table.dup_pair_log)(&pair.duplicate, &pair.kept, &reason));
     }
     if !outcome.dedup.unparseable.is_empty() {
-        messages.push(format!(
-            "! не разобраны как WAV: {}",
-            outcome.dedup.unparseable.join(", ")
-        ));
+        let names = outcome.dedup.unparseable.join(", ");
+        messages.push((table.unparseable_note)(&names));
     }
     messages
 }
@@ -326,11 +328,11 @@ async fn finish_run(run: Option<ActiveRun>) -> i32 {
 /// существует/создаётся, удалённая листится реальным бэкендом (ошибка
 /// NT_STATUS возвращается текстом — видна в попапе); при успехе считается
 /// факт — сколько .wav в директории (нуль виден в попапе до старта).
-fn spawn_validation(spec: RunSpec, tx: UnboundedSender<AppEvent>) {
+fn spawn_validation(spec: RunSpec, lang: Lang, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let outcome = tokio::task::spawn_blocking({
             let spec = spec.clone();
-            move || validate_spec(&spec)
+            move || validate_spec(&spec, lang)
         })
         .await
         .unwrap_or_else(|err| Err(format!("validation task crashed: {err}")));
@@ -343,23 +345,24 @@ fn spawn_validation(spec: RunSpec, tx: UnboundedSender<AppEvent>) {
 }
 
 /// Проверки спеки: `Ok(N)` — всё в порядке, N — .wav найдено листингом;
-/// `Err(текст)` — ошибка для попапа. Публично для интеграционных тестов
-/// (та же валидация, что перед стартом).
-pub fn validate_spec(spec: &RunSpec) -> Result<usize, String> {
+/// `Err(текст)` — ошибка для попапа (на языке `lang`). Публично для
+/// интеграционных тестов (та же валидация, что перед стартом).
+pub fn validate_spec(spec: &RunSpec, lang: Lang) -> Result<usize, String> {
+    let table = tr(lang);
     if spec.remote_dir.as_os_str().is_empty() {
-        return Err("исходная директория не указана".to_string());
+        return Err(table.err_empty_remote.to_string());
     }
     if !spec.local_mode {
         if spec.host.trim().is_empty() {
-            return Err("хост SMB-сервера не указан".to_string());
+            return Err(table.err_empty_host.to_string());
         }
         if spec.share.trim().is_empty() {
-            return Err("имя шары не указано".to_string());
+            return Err(table.err_empty_share.to_string());
         }
     }
     if !spec.local_dir.exists() {
         if let Err(err) = std::fs::create_dir_all(&spec.local_dir) {
-            return Err(format!("локальная директория: {err}"));
+            return Err((table.err_local_dir_io)(&err.to_string()));
         }
     }
     let listing = if spec.local_mode {
@@ -371,8 +374,8 @@ pub fn validate_spec(spec: &RunSpec) -> Result<usize, String> {
     Ok(entries.iter().filter(|entry| entry.is_wav()).count())
 }
 
-/// Пресет из спеки для записи в `tui.toml`.
-fn settings_of_spec(spec: &RunSpec) -> TuiSettings {
+/// Пресет из спеки для записи в `tui.toml` (язык — текущий, не сбрасывается).
+fn settings_of_spec(spec: &RunSpec, lang: Lang) -> TuiSettings {
     TuiSettings {
         host: spec.host.clone(),
         share: spec.share.clone(),
@@ -381,6 +384,7 @@ fn settings_of_spec(spec: &RunSpec) -> TuiSettings {
         model: persist::model_label(spec.model).to_string(),
         dedup: spec.dedup,
         local_mode: spec.local_mode,
+        lang: lang.label().to_string(),
     }
 }
 
@@ -463,19 +467,20 @@ fn covers(rect: Rect, y: u16) -> bool {
 /// (TestBackend рендерит тот же кадр, что и живой event loop).
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let table = tr(app.lang());
     if is_too_small(area) {
-        draw_too_small(frame, area);
+        draw_too_small(frame, area, table);
         return;
     }
-    widgets::render_screen(frame, area, &screen_view(app));
+    widgets::render_screen(frame, area, &screen_view(app), table);
     if app.state() == State::Config {
         if let Some(popup) = app.popup_view() {
-            popup::render_popup(frame, area, &popup);
+            popup::render_popup(frame, area, &popup, table);
         }
     }
     // Confirm выхода — поверх всего (и попапа невозможен: Running ≠ Config).
     if app.confirm_open() {
-        widgets::render_confirm(frame, area);
+        widgets::render_confirm(frame, area, table);
     }
 }
 
@@ -486,6 +491,7 @@ fn is_too_small(area: Rect) -> bool {
 /// Взгляд на кадр из состояния App: шапка из конфига прогона, активный таб
 /// (Files/Dedup/Log/Help), таблица, журнал, сводка в footer.
 fn screen_view(app: &App) -> ScreenView {
+    let table = tr(app.lang());
     let (dedup_pairs, dedup_unparseable) = app
         .outcome()
         .map(|outcome| (outcome.dedup.pairs.clone(), outcome.dedup.unparseable.clone()))
@@ -497,34 +503,34 @@ fn screen_view(app: &App) -> ScreenView {
     ScreenView {
         header: header_view(app),
         tab: app.active_tab(),
-        files: app.files().iter().map(|view| file_row_view(view, tick)).collect(),
+        files: app.files().iter().map(|view| file_row_view(view, tick, table)).collect(),
         selected: (!app.files().is_empty()).then_some(app.selected_index()),
         // Details-панель — отдельный этап (таб Files, полный режим).
         details: None,
-        footer: FooterView { summary: footer_summary(app) },
+        footer: FooterView { summary: footer_summary(app, table) },
         dedup_pairs,
         dedup_unparseable,
         log: app.log().clone(),
         log_filter_input,
-        banner: cancel_banner(app),
-        current: current_file_view(app),
+        banner: cancel_banner(app, table),
+        current: current_file_view(app, table),
     }
 }
 
 /// Баннер мягкой отмены: живёт, пока движок доигрывает текущий файл.
-fn cancel_banner(app: &App) -> Option<String> {
-    app.cancelling().then(|| "Прерывание… текущий файл доигрывается (форс: Enter ещё раз)".to_string())
+fn cancel_banner(app: &App, table: &StrTable) -> Option<String> {
+    app.cancelling().then(|| table.cancel_banner.to_string())
 }
 
 /// Индикатор текущего файла: первый файл без терминального исхода в Running.
-fn current_file_view(app: &App) -> Option<CurrentFileView> {
+fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
     if app.state() != State::Running {
         return None;
     }
     let view = app.files().iter().find(|file| file.outcome.is_none())?;
     Some(CurrentFileView {
         name: view.name.clone(),
-        stage: stage_label(view.stage).to_string(),
+        stage: stage_label(view.stage, table).to_string(),
         pct: view.pct,
         estimated: view.estimated,
         phase: app.tick_count(),
@@ -556,12 +562,12 @@ fn model_label(model: Model) -> &'static str {
 
 /// Строка таблицы из модели прогона: бейдж и стадия по исходу (терминальные
 /// строки без «мёртвой» стадии), таймер стадии, индeterminate-бар.
-fn file_row_view(view: &FileView, tick: u64) -> FileRowView {
+fn file_row_view(view: &FileView, tick: u64, table: &StrTable) -> FileRowView {
     let terminal = view.outcome.is_some();
     let stage = view
         .outcome
         .as_ref()
-        .map_or_else(|| stage_label(view.stage), stage_label_of_outcome);
+        .map_or_else(|| stage_label(view.stage, table), |outcome| stage_label_of_outcome(outcome, table));
     let stage_elapsed = if terminal {
         None
     } else {
@@ -576,7 +582,7 @@ fn file_row_view(view: &FileView, tick: u64) -> FileRowView {
         stage: stage.to_string(),
         pct: view.pct.unwrap_or(0.0),
         estimated: view.estimated,
-        stems_done: 0,
+        stems_done: view.stems_done,
         stage_elapsed,
         indeterminate,
     }
@@ -594,24 +600,24 @@ fn file_badge(view: &FileView) -> FileBadge {
 }
 
 /// Метка стадии (совпадает с терминологией пайплайна).
-fn stage_label(stage: Stage) -> &'static str {
+fn stage_label(stage: Stage, table: &StrTable) -> &'static str {
     match stage {
-        Stage::Queued => "queued",
-        Stage::Download => "download",
-        Stage::Separate => "separate",
-        Stage::Upload => "upload",
-        Stage::Rename => "rename",
+        Stage::Queued => table.stage_queued,
+        Stage::Download => table.stage_download,
+        Stage::Separate => table.stage_separate,
+        Stage::Upload => table.stage_upload,
+        Stage::Rename => table.stage_rename,
     }
 }
 
 /// Метка стадии по терминальному исходу: строки не «зависают» на последней
 /// стадии (дубль больше не выглядит как «download 0%»).
-fn stage_label_of_outcome(outcome: &FileOutcome) -> &'static str {
+fn stage_label_of_outcome(outcome: &FileOutcome, table: &StrTable) -> &'static str {
     match outcome {
-        FileOutcome::Ok => "готово",
-        FileOutcome::Failed { .. } => "ошибка",
-        FileOutcome::Duplicate { .. } => "дубль",
-        FileOutcome::Skipped { .. } => "скип",
+        FileOutcome::Ok => table.stage_done,
+        FileOutcome::Failed { .. } => table.stage_failed,
+        FileOutcome::Duplicate { .. } => table.stage_duplicate,
+        FileOutcome::Skipped { .. } => table.stage_skipped,
     }
 }
 
@@ -619,13 +625,13 @@ fn stage_label_of_outcome(outcome: &FileOutcome) -> &'static str {
 /// исходов, общий elapsed и ETA (среднее по завершённым × остаток;
 /// до первого завершённого — «--»). После завершения ETA скрыт,
 /// при батчевой ошибке прогона — её текст.
-fn footer_summary(app: &App) -> String {
+fn footer_summary(app: &App, table: &StrTable) -> String {
     if let Some(error) = app.run_error() {
-        return format!("ошибка: {error}");
+        return (table.footer_error)(error);
     }
     // Пустой итог вместо незаметного «файлы 0/0» — явная подсказка.
     if app.outcome().is_some_and(|outcome| outcome.total == 0) {
-        return EMPTY_PLAN_HINT.to_string();
+        return table.empty_plan_hint.to_string();
     }
     let mut counts = [0_usize; 4]; // ok, fail, dup, skip
     for file in app.files() {
@@ -648,8 +654,12 @@ fn footer_summary(app: &App) -> String {
         return String::new();
     }
     let mut summary = format!(
-        "{} · OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}",
-        widgets::files_progress(done, total)
+        "{} · {} {ok} · {} {fail} · {} {dup} · {} {skip}",
+        widgets::files_progress(table, done, total),
+        table.badge_ok,
+        table.badge_fail,
+        table.badge_dup,
+        table.badge_skip,
     );
     match app.outcome() {
         Some(outcome) => {
@@ -667,13 +677,10 @@ fn footer_summary(app: &App) -> String {
 }
 
 /// Заглушка при недостаточном размере (нужно `MIN_WIDTH`×`MIN_HEIGHT`).
-fn draw_too_small(frame: &mut Frame, area: Rect) {
+fn draw_too_small(frame: &mut Frame, area: Rect, table: &StrTable) {
     let message = vec![
-        Line::from("Слишком маленький терминал"),
-        Line::from(format!(
-            "нужно {MIN_WIDTH}×{MIN_HEIGHT}, сейчас {}×{}",
-            area.width, area.height
-        )),
+        Line::from(table.too_small_title),
+        Line::from((table.too_small_size)(MIN_WIDTH, MIN_HEIGHT, area.width, area.height)),
     ];
     let paragraph = Paragraph::new(message)
         .style(Style::new().yellow())
@@ -801,7 +808,7 @@ mod tests {
 
         assert!(text.contains("▶"), "спиннер текущего файла");
         assert!(text.contains("a.wav"));
-        assert!(text.contains("download · "), "тикающий таймер стадии");
+        assert!(text.contains("загрузка · "), "тикающий таймер стадии");
         assert!(text.contains("··"), "download без процента — индeterminate-бар");
     }
 
@@ -866,7 +873,7 @@ mod tests {
         let text = render(100, 30, &App::new());
         assert!(text.contains("audio_split"));
         assert!(text.contains("нет файлов — Esc → настройка"));
-        assert!(text.contains("[s]tart"));
+        assert!(text.contains("[s]тарт"));
     }
 
     #[test]
@@ -891,8 +898,8 @@ mod tests {
 
         let text = render(100, 30, &app);
         assert!(text.contains("Запуск прогона"));
-        assert!(text.contains("Host:"));
-        assert!(text.contains("[1]Files"), "экран за попапом жив");
+        assert!(text.contains("Хост:"));
+        assert!(text.contains("[1]Файлы"), "экран за попапом жив");
     }
 
     #[test]
@@ -900,9 +907,108 @@ mod tests {
         let mut app = App::new();
         app.handle(&AppEvent::RunStarted { plan: plan_fixture() });
         let text = render(100, 30, &app);
-        assert!(text.contains("FILES"));
-        assert!(text.contains("RUN"));
+        assert!(text.contains("ФАЙЛЫ"));
+        assert!(text.contains("ПРЦ"));
         assert!(text.contains("a.wav"));
+    }
+
+    #[test]
+    fn stems_column_is_honest_live_and_dash_before_data() {
+        let mut app = running_app();
+
+        let text = render(100, 30, &app);
+        assert!(text.contains("—"), "счётчик неизвестен — «—», не «0/6»: {text}");
+        assert!(!text.contains("0/6"));
+
+        feed(&mut app, AppEvent::FileStems { name: "a.wav".into(), count: 6 });
+        let text = render(100, 30, &app);
+        assert!(text.contains("6/6"), "живой счётчик по событию драйвера: {text}");
+    }
+
+    #[test]
+    fn key_screens_render_in_both_locales() {
+        let mut app = running_app();
+        feed(&mut app, AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Download });
+
+        // ru (дефолт): шапка-приложение, табы, таблица, футер.
+        let text = render(100, 30, &app);
+        assert!(text.contains("audio_split"), "шапка: {text}");
+        assert!(text.contains("[1]Файлы"), "табы ru: {text}");
+        assert!(text.contains("СТАДИЯ"), "заголовок таблицы ru: {text}");
+        assert!(text.contains("файлы 0/1"), "футер ru: {text}");
+        // Подсказки клавиш — в широком кадре (со сводкой не влезают в 100).
+        let wide = render(160, 30, &app);
+        assert!(wide.contains("[s]тарт"), "подсказки клавиш ru: {wide}");
+        assert!(text.contains("загрузка"), "стадия ru: {text}");
+
+        // Переключение `l` — те же экраны на en, состояние живо.
+        app.handle(&key(crossterm::event::KeyCode::Char('l')));
+        let text = render(100, 30, &app);
+        assert!(text.contains("[1]Files"), "табы en: {text}");
+        assert!(text.contains("STAGE"), "заголовок таблицы en: {text}");
+        assert!(text.contains("files 0/1"), "футер en: {text}");
+        let wide = render(160, 30, &app);
+        assert!(wide.contains("[s]tart"), "подсказки клавиш en: {wide}");
+        assert!(text.contains("download"), "стадия en: {text}");
+        assert_eq!(app.state(), State::Running, "язык не сбрасывает прогон");
+        assert!(!text.contains("ФАЙЛЫ"), "ru-строки ушли: {text}");
+
+        // Попап на en (язык задаётся до открытия — в попапе `l` модален).
+        let mut config = App::new();
+        config.set_lang(Lang::En);
+        config.handle(&enter());
+        config.open_config(persist::load());
+        let text = render(100, 30, &config);
+        assert!(text.contains("Run setup"), "попап en: {text}");
+        assert!(text.contains("Remote dir:"), "подписи полей en: {text}");
+
+        // Тот же попап на ru.
+        let mut config_ru = App::new();
+        config_ru.handle(&enter());
+        config_ru.open_config(persist::load());
+        let text = render(100, 30, &config_ru);
+        assert!(text.contains("Запуск прогона"), "попап ru: {text}");
+        assert!(text.contains("Исходная папка:"), "подписи полей ru: {text}");
+    }
+
+    #[test]
+    fn confirm_dialog_renders_in_both_locales() {
+        // ru: confirm по q/Esc в Running.
+        let mut ru = running_app();
+        ru.handle(&key(crossterm::event::KeyCode::Char('q')));
+        let text = render(100, 30, &ru);
+        assert!(text.contains("Подтверждение"), "заголовок ru: {text}");
+        assert!(text.contains("Прервать прогон и выйти?"), "вопрос ru: {text}");
+        assert!(text.contains("границе файлов"), "мягкая отмена ru: {text}");
+
+        // en: переключение до открытия модала.
+        let mut en = running_app();
+        en.handle(&key(crossterm::event::KeyCode::Char('l')));
+        en.handle(&key(crossterm::event::KeyCode::Char('q')));
+        let text = render(100, 30, &en);
+        assert!(text.contains("Confirm"), "заголовок en: {text}");
+        assert!(text.contains("Interrupt the run and quit?"), "вопрос en: {text}");
+        assert!(text.contains("file boundaries"), "мягкая отмена en: {text}");
+        assert!(!text.contains("Подтверждение"), "ru-строки ушли: {text}");
+    }
+
+    #[test]
+    fn log_messages_render_in_both_locales() {
+        let mut app = App::new();
+        app.set_lang(Lang::En);
+        feed(&mut app, AppEvent::RunStarted { plan: plan_fixture() });
+        feed(&mut app, AppEvent::FileDone { name: "a.wav".into() });
+        feed(&mut app, AppEvent::FileDuplicate { name: "z.wav".into() });
+        feed(&mut app, AppEvent::BatchFinished { outcome: outcome_with_dedup() });
+
+        app.handle(&key(crossterm::event::KeyCode::Char('3')));
+        let text = render(100, 30, &app);
+        assert!(text.contains("run started: 1 files"), "журнал en: {text}");
+        assert!(text.contains("a.wav: done"), "журнал en: {text}");
+        assert!(text.contains("z.wav: duplicate (skipped)"), "журнал en: {text}");
+        assert!(text.contains("run finished"), "сводка en: {text}");
+        assert!(text.contains("louder by 11.1 dB"), "причина дедупа en: {text}");
+        assert!(text.contains("unparseable as WAV: broken.wav"), "примечание en: {text}");
     }
 
     #[test]
@@ -939,7 +1045,7 @@ mod tests {
             local_mode: true,
         };
 
-        let wav_count = validate_spec(&spec).expect("локальная валидация проходит");
+        let wav_count = validate_spec(&spec, Lang::Ru).expect("локальная валидация проходит");
 
         assert_eq!(wav_count, 0, "пустая директория — ноль .wav");
         assert!(spec.local_dir.exists(), "локальная директория создана при проверке");
@@ -964,7 +1070,7 @@ mod tests {
             local_mode: true,
         };
 
-        let wav_count = validate_spec(&spec).expect("листинг проходит");
+        let wav_count = validate_spec(&spec, Lang::Ru).expect("листинг проходит");
 
         assert_eq!(wav_count, 2, "регистр расширения не важен, не-wav не считается");
         let _ = std::fs::remove_dir_all(&base);
@@ -985,7 +1091,7 @@ mod tests {
             local_mode: true,
         };
 
-        let error = validate_spec(&spec).expect_err("нет директории — ошибка");
+        let error = validate_spec(&spec, Lang::Ru).expect_err("нет директории — ошибка");
 
         assert!(error.contains("no such file") || error.contains("No such file"));
         let _ = std::fs::remove_dir_all(&base);
@@ -1003,7 +1109,7 @@ mod tests {
             local_mode: false,
         };
 
-        let error = validate_spec(&spec).expect_err("пустой хост — ошибка до запуска smbclient");
+        let error = validate_spec(&spec, Lang::Ru).expect_err("пустой хост — ошибка до запуска smbclient");
 
         assert!(error.contains("хост"));
     }
@@ -1172,7 +1278,7 @@ mod tests {
             local_mode: true,
         };
 
-        let settings = settings_of_spec(&spec);
+        let settings = settings_of_spec(&spec, Lang::Ru);
 
         assert_eq!(settings.model, "6s");
         assert_eq!(settings.model(), Model::SixS);
@@ -1212,7 +1318,7 @@ mod tests {
 
         let text = render(100, 30, &app);
 
-        assert!(text.contains("DUP"), "заголовок таблицы");
+        assert!(text.contains("ДУБЛ"), "заголовок таблицы");
         assert!(text.contains("unknown 3.wav"), "дубль");
         assert!(text.contains("unknown 2.wav"), "хранитель");
         assert!(text.contains("0.99/1.00/0.99"), "corr по окнам");
@@ -1296,7 +1402,7 @@ mod tests {
         assert!(text.contains("PgUp/PgDn"), "прокрутка журнала");
         assert!(text.contains("зарезервировано"), "m/o помечены");
         // Рамка таблицы Files видна в левом поле попапа — фон жив под оверлеем.
-        assert!(text.contains("FILES"), "фон (таблица Files) жив под оверлеем");
+        assert!(text.contains("ФАЙЛЫ"), "фон (таблица Files) жив под оверлеем");
     }
 
     #[test]
@@ -1314,7 +1420,7 @@ mod tests {
         let messages: Vec<String> = app.log().visible().iter().map(|e| e.message.clone()).collect();
         assert_eq!(messages.len(), 4 + 3, "старт + стадия + done + dup + сводка + пара + unparseable");
         assert!(messages[0].contains("прогон начат: 1 файлов"));
-        assert!(messages[1].contains("a.wav: separate"));
+        assert!(messages[1].contains("a.wav: разделение"));
         assert!(messages[2].contains("a.wav: готово"));
         assert!(messages[3].contains("z.wav: дубль"));
         assert!(messages[4].starts_with("прогон завершён"));

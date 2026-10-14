@@ -28,9 +28,10 @@ use ratatui::Frame;
 
 use crate::config::Model;
 use crate::tui::app::{Focus, ValidationStatus};
+use crate::tui::i18n::StrTable;
 
-/// Ширина колонки подписей (`Remote dir: `).
-const LABEL_WIDTH: usize = 12;
+/// Ширина колонки подписей (`Исходная папка: ` — самая длинная в ru).
+const LABEL_WIDTH: usize = 16;
 /// Размер попапа (обрезается по размеру терминала).
 const POPUP_WIDTH: u16 = 68;
 const POPUP_HEIGHT: u16 = 13;
@@ -85,16 +86,16 @@ pub fn popup_area(area: Rect) -> Rect {
 }
 
 /// Рендер попапа поверх экрана: очистка фона, рамка, поля, статус, курсор.
-pub fn render_popup(frame: &mut Frame, area: Rect, view: &PopupView) {
+pub fn render_popup(frame: &mut Frame, area: Rect, view: &PopupView, tr: &StrTable) {
     let popup = popup_area(area);
     frame.render_widget(Clear, popup);
-    let block = Block::bordered().title(" Запуск прогона ");
+    let block = Block::bordered().title(tr.popup_title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.is_empty() {
         return;
     }
-    let rows = field_rows(inner, view);
+    let rows = field_rows(inner, view, tr);
     for (row, line) in rows.iter().enumerate() {
         let y = inner.y + row as u16;
         if y >= inner.y + inner.height {
@@ -113,7 +114,7 @@ fn strip_y(inner: Rect, y: u16) -> Rect {
 
 /// Строки попапа: поля, пустая строка (или статус SMB/GVFS-paste), статус
 /// валидации, две строки подсказок.
-fn field_rows(inner: Rect, view: &PopupView) -> Vec<Line<'static>> {
+fn field_rows(inner: Rect, view: &PopupView, tr: &StrTable) -> Vec<Line<'static>> {
     let value_width = (inner.width as usize).saturating_sub(LABEL_WIDTH);
     let hint_row = view
         .hint
@@ -121,23 +122,23 @@ fn field_rows(inner: Rect, view: &PopupView) -> Vec<Line<'static>> {
         .map(|text| Line::from(Span::styled(text.clone(), STYLE_INFO)))
         .unwrap_or_default();
     let mut rows = vec![
-        text_row("Host:", &view.host, view.focus == Focus::Host, value_width),
-        text_row("Share:", &view.share, view.focus == Focus::Share, value_width),
-        text_row("Remote dir:", &view.remote_dir, view.focus == Focus::RemoteDir, value_width),
-        text_row("Local dir:", &view.local_dir, view.focus == Focus::LocalDir, value_width),
-        model_row(view),
-        toggle_row("Dedup:", view.dedup, "вкл", "выкл", view.focus == Focus::Dedup),
+        text_row(tr.label_host, &view.host, view.focus == Focus::Host, value_width),
+        text_row(tr.label_share, &view.share, view.focus == Focus::Share, value_width),
+        text_row(tr.label_remote_dir, &view.remote_dir, view.focus == Focus::RemoteDir, value_width),
+        text_row(tr.label_local_dir, &view.local_dir, view.focus == Focus::LocalDir, value_width),
+        model_row(view, tr),
+        toggle_row(tr.label_dedup, view.dedup, tr.toggle_on, tr.toggle_off, view.focus == Focus::Dedup),
         toggle_row(
-            "Local mode:",
+            tr.label_local_mode,
             view.local_mode,
-            "локальная папка",
-            "smb-шара",
+            tr.local_mode_desc,
+            tr.smb_mode_desc,
             view.focus == Focus::LocalMode,
         ),
         hint_row,
-        status_row(&view.validation),
-        Line::from(Span::styled("Tab/Shift-Tab — фокус · Space/←→ — переключить", STYLE_HINT)),
-        Line::from(Span::styled("Enter — проверить и старт · Esc — отмена", STYLE_HINT)),
+        status_row(&view.validation, tr),
+        Line::from(Span::styled(tr.popup_focus_hints.to_string(), STYLE_HINT)),
+        Line::from(Span::styled(tr.popup_action_hints.to_string(), STYLE_HINT)),
     ];
     rows.truncate(inner.height as usize);
     rows
@@ -174,7 +175,7 @@ fn toggle_row(label: &str, on: bool, on_text: &str, off_text: &str, focused: boo
 }
 
 /// Переключатель модели: выбранная — `[sw]`/`[6s]` жёлтым, другая — dim.
-fn model_row(view: &PopupView) -> Line<'static> {
+fn model_row(view: &PopupView, tr: &StrTable) -> Line<'static> {
     let segment = |label: &'static str, active: bool| {
         if active {
             Span::styled(format!("[{label}]"), STYLE_ACTIVE)
@@ -183,7 +184,7 @@ fn model_row(view: &PopupView) -> Line<'static> {
         }
     };
     Line::from(vec![
-        Span::styled(format!("{:<LABEL_WIDTH$}", "Model:"), STYLE_DIM),
+        Span::styled(format!("{:<LABEL_WIDTH$}", tr.label_model), STYLE_DIM),
         Span::raw("  "),
         segment("sw", view.model == Model::Sw),
         Span::raw("  "),
@@ -193,20 +194,18 @@ fn model_row(view: &PopupView) -> Line<'static> {
 
 /// Строка статуса валидации: после успешного листинга — факт (сколько .wav
 /// найдено); ноль — жёлтый варнинг (старт не блокируется, но путь под вопросом).
-fn status_row(validation: &ValidationStatus) -> Line<'static> {
+fn status_row(validation: &ValidationStatus, tr: &StrTable) -> Line<'static> {
     match validation {
         ValidationStatus::Idle => Line::default(),
         ValidationStatus::Checking => {
-            Line::from(Span::styled("проверка директорий…", STYLE_INFO))
+            Line::from(Span::styled(tr.checking_dirs.to_string(), STYLE_INFO))
         }
-        ValidationStatus::Ok { wav_count } if *wav_count > 0 => Line::from(Span::styled(
-            format!("✓ директория доступна · .wav: {wav_count}"),
-            STYLE_OK,
-        )),
-        ValidationStatus::Ok { .. } => Line::from(Span::styled(
-            "✓ директория доступна · .wav: 0 · .wav не найдены — проверь путь",
-            STYLE_WARN,
-        )),
+        ValidationStatus::Ok { wav_count } if *wav_count > 0 => {
+            Line::from(Span::styled((tr.validation_ok)(*wav_count), STYLE_OK))
+        }
+        ValidationStatus::Ok { .. } => {
+            Line::from(Span::styled(tr.validation_ok_zero.to_string(), STYLE_WARN))
+        }
         ValidationStatus::Failed(message) => {
             Line::from(Span::styled(format!("✗ {message}"), Style::new().fg(Color::Red)))
         }
@@ -249,7 +248,13 @@ pub fn is_toggle_key(code: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::i18n::{self, Lang};
     use ratatui::backend::TestBackend;
+
+    /// Дефолтная (русская) таблица строк.
+    fn tr() -> &'static i18n::StrTable {
+        i18n::tr(Lang::Ru)
+    }
     use ratatui::Terminal;
 
     use crate::tui::app::ValidationStatus;
@@ -258,7 +263,7 @@ mod tests {
     /// Рендер попапа в TestBackend: текст буфера + терминал для проверок ячеек.
     fn render_popup_frame(width: u16, height: u16, view: &PopupView) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| render_popup(frame, frame.area(), view)).unwrap();
+        terminal.draw(|frame| render_popup(frame, frame.area(), view, tr())).unwrap();
         terminal
     }
 
@@ -304,10 +309,10 @@ mod tests {
         let terminal = render_popup_frame(100, 30, &view());
         let text = buffer_text(&terminal);
         assert!(text.contains("Запуск прогона"));
-        assert!(text.contains("Host:"));
-        assert!(text.contains("Share:"));
-        assert!(text.contains("Remote dir:"));
-        assert!(text.contains("Local dir:"));
+        assert!(text.contains("Хост:"));
+        assert!(text.contains("Шара:"));
+        assert!(text.contains("Исходная папка:"));
+        assert!(text.contains("Рабочая папка:"));
         assert!(text.contains("nas.local"));
         assert!(text.contains("/recordings"));
         assert!(text.contains("/tmp/work"));
@@ -414,7 +419,7 @@ mod tests {
         let mut terminal = render_popup_frame(100, 30, &view());
         let position = terminal.backend_mut().get_cursor_position().unwrap();
         // inner.x = 17, значение с колонки 17+12, курсор в конце "/recordings" (+11).
-        assert_eq!(position, Position { x: 40, y: 11 });
+        assert_eq!(position, Position { x: 44, y: 11 });
 
         // Фокус на переключателе — курсор не рисуется.
         let mut toggles = view();
@@ -451,14 +456,14 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
             .draw(|frame| {
-                widgets::render_screen(frame, frame.area(), &screen);
-                render_popup(frame, frame.area(), &view());
+                widgets::render_screen(frame, frame.area(), &screen, tr());
+                render_popup(frame, frame.area(), &view(), tr());
             })
             .unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Host:"), "попап поверх экрана");
-        assert!(text.contains("[1]Files"), "экран за пределами попапа жив");
-        assert!(text.contains("[?]help"), "footer виден");
+        assert!(text.contains("Хост:"), "попап поверх экрана");
+        assert!(text.contains("[1]Файлы"), "экран за пределами попапа жив");
+        assert!(text.contains("[?]справка"), "footer виден");
     }
 
     #[test]
