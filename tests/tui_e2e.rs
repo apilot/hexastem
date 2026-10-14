@@ -27,7 +27,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const EXT: &str = "flac";
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
-const SCREEN: ratatui::layout::Rect = ratatui::layout::Rect::new(0, 0, 100, 30);
+/// Ширина с запасом: спарклайн GPU (20 колонок) + VRAM-бар видны в шапке целиком.
+const SCREEN: ratatui::layout::Rect = ratatui::layout::Rect::new(0, 0, 140, 30);
 /// Мок-вывод `nvidia-smi --query-gpu=... --format=csv,noheader,nounits`.
 const NVIDIA_SMI_SAMPLE: &str = "NVIDIA GeForce RTX 4090, 63, 2100, 24564\n";
 
@@ -343,12 +344,14 @@ fn engine_events(local: &Path, names: &[&str]) -> Vec<EngineEvent> {
         file: local.join(names[0]).to_string_lossy().into_owned(),
         stage: "load".to_string(),
         pct: 50.0,
+        estimated: false,
     }];
     for (i, name) in names.iter().enumerate() {
         events.push(EngineEvent::Progress {
             file: local.join(name).to_string_lossy().into_owned(),
             stage: "separate".to_string(),
             pct: 40.0 + i as f64 * 10.0,
+            estimated: false,
         });
         let file = local.join(name).to_string_lossy().into_owned();
         let base = Path::new(name).file_stem().and_then(|n| n.to_str()).unwrap_or(name);

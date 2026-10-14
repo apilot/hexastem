@@ -278,6 +278,9 @@ fn start_run(spec: RunSpec, tx_events: UnboundedSender<AppEvent>, tx_gpu: Unboun
     let tx_engine_log = tx_events.clone();
     let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(
         EngineRunner::new(&venv_path(), &driver_script(), spec.model.checkpoint(), OUTPUT_FORMAT)
+            // Стартовая RTF-оценка модели для estimированного separate-прогресса
+            // драйвера (уточняется им по бою между файлами).
+            .with_rtf_estimate(spec.model.rtf_estimate())
             // Строки stderr драйвера — в общий канал событий: только таб Log,
             // терминал TUI не засоряется (A: STDERR-ЛИК).
             .on_stderr(Box::new(move |line: &str| {
@@ -523,6 +526,7 @@ fn current_file_view(app: &App) -> Option<CurrentFileView> {
         name: view.name.clone(),
         stage: stage_label(view.stage).to_string(),
         pct: view.pct,
+        estimated: view.estimated,
         phase: app.tick_count(),
         stage_elapsed: view.stage_started.map_or(0.0, |started| started.elapsed().as_secs_f64()),
     })
@@ -571,6 +575,7 @@ fn file_row_view(view: &FileView, tick: u64) -> FileRowView {
         name: view.name.clone(),
         stage: stage.to_string(),
         pct: view.pct.unwrap_or(0.0),
+        estimated: view.estimated,
         stems_done: 0,
         stage_elapsed,
         indeterminate,
@@ -642,7 +647,10 @@ fn footer_summary(app: &App) -> String {
     if total == 0 && app.outcome().is_none() {
         return String::new();
     }
-    let mut summary = format!("файлы {done}/{total} · OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}");
+    let mut summary = format!(
+        "{} · OK {ok} · FAIL {fail} · DUP {dup} · SKIP {skip}",
+        widgets::files_progress(done, total)
+    );
     match app.outcome() {
         Some(outcome) => {
             // Завершённый прогон: авторитетная длительность, ETA не нужен.

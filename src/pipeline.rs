@@ -65,6 +65,10 @@ pub enum EngineEvent {
         stage: String,
         /// Процент 0..100.
         pct: f64,
+        /// `true` — оценка по времени (драйвер не знает реальный прогресс
+        /// separate); `false` (или отсутствие поля) — точное значение.
+        #[serde(rename = "est", default)]
+        estimated: bool,
     },
     /// Файл разделён: локальные пути стемов.
     FileDone {
@@ -185,6 +189,8 @@ pub struct EngineRunner {
     /// Слот текущего процесса драйвера: форс-kill забирает `Child` из слота,
     /// ожидание это видит и завершается ошибкой «движок убит».
     current: Arc<Mutex<Option<Child>>>,
+    /// Стартовая оценка RTF для драйвера (`--rtf-estimate`); `None` — не передавать.
+    rtf_estimate: Option<f64>,
 }
 
 impl std::fmt::Debug for EngineRunner {
@@ -217,7 +223,14 @@ impl EngineRunner {
             output_format: output_format.to_string(),
             on_stderr: Arc::new(|line| eprintln!("{line}")),
             current: Arc::new(Mutex::new(None)),
+            rtf_estimate: None,
         }
+    }
+
+    /// Builder: стартовая оценка RTF драйвера (уточняется им по бою).
+    pub fn with_rtf_estimate(mut self, rtf_estimate: f64) -> Self {
+        self.rtf_estimate = Some(rtf_estimate);
+        self
     }
 
     /// Builder: подменяет приёмник `[engine]`-строк (CLI оставляет дефолт —
@@ -241,7 +254,9 @@ impl EngineRunner {
     /// `[engine]`-строки события (формат прежнего CLI-вывода).
     fn stderr_line(event: &EngineEvent) -> Option<String> {
         match event {
-            EngineEvent::Progress { file, stage, pct } => Some(format!("[engine] {file}: {stage} {pct:.1}%")),
+            EngineEvent::Progress { file, stage, pct, .. } => {
+                Some(format!("[engine] {file}: {stage} {pct:.1}%"))
+            }
             EngineEvent::BatchDone { ok, failed } => Some(format!("[engine] batch done: ok={ok} failed={failed}")),
             EngineEvent::FileDone { .. } | EngineEvent::FileError { .. } => None,
         }
@@ -258,8 +273,11 @@ impl EngineRunner {
             .arg("--output-format")
             .arg(&self.output_format)
             .arg("--files")
-            .args(files)
-            .stdout(Stdio::piped())
+            .args(files);
+        if let Some(rtf) = self.rtf_estimate {
+            cmd.arg("--rtf-estimate").arg(rtf.to_string());
+        }
+        cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
     }
@@ -1297,7 +1315,30 @@ mod tests {
         let cases = [
             (
                 r#"{"event":"progress","file":"a.wav","stage":"separate","pct":42.5}"#,
-                EngineEvent::Progress { file: "a.wav".to_string(), stage: "separate".to_string(), pct: 42.5 },
+                EngineEvent::Progress {
+                    file: "a.wav".to_string(),
+                    stage: "separate".to_string(),
+                    pct: 42.5,
+                    estimated: false,
+                },
+            ),
+            (
+                r#"{"event":"progress","file":"a.wav","stage":"separate","pct":42.5,"est":false}"#,
+                EngineEvent::Progress {
+                    file: "a.wav".to_string(),
+                    stage: "separate".to_string(),
+                    pct: 42.5,
+                    estimated: false,
+                },
+            ),
+            (
+                r#"{"event":"progress","file":"a.wav","stage":"separate","pct":33.3,"est":true}"#,
+                EngineEvent::Progress {
+                    file: "a.wav".to_string(),
+                    stage: "separate".to_string(),
+                    pct: 33.3,
+                    estimated: true,
+                },
             ),
             (
                 r#"{"event":"file_done","file":"/tmp/a.wav","stems":["/tmp/a/vocals.flac"],"seconds":1.25}"#,
@@ -1353,6 +1394,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn engine_runner_appends_rtf_estimate_flag_when_set() {
+        let runner = EngineRunner::new(Path::new("/venv"), Path::new("/app/driver.py"), "m", "flac")
+            .with_rtf_estimate(0.45);
+        let cmd = runner.build_command(&[PathBuf::from("/tmp/a.wav")], Path::new("/tmp/work"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let idx = args.iter().position(|a| a == "--rtf-estimate").expect("flag present");
+        assert_eq!(args[idx + 1], "0.45");
+
+        let plain = EngineRunner::new(Path::new("/venv"), Path::new("/app/driver.py"), "m", "flac");
+        let cmd = plain.build_command(&[PathBuf::from("/tmp/a.wav")], Path::new("/tmp/work"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(!args.contains(&"--rtf-estimate".to_string()), "no flag by default");
+    }
+
     /// Fake-venv: `bin/python` — shell-скрипт, изображающий драйвер.
     fn fake_venv(venv: &Path, body: &str) {
         let bin = venv.join("bin");
@@ -1397,7 +1453,12 @@ mod tests {
         assert_eq!(
             forwarded,
             [
-                EngineEvent::Progress { file: "a.wav".to_string(), stage: "separate".to_string(), pct: 42.5 },
+                EngineEvent::Progress {
+                    file: "a.wav".to_string(),
+                    stage: "separate".to_string(),
+                    pct: 42.5,
+                    estimated: false,
+                },
                 EngineEvent::BatchDone { ok: 1, failed: 0 },
             ],
             "события протокола форвардятся без изменений"

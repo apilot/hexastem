@@ -6,6 +6,7 @@
 //! (cancel/pause/retry) фиксируются флагами — event loop снимает их и
 //! передаёт раннеру (см. `runner::RunnerHandle`).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,9 @@ use crate::tui::widgets::{GpuView, Tab, TABS};
 
 /// Статус-строка попапа после распознавания SMB/GVFS-пути из paste.
 const SMB_HINT_STATUS: &str = "Распознан SMB/GVFS путь — host/share/папка заполнены";
+
+/// Глубина истории утилизации GPU для спарклайна шапки (btop-стиль).
+const GPU_HISTORY_CAP: usize = 40;
 
 /// Статус валидации полей попапа запуска.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +90,11 @@ pub struct FileView {
     pub name: String,
     /// Текущая стадия.
     pub stage: Stage,
-    /// Процент separate (только на стадии Separate).
+    /// Процент отдельной стадии (Separate/Download); `estimated` — оценка.
     pub pct: Option<f64>,
+    /// `true` — pct оценочный (драйвер не знает реальный прогресс separate),
+    /// UI помечает такой процент тильдой «~NN%».
+    pub estimated: bool,
     /// Полная огибающая пиков (после download; ровно 1 раз на файл).
     pub peaks: Option<Arc<[f32]>>,
     /// Терминальный исход (Ok/Failed/Duplicate/Skipped).
@@ -444,6 +451,8 @@ pub struct App {
     pending_start: Option<RunSpec>,
     /// Снимок GPU-поллера для шапки.
     gpu: Option<GpuView>,
+    /// История утилизации GPU (%) для спарклайна в шапке (btop-стиль).
+    gpu_history: VecDeque<u8>,
     /// Активный таб нижней навигации.
     active_tab: Tab,
     /// Таб, из которого открыли Help (для возврата повторным `?`).
@@ -661,15 +670,19 @@ impl App {
                 // Вне separate процент не определён (приближение не храним).
                 if *stage != Stage::Separate {
                     file.pct = None;
+                    file.estimated = false;
                 }
             }),
-            AppEvent::FileProgress { name, pct } => self.update_file(name, |file| {
-                if file.stage != Stage::Separate {
-                    file.stage = Stage::Separate;
-                    file.stage_started = Some(Instant::now());
-                }
-                file.pct = Some(*pct);
-            }),
+            AppEvent::FileProgress { name, stage, pct, estimated } => {
+                self.update_file(name, |file| {
+                    if file.stage != *stage {
+                        file.stage = *stage;
+                        file.stage_started = Some(Instant::now());
+                    }
+                    file.pct = Some(*pct);
+                    file.estimated = *estimated;
+                });
+            }
             // Загрузка модели глобальна: по завершении (100%) индикатор гаснет.
             AppEvent::ModelProgress { pct } => {
                 self.model_pct = if *pct >= 100.0 { None } else { Some(*pct) };
@@ -1110,9 +1123,16 @@ impl App {
     }
 
     /// Снимок GPU-поллера: `None` — GPU недоступна («GPU: n/a» в шапке).
+    /// Утилизация копится в историю для спарклайна (cap [`GPU_HISTORY_CAP`]).
     fn on_gpu(&mut self, event: GpuEvent) {
         let GpuEvent::Info(info) = event;
-        self.gpu = info.as_ref().map(gpu_view);
+        if let Some(util) = info.as_ref().and_then(|i| i.util_percent) {
+            self.gpu_history.push_back(util);
+            while self.gpu_history.len() > GPU_HISTORY_CAP {
+                self.gpu_history.pop_front();
+            }
+        }
+        self.gpu = info.as_ref().map(|i| gpu_view(i, &self.gpu_history));
     }
 
     /// Итог валидации: факт (число .wav) показывается в попапе, старт —
@@ -1147,13 +1167,14 @@ fn sanitize_paste(text: &str) -> String {
     text.chars().filter(|c| *c != '\n' && *c != '\r').collect()
 }
 
-/// Снимок nvidia-smi → view шапки (MiB → GiB, `[N/A]`-утилизация → 0).
-fn gpu_view(info: &GpuInfo) -> GpuView {
+/// Снимок nvidia-smi → view шапки (MiB → GiB; утилизация — `None` если n/a).
+fn gpu_view(info: &GpuInfo, history: &VecDeque<u8>) -> GpuView {
     GpuView {
         name: info.name.clone(),
         used_gib: info.mem_used_mib as f32 / 1024.0,
         total_gib: info.mem_total_mib as f32 / 1024.0,
-        util_pct: info.util_percent.map_or(0.0, f64::from),
+        util_pct: info.util_percent.map(f64::from),
+        util_history: history.iter().copied().collect(),
     }
 }
 
@@ -1368,7 +1389,12 @@ mod tests {
         app.handle(&AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Download });
         assert_eq!(app.files()[0].stage, Stage::Download);
 
-        app.handle(&AppEvent::FileProgress { name: "a.wav".into(), pct: 40.0 });
+        app.handle(&AppEvent::FileProgress {
+            name: "a.wav".into(),
+            stage: Stage::Separate,
+            pct: 40.0,
+            estimated: false,
+        });
         assert_eq!(app.files()[0].stage, Stage::Separate);
         assert_eq!(app.files()[0].pct, Some(40.0));
 
@@ -1389,11 +1415,63 @@ mod tests {
     }
 
     #[test]
+    fn download_progress_sets_stage_and_real_flag() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::FileProgress {
+            name: "a.wav".into(),
+            stage: Stage::Download,
+            pct: 35.0,
+            estimated: false,
+        });
+        assert_eq!(app.files()[0].stage, Stage::Download);
+        assert_eq!(app.files()[0].pct, Some(35.0));
+        assert!(!app.files()[0].estimated, "поллер шлёт фактический процент");
+
+        app.handle(&AppEvent::FileProgress {
+            name: "a.wav".into(),
+            stage: Stage::Separate,
+            pct: 42.0,
+            estimated: true,
+        });
+        assert_eq!(app.files()[0].stage, Stage::Separate);
+        assert!(app.files()[0].estimated, "est-прогресс помечается оценочным");
+
+        app.handle(&AppEvent::FileStage { name: "a.wav".into(), stage: Stage::Upload });
+        assert!(!app.files()[0].estimated, "смена стадии сбрасывает оценочность");
+    }
+
+    #[test]
+    fn gpu_utilization_history_is_capped() {
+        let mut app = App::new();
+        for pct in 0..60u8 {
+            app.handle(&AppEvent::Gpu(GpuEvent::Info(Some(GpuInfo {
+                name: "RTX".into(),
+                util_percent: Some(pct),
+                mem_used_mib: 1024,
+                mem_total_mib: 8192,
+            }))));
+        }
+
+        let gpu = app.gpu().expect("gpu snapshot present");
+        assert_eq!(gpu.util_history.len(), 40, "история ограничена cap'ом");
+        assert_eq!(gpu.util_history.first(), Some(&20), "старые значения вытеснены");
+        assert_eq!(gpu.util_history.last(), Some(&59));
+        assert_eq!(gpu.util_pct, Some(59.0));
+    }
+
+    #[test]
     fn unknown_files_in_events_are_ignored() {
         let mut app = App::new();
         start_run(&mut app);
 
-        app.handle(&AppEvent::FileProgress { name: "ghost.wav".into(), pct: 50.0 });
+        app.handle(&AppEvent::FileProgress {
+            name: "ghost.wav".into(),
+            stage: Stage::Separate,
+            pct: 50.0,
+            estimated: false,
+        });
         app.handle(&AppEvent::FileDone { name: "ghost.wav".into() });
 
         assert!(app.files().iter().all(|f| f.name != "ghost.wav"));
@@ -1407,7 +1485,12 @@ mod tests {
         let mut app = App::new();
         start_run(&mut app);
 
-        app.handle(&AppEvent::FileProgress { name: "a.wav".into(), pct: 80.0 });
+        app.handle(&AppEvent::FileProgress {
+            name: "a.wav".into(),
+            stage: Stage::Separate,
+            pct: 80.0,
+            estimated: false,
+        });
         app.handle(&AppEvent::FileDone { name: "a.wav".into() });
 
         assert_eq!(app.files()[0].outcome, Some(FileOutcome::Ok));

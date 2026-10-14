@@ -6,7 +6,10 @@ for every file (load_model() caches model_instance internally). All driver
 protocol output goes to stdout as one JSON object per line; library chatter
 goes to stderr:
 
-  {"event": "progress", "file": "...", "stage": "load|separate", "pct": 0..100}
+  {"event": "progress", "file": "...", "stage": "load|separate", "pct": 0..100,
+   "est": true|false}
+  # est=true — оценка по времени (audio-separator не отдаёт прогресс separate);
+  # est=false — точное значение (старт 0%, финал 100%).
   {"event": "file_done", "file": "...", "stems": ["...", ...], "seconds": 12.3}
   {"event": "file_error", "file": "...", "error": "..."}
   {"event": "batch_done", "ok": N, "failed": M}
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +41,11 @@ DEFAULT_OUTPUT_FORMAT = "FLAC"
 # audio_split/.models — persistent model cache (git-ignored)
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / ".models"
 ATTEMPTS_PER_FILE = 2  # 1 try + 1 retry
+# audio-separator не отдаёт прогресс separate: пока работает worker-поток,
+# главный цикл раз в EST_TICK_SEC шлёт оценку прогресса (progress "est": true).
+EST_TICK_SEC = 1.0
+EST_CAP_PCT = 95.0  # оценка не заявляет завершение — финальные 100% только реальные
+DEFAULT_RTF_ESTIMATE = 0.5  # стартовая оценка RTF (elapsed/duration), уточняется по бою
 # Stems of BS-Roformer-SW / htdemucs_6s; used as clean custom output names.
 EXPECTED_STEMS = ("vocals", "drums", "bass", "guitar", "piano", "other")
 
@@ -51,13 +60,20 @@ class DriverConfig:
     output_dir: Path
     output_format: str
     files: tuple[Path, ...]
+    rtf_estimate: float = DEFAULT_RTF_ESTIMATE
 
 
 # --- protocol: pure event builders -------------------------------------------
 
 
-def progress_event(file: str, stage: str, pct: float) -> dict:
-    return {"event": "progress", "file": file, "stage": stage, "pct": round(pct, 1)}
+def progress_event(file: str, stage: str, pct: float, est: bool = False) -> dict:
+    return {
+        "event": "progress",
+        "file": file,
+        "stage": stage,
+        "pct": round(pct, 1),
+        "est": est,
+    }
 
 
 def file_done_event(file: str, stems: list[str], seconds: float) -> dict:
@@ -145,22 +161,98 @@ def separate_one(separator: Any, audio_path: Path, out_dir: Path) -> list[str]:
     return resolve_stem_paths(out_dir, names)
 
 
+def duration_secs(path: Path) -> float | None:
+    """Audio duration from the file header only (soundfile.info, no decoding)."""
+    try:
+        import soundfile  # lazy: keeps unit tests dependency-free
+
+        info = soundfile.info(str(path))
+    except Exception:  # noqa: BLE001 — unknown/corrupt format → no estimate, just 0%
+        return None
+    if info.samplerate <= 0:
+        return None
+    return info.frames / info.samplerate
+
+
+def estimated_pct(elapsed_sec: float, duration_sec: float, rtf: float) -> float:
+    """Time-based progress estimate; capped below 100 until the real finish."""
+    if duration_sec <= 0 or rtf <= 0:
+        return 0.0
+    return min(EST_CAP_PCT, elapsed_sec / (duration_sec * rtf) * 100.0)
+
+
+class RtfTracker:
+    """Self-learning RTF: starts from the CLI estimate, learns from finished files."""
+
+    def __init__(self, initial: float = DEFAULT_RTF_ESTIMATE):
+        self.rtf = initial if initial > 0 else DEFAULT_RTF_ESTIMATE
+
+    def learn(self, elapsed_sec: float, duration_sec: float | None) -> None:
+        """Feed a measured RTF back (ignored when inputs are unusable)."""
+        if duration_sec is not None and duration_sec > 0 and elapsed_sec > 0:
+            self.rtf = elapsed_sec / duration_sec
+
+
+def separate_with_progress(
+    separator: Any,
+    audio_path: Path,
+    out_dir: Path,
+    emit_fn: Emitter,
+    rtf: float,
+    duration: float | None,
+    tick: float = EST_TICK_SEC,
+) -> tuple[list[str], float]:
+    """Run separate() in a worker thread, ticking time-based progress meanwhile.
+
+    Returns (stem_paths, elapsed_seconds); raises the worker's exception on the
+    caller side so process_file's retry logic sees it as before.
+    """
+    started = time.perf_counter()
+    result: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            result["stems"] = separate_one(separator, audio_path, out_dir)
+        except Exception as error:  # noqa: BLE001 — re-raised on the caller side
+            result["error"] = error
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(tick)
+        if thread.is_alive() and duration is not None:
+            elapsed = time.perf_counter() - started
+            emit_fn(progress_event(
+                str(audio_path), "separate", estimated_pct(elapsed, duration, rtf), est=True,
+            ))
+    if "error" in result:
+        raise result["error"]
+    if "stems" not in result:
+        raise RuntimeError("separation thread finished without result")
+    return result["stems"], time.perf_counter() - started
+
+
 def process_file(
     separator: Any,
     audio_path: Path,
     output_dir: Path,
     emit_fn: Emitter,
+    tracker: RtfTracker,
     attempts: int = ATTEMPTS_PER_FILE,
+    tick: float = EST_TICK_SEC,
 ) -> bool:
     """One file, retried in place; any failure is reported, never raised."""
     out_dir = output_dir / audio_path.stem
+    duration = duration_secs(audio_path)
     last_error = "unknown error"
     for attempt in range(1, attempts + 1):
         emit_fn(progress_event(str(audio_path), "separate", 0))
-        started = time.perf_counter()
         try:
-            stems = separate_one(separator, audio_path, out_dir)
-            emit_fn(file_done_event(str(audio_path), stems, time.perf_counter() - started))
+            stems, seconds = separate_with_progress(
+                separator, audio_path, out_dir, emit_fn, tracker.rtf, duration, tick,
+            )
+            tracker.learn(seconds, duration)
+            emit_fn(file_done_event(str(audio_path), stems, seconds))
             return True
         except Exception as error:  # noqa: BLE001 — one bad file must not stop the batch
             last_error = f"{type(error).__name__}: {error}"
@@ -186,8 +278,9 @@ def run_batch(
             emit_fn(file_error_event(str(path), message))
         return 0, len(config.files)
     emit_fn(progress_event(first, "load", 100))
+    tracker = RtfTracker(config.rtf_estimate)
     results = [
-        process_file(separator, path, config.output_dir, emit_fn)
+        process_file(separator, path, config.output_dir, emit_fn, tracker)
         for path in config.files
     ]
     ok = sum(results)
@@ -212,6 +305,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="model cache dir (default: audio_split/.models)")
     parser.add_argument("--output-format", default=DEFAULT_OUTPUT_FORMAT,
                         help="stem format: FLAC | WAV | MP3 (default: FLAC)")
+    parser.add_argument("--rtf-estimate", type=float, default=DEFAULT_RTF_ESTIMATE,
+                        help="initial real-time-factor guess for estimated separate "
+                             "progress; refined after each finished file "
+                             f"(default: {DEFAULT_RTF_ESTIMATE})")
     return parser.parse_args(argv)
 
 
@@ -223,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         output_format=args.output_format.upper(),
         files=tuple(args.files),
+        rtf_estimate=args.rtf_estimate,
     )
     log_environment()
     _log(

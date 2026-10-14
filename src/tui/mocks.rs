@@ -44,7 +44,9 @@ impl MockSmb {
     pub(crate) fn with_dir(mut self, dir: &str, names: &[&str]) -> Self {
         self.dirs.insert(
             PathBuf::from(dir),
-            names.iter().map(|n| SmbEntry { name: n.to_string(), is_dir: false, size: 1 }).collect(),
+            // size: 0 — download-поллер размера не знает (size > 0 не опрашивает):
+            // прогонные тесты остаются детерминированными без download-событий.
+            names.iter().map(|n| SmbEntry { name: n.to_string(), is_dir: false, size: 0 }).collect(),
         );
         self
     }
@@ -279,5 +281,6 @@ pub(crate) fn progress_event(local_dir: &Path, name: &str, pct: f64) -> EngineEv
         file: local_dir.join(name).to_string_lossy().into_owned(),
         stage: "separate".to_string(),
         pct,
+        estimated: false,
     }
 }

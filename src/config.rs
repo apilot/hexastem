@@ -24,6 +24,15 @@ impl Model {
             Model::SixS => "htdemucs_6s.yaml",
         }
     }
+
+    /// Стартовая оценка RTF (время обработки / длительность) для
+    /// оценочного separate-прогресса драйвера; уточняется по бою.
+    pub fn rtf_estimate(self) -> f64 {
+        match self {
+            Model::Sw => 0.45,
+            Model::SixS => 0.15,
+        }
+    }
 }
 
 /// Настройки одного прогона пайплайна.
@@ -109,6 +118,12 @@ mod tests {
 
         assert_eq!(cfg.model, Model::SixS);
         assert_eq!(cfg.model.checkpoint(), "htdemucs_6s.yaml");
+    }
+
+    #[test]
+    fn rtf_estimate_matches_model_speed() {
+        assert_eq!(Model::Sw.rtf_estimate(), 0.45);
+        assert_eq!(Model::SixS.rtf_estimate(), 0.15);
     }
 
     #[test]

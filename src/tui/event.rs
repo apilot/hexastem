@@ -145,8 +145,9 @@ pub enum AppEvent {
     RunFailed { error: String },
     /// Смена стадии обработки файла.
     FileStage { name: String, stage: Stage },
-    /// Прогресс разделения файла (pct 0..100, из `EngineEvent::Progress`).
-    FileProgress { name: String, pct: f64 },
+    /// Прогресс по файлу (pct 0..100): стадия `Separate` из `EngineEvent::Progress`,
+    /// `Download` — от поллера размеров (фактический локальный объём).
+    FileProgress { name: String, stage: Stage, pct: f64, estimated: bool },
     /// Прогресс загрузки модели (глобальный, стадия `load` драйвера).
     ModelProgress { pct: f64 },
     /// Файл полностью готов: стемы залиты, исходник переименован.

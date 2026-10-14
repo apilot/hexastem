@@ -12,6 +12,8 @@ import io
 import json
 import sys
 import tempfile
+import time
+import wave
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -23,14 +25,17 @@ import separator_driver as sd  # noqa: E402
 class FakeSeparator:
     """Stands in for audio_separator.separator.Separator; behavior keyed by input path."""
 
-    def __init__(self, behavior: dict[str, object]):
+    def __init__(self, behavior: dict[str, object], delay: float = 0.0):
         self._behavior = behavior
+        self._delay = delay
         self.calls: list[str] = []
         self.output_dir: str | None = None
         self.model_instance = None
 
     def separate(self, audio_path: str, custom_output_names=None) -> list[str]:
         self.calls.append(audio_path)
+        if self._delay:
+            time.sleep(self._delay)  # simulates GPU work for estimate ticks
         result = self._behavior[audio_path]
         if isinstance(result, Exception):
             raise result
@@ -78,13 +83,28 @@ def make_config(tmp: Path, names: list[str], **overrides) -> sd.DriverConfig:
         "output_dir": tmp / "out",
         "output_format": "FLAC",
         "files": tuple(files),
+        "rtf_estimate": sd.DEFAULT_RTF_ESTIMATE,
     }
     return sd.DriverConfig(**{**defaults, **overrides})
 
 
+def make_wav(path: Path, seconds: float, rate: int = 8000) -> Path:
+    """Synthetic mono 16-bit wav (silence) with an exact frames/rate duration."""
+    frames = int(rate * seconds)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(b"\x00\x00" * frames)
+    return path
+
+
 def test_event_builders_shapes():
     progress = sd.progress_event("/a.wav", "separate", 33.333)
-    assert progress == {"event": "progress", "file": "/a.wav", "stage": "separate", "pct": 33.3}
+    assert progress == {"event": "progress", "file": "/a.wav", "stage": "separate",
+                        "pct": 33.3, "est": False}
+    estimated = sd.progress_event("/a.wav", "separate", 50.0, est=True)
+    assert estimated["est"] is True
     done = sd.file_done_event("/a.wav", ["/out/vocals.flac"], 1.234)
     assert done == {"event": "file_done", "file": "/a.wav", "stems": ["/out/vocals.flac"], "seconds": 1.23}
     error = sd.file_error_event("/a.wav", "boom")
@@ -171,6 +191,7 @@ def test_cli_defaults():
     assert args.model_file == "BS-Roformer-SW.ckpt"
     assert args.output_format.upper() == "FLAC"
     assert args.model_file_dir == sd.DEFAULT_MODEL_DIR
+    assert args.rtf_estimate == sd.DEFAULT_RTF_ESTIMATE
     assert [str(f) for f in args.files] == ["/x/a.wav"]
 
 
@@ -181,10 +202,72 @@ def test_cli_explicit_options():
         "--output-dir", "/tmp/out",
         "--model-file-dir", "/tmp/models",
         "--output-format", "flac",
+        "--rtf-estimate", "0.2",
     ])
     assert args.model_file == "htdemucs_6s.yaml"
     assert args.model_file_dir == Path("/tmp/models")
+    assert args.rtf_estimate == 0.2
     assert len(args.files) == 2
+
+
+def test_duration_secs_reads_header():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        wav = make_wav(tmp / "two_sec.wav", 2.0, rate=4000)
+        duration = sd.duration_secs(wav)
+        assert duration is not None and abs(duration - 2.0) < 1e-6
+        text = tmp / "fake.wav"
+        text.write_text("not audio at all")
+        assert sd.duration_secs(text) is None
+
+
+def test_estimated_pct_caps_and_guards():
+    assert sd.estimated_pct(1.0, 10.0, 0.5) == 20.0
+    assert sd.estimated_pct(1000.0, 10.0, 0.5) == sd.EST_CAP_PCT
+    assert sd.estimated_pct(1.0, 0.0, 0.5) == 0.0  # no duration → no estimate
+    assert sd.estimated_pct(1.0, 10.0, 0.0) == 0.0  # no rtf → no estimate
+
+
+def test_est_ticks_monotonic_with_real_finish():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        wav = make_wav(tmp / "slow.wav", 2.0)  # 2s duration, rtf 0.5 → full 1.0s
+        fake = FakeSeparator({str(wav): "ok"}, delay=0.35)
+        events: list[dict] = []
+        assert sd.process_file(fake, wav, tmp / "out", events.append, sd.RtfTracker(), tick=0.05)
+        est = [e for e in events if e["event"] == "progress" and e["est"]]
+        assert est, "expected time-based estimate ticks while separate() runs"
+        pcts = [e["pct"] for e in est]
+        assert all(e["est"] for e in est)
+        assert all(a <= b for a, b in zip(pcts, pcts[1:])), f"not monotonic: {pcts}"
+        assert all(p < 100 for p in pcts)
+        done = [e for e in events if e["event"] == "file_done"]
+        assert len(done) == 1 and done[0]["seconds"] >= 0.3
+
+
+def test_actual_rtf_learns_for_next_file():
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        wav1 = make_wav(tmp / "first.wav", 2.0)
+        wav2 = make_wav(tmp / "second.wav", 2.0)
+        behavior = {str(wav1): "ok", str(wav2): "ok"}
+        fake = FakeSeparator(behavior, delay=0.3)  # actual rtf = 0.3/2 = 0.15
+        tracker = sd.RtfTracker(initial=1000.0)  # absurd default → ~0% for the 1st file
+        out = tmp / "out"
+
+        first: list[dict] = []
+        assert sd.process_file(fake, wav1, out, first.append, tracker, tick=0.05)
+        assert tracker.rtf < 1.0, f"tracker did not learn: {tracker.rtf}"
+
+        second: list[dict] = []
+        assert sd.process_file(fake, wav2, out, second.append, tracker, tick=0.05)
+
+        def max_est(events: list[dict]) -> float:
+            return max((e["pct"] for e in events if e.get("est")), default=0.0)
+
+        assert max_est(second) > max_est(first) + 5.0, (
+            f"learned rtf must raise estimates: first={max_est(first)} second={max_est(second)}"
+        )
 
 
 def run_all() -> int:

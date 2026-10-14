@@ -29,6 +29,10 @@ const BAR_FILLED: char = '█';
 const BAR_EMPTY: char = '░';
 const PROGRESS_BAR_WIDTH: usize = 12;
 const GPU_BAR_WIDTH: usize = 6;
+/// Колонок спарклайна утилизации GPU в шапке (btop-стиль).
+const GPU_SPARK_WIDTH: usize = 20;
+/// Колонок мини-бара глобального прогресса в футере.
+const FILES_BAR_WIDTH: usize = 6;
 /// Ниже этой ширины DETAILS-колонка скрывается (compact-режим).
 const FULL_LAYOUT_MIN_WIDTH: u16 = 100;
 /// Ширина DETAILS-колонки: подпись waveform (40 символов) + рамка + запас.
@@ -114,8 +118,10 @@ pub struct GpuView {
     pub used_gib: f32,
     /// Всего VRAM, GiB.
     pub total_gib: f32,
-    /// Утилизация, %.
-    pub util_pct: f64,
+    /// Утилизация, % (`None` — nvidia-smi не даёт: показываем «n/a»).
+    pub util_pct: Option<f64>,
+    /// История утилизации (%) для спарклайна (btop-стиль).
+    pub util_history: Vec<u8>,
 }
 
 /// Строка таблицы файлов (UI-модель; источник — маппинг EngineEvent, seq 03).
@@ -127,8 +133,10 @@ pub struct FileRowView {
     pub name: String,
     /// Текущая стадия (`scan`/`download`/`separate`/…).
     pub stage: String,
-    /// Прогресс separate, 0..=100.
+    /// Прогресс отдельной стадии, 0..=100.
     pub pct: f64,
+    /// `true` — pct оценочный (драйвер): UI помечает тильдой «~NN%».
+    pub estimated: bool,
     /// Готовых стемов (из [`EXPECTED_STEM_COUNT`]).
     pub stems_done: u8,
     /// Секунд с входа в текущую стадию (`None` — таймер не идёт).
@@ -205,8 +213,10 @@ pub struct CurrentFileView {
     pub name: String,
     /// Стадия.
     pub stage: String,
-    /// Процент separate (`None` — стадия без процента: индeterminate-бар).
+    /// Процент стадии (`None` — стадия без процента: индeterminate-бар).
     pub pct: Option<f64>,
+    /// `true` — pct оценочный: метка «~NN%» вместо «NN%».
+    pub estimated: bool,
     /// Фаза анимации (тики): спиннер + бегущий бар.
     pub phase: u64,
     /// Секунд в текущей стадии.
@@ -325,6 +335,36 @@ pub fn progress_bar_parts(pct: f64, width: usize) -> (String, String) {
 fn fill_columns(pct: f64, width: usize) -> usize {
     let clamped = pct.clamp(0.0, 100.0);
     ((clamped / 100.0) * width as f64).floor() as usize
+}
+
+/// Уровень спарклайна: значение 0..=100 → индекс блока `▁..█`.
+fn spark_level(value: u8) -> usize {
+    let scaled = f64::from(value.min(100)) / 100.0 * (WAVE_BLOCKS.len() - 1) as f64;
+    scaled.round() as usize
+}
+
+/// Спарклайн истории (btop-стиль): последние `width` значений, каждый — блок
+/// `▁▂▃▄▅▆▇█` по величине; недостающие колонки слева — пробелы.
+pub fn sparkline(history: &[u8], width: usize) -> String {
+    let skip = history.len().saturating_sub(width);
+    let bars: String = history[skip..].iter().map(|v| WAVE_BLOCKS[spark_level(*v)]).collect();
+    format!("{}{bars}", " ".repeat(width - (history.len() - skip)))
+}
+
+/// Глобальная полоса футера по завершённым/всего: «файлы 1/3 ██░░░░ 33%».
+/// Заполнение округляется (не floor): 1/3 даёт 2 из 6 колонок, как в btop.
+pub fn files_progress(done: usize, total: usize) -> String {
+    if total == 0 {
+        return "файлы 0/0".to_string();
+    }
+    let pct = done as f64 / total as f64 * 100.0;
+    let filled = (pct / 100.0 * FILES_BAR_WIDTH as f64).round() as usize;
+    let bar = format!(
+        "{}{}",
+        BAR_FILLED.to_string().repeat(filled),
+        BAR_EMPTY.to_string().repeat(FILES_BAR_WIDTH - filled),
+    );
+    format!("файлы {done}/{total} {bar} {:.0}%", pct)
 }
 
 /// Неопределённый прогресс (download/upload без процента): бегущее окно
@@ -448,23 +488,35 @@ fn header_spans(view: &HeaderView) -> Vec<Span<'static>> {
     spans
 }
 
-/// GPU-слот: `None` → `GPU: n/a` (graceful без поллера), иначе бар + VRAM.
+/// GPU-слот: `None` → `GPU: n/a` (graceful без поллера); иначе утилизация
+/// «NN%» + спарклайн истории (btop-стиль) + VRAM-бар `▓ X/Y GiB`. Без данных
+/// утилизации — «n/a», VRAM остаётся (поллер мог не дать util_percent).
 fn gpu_spans(gpu: Option<&GpuView>) -> Vec<Span<'static>> {
     let Some(gpu) = gpu else {
         return vec![Span::styled("GPU: n/a", STYLE_DIM)];
     };
+    let mut spans = vec![Span::styled("GPU ", STYLE_DIM)];
+    match gpu.util_pct {
+        Some(pct) => {
+            spans.push(Span::styled(format!("{pct:.0}%"), STYLE_FILL));
+            spans.push(Span::styled(
+                format!(" {} ", sparkline(&gpu.util_history, GPU_SPARK_WIDTH)),
+                STYLE_FILL,
+            ));
+        }
+        None => spans.push(Span::styled("n/a ", STYLE_DIM)),
+    }
+    spans.push(Span::styled("▓ ", STYLE_FILL));
     let pct = if gpu.total_gib > 0.0 {
         f64::from(gpu.used_gib) / f64::from(gpu.total_gib) * 100.0
     } else {
         0.0
     };
     let (filled, empty) = progress_bar_parts(pct, GPU_BAR_WIDTH);
-    vec![
-        Span::styled("GPU ", STYLE_DIM),
-        Span::styled(filled, STYLE_FILL),
-        Span::styled(empty, STYLE_EMPTY),
-        Span::styled(format!(" {:.1}/{:.1}GiB", gpu.used_gib, gpu.total_gib), STYLE_DIM),
-    ]
+    spans.push(Span::styled(filled, STYLE_FILL));
+    spans.push(Span::styled(empty, STYLE_EMPTY));
+    spans.push(Span::styled(format!(" {:.1}/{:.1}GiB", gpu.used_gib, gpu.total_gib), STYLE_DIM));
+    spans
 }
 
 /// Полоса табов: 4 равные зоны, активный подсвечен (зоны = [`tab_at`]).
@@ -535,10 +587,16 @@ fn file_row(view: &FileRowView) -> Row<'static> {
         ])),
         None => {
             let (filled, empty) = progress_bar_parts(view.pct, PROGRESS_BAR_WIDTH);
+            // Оценочный процент честно помечаем тильдой (~63%), фактический — как раньше.
+            let label = if view.estimated {
+                format!("~{:.0}%", view.pct)
+            } else {
+                format!(" {:>3.0}%", view.pct)
+            };
             Cell::from(Line::from(vec![
                 Span::styled(filled, STYLE_FILL),
                 Span::styled(empty, STYLE_EMPTY),
-                Span::raw(format!(" {:>3.0}%", view.pct)),
+                Span::raw(label),
             ]))
         }
     };
@@ -1044,6 +1102,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, banner: Option<&str>, curre
         return;
     };
     let (bar, pct_label) = match current.pct {
+        Some(pct) if current.estimated => {
+            (progress_bar(pct, PROGRESS_BAR_WIDTH), format!("~{pct:.0}%"))
+        }
         Some(pct) => (progress_bar(pct, PROGRESS_BAR_WIDTH), format!("{pct:>3.0}%")),
         None => (indeterminate_bar(current.phase, PROGRESS_BAR_WIDTH), "··".to_string()),
     };
@@ -1355,6 +1416,7 @@ mod tests {
             name: "a.wav".into(),
             stage: "download".into(),
             pct: None,
+            estimated: false,
             phase: 2,
             stage_elapsed: 5.0,
         };
@@ -1371,12 +1433,34 @@ mod tests {
     }
 
     #[test]
+    fn status_line_marks_estimated_pct_with_tilde() {
+        let base = |pct: Option<f64>, estimated: bool| CurrentFileView {
+            name: "a.wav".into(),
+            stage: "separate".into(),
+            pct,
+            estimated,
+            phase: 0,
+            stage_elapsed: 0.0,
+        };
+        let text = buffer_text(&render_frame(100, 1, |f, a| {
+            render_status_line(f, a, None, Some(&base(Some(42.0), true)))
+        }));
+        assert!(text.contains("~42%"), "оценка — с тильдой: {text}");
+
+        let text = buffer_text(&render_frame(100, 1, |f, a| {
+            render_status_line(f, a, None, Some(&base(Some(42.0), false)))
+        }));
+        assert!(text.contains(" 42%"), "фактический — без тильды: {text}");
+    }
+
+    #[test]
     fn table_stage_column_shows_timer_and_indeterminate_bar() {
         let rows = vec![FileRowView {
             badge: FileBadge::Run,
             name: "a.wav".into(),
             stage: "download".into(),
             pct: 0.0,
+            estimated: false,
             stems_done: 0,
             stage_elapsed: Some(65.0),
             indeterminate: Some(3),
@@ -1405,6 +1489,7 @@ mod tests {
             name: name.into(),
             stage: "separate".into(),
             pct,
+            estimated: false,
             stems_done: stems,
             stage_elapsed: None,
             indeterminate: None,
@@ -1434,14 +1519,67 @@ mod tests {
             name: "RTX".into(),
             used_gib: 2.1,
             total_gib: 6.0,
-            util_pct: 63.0,
+            util_pct: Some(63.0),
+            util_history: vec![10, 40, 63, 90],
         });
-        let terminal = render_frame(80, 3, |f, area| render_header(f, area, &view));
+        // Широкий кадр: спарклайн (20) + VRAM должны помещаться в одну строку.
+        let terminal = render_frame(140, 3, |f, area| render_header(f, area, &view));
         let text = buffer_text(&terminal);
         // 2.1/6.0 = 35% → 2 из 6 полуколонок заполнены.
-        assert!(text.contains("GPU ██░░░░"));
+        assert!(text.contains("GPU 63%"), "утилизация процентом: {text}");
+        assert!(text.contains("▂▄▅▇"), "спарклайн по истории [10,40,63,90]: {text}");
+        assert!(text.contains("▓"), "разделитель VRAM-бара: {text}");
+        assert!(text.contains("██░░░░"));
         assert!(text.contains("2.1/6.0GiB"));
         assert!(!text.contains("n/a"));
+    }
+
+    #[test]
+    fn header_gpu_without_utilization_shows_na_but_keeps_vram() {
+        let mut view = header_view();
+        view.gpu = Some(GpuView {
+            name: "RTX".into(),
+            used_gib: 1.0,
+            total_gib: 8.0,
+            util_pct: None,
+            util_history: Vec::new(),
+        });
+        let terminal = render_frame(120, 3, |f, area| render_header(f, area, &view));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("GPU n/a "), "утилизация неизвестна: {text}");
+        assert!(text.contains("▓"), "VRAM-бар остаётся: {text}");
+        assert!(text.contains("1.0/8.0GiB"));
+    }
+
+    #[test]
+    fn sparkline_maps_values_to_blocks_right_aligned() {
+        assert_eq!(sparkline(&[], 4), "    ", "пустая история — пробелы");
+        assert_eq!(sparkline(&[100], 4), "   █", "хвост выравнивается вправо");
+        assert_eq!(sparkline(&[0, 50, 100], 4), " ▁▅█", "уровень 50 → round(3.5) → ▅");
+        assert_eq!(sparkline(&[10, 20, 30, 40], 2), "▃▄", "берутся последние width значений");
+        assert_eq!(sparkline(&[255], 4), "   █", "значения выше 100 клампятся");
+    }
+
+    #[test]
+    fn files_progress_bar_over_done_total() {
+        assert_eq!(files_progress(0, 3), "файлы 0/3 ░░░░░░ 0%");
+        assert_eq!(files_progress(1, 3), "файлы 1/3 ██░░░░ 33%");
+        assert_eq!(files_progress(3, 3), "файлы 3/3 ██████ 100%");
+        assert_eq!(files_progress(0, 0), "файлы 0/0", "пустой план — без бара");
+    }
+
+    #[test]
+    fn table_marks_estimated_pct_with_tilde() {
+        let mut row = file_row_view(FileBadge::Run, "a.wav", 63.0, 0);
+        row.estimated = true;
+        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[row], None));
+        let text = buffer_text(&terminal);
+        assert!(text.contains("~63%"), "оценка помечается тильдой: {text}");
+
+        let real = file_row_view(FileBadge::Run, "a.wav", 63.0, 0);
+        let terminal = render_frame(80, 10, |f, area| render_files(f, area, &[real], None));
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" 63%"), "фактический — без тильды: {text}");
     }
 
     #[test]

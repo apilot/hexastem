@@ -12,6 +12,8 @@
 //! - `TeeEngine`: `EngineEvent` → Progress(pct)/ModelProgress/FileFailed;
 //!   на входе батча вычисляет дубли (скачано, но не в worklist) → DUP;
 //!   после доработки файла пайплайном — кооперативная пауза (граница файлов).
+//! - `download_poller_loop`: фоновая задача — фактический download-прогресс
+//!   по размерам файлов (smbclient не отдаёт прогресс передачи).
 //!
 //! Управление — кооперативное, через [`RunnerHandle`]: cancel/пауза/retry на
 //! атомарках и очереди, проверки — на границах файлов и стадий.
@@ -26,9 +28,9 @@
 //! - **Scan-стадия не имеет отдельного события**: план приходит одним
 //!   [`AppEvent::RunStarted`] после скана; стадия scan видима как Running
 //!   без строк таблицы.
-//! - **Проценты недетерминированных стадий не приближаются**: вне separate
-//!   процент сбрасывается (download/upload/rename — indeterminate), т.к.
-//!   размера операций у UI нет.
+//! - **Процент separate — оценка драйвера** (`est: true`), download-прогресс —
+//!   фактический (поллер размера локального файла против размера на шаре),
+//!   upload/rename — indeterminate (размеров операций у UI нет).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
@@ -251,6 +253,21 @@ async fn run_once(
         }
         let engine_tee =
             TeeEngine { inner: &*engine, events: events.clone(), ctrl: ctrl.clone(), downloaded: downloaded.clone() };
+        // Download-прогресс: размеры pending-файлов с шары (SmbEntry.size) —
+        // поллер сверяет их с ростом локальных файлов (см. download_poller_loop).
+        let remote_sizes: RemoteSizes = plan
+            .pending
+            .iter()
+            .filter(|entry| entry.size > 0)
+            .map(|entry| (entry.name.clone(), entry.size))
+            .collect();
+        let poller = runtime.spawn(download_poller_loop(
+            remote_sizes,
+            opts.local_dir.clone(),
+            downloaded.clone(),
+            events.clone(),
+            DOWNLOAD_POLL,
+        ));
         let pipeline = Pipeline::new(
             &smb_tee,
             &engine_tee,
@@ -259,11 +276,71 @@ async fn run_once(
             &opts.stem_ext,
         )
         .with_dedup(opts.dedup);
-        let result = pipeline.execute(&plan)?;
+        let result = pipeline.execute(&plan);
+        poller.abort(); // поллер живёт только пока идёт батч
+        let result = result?;
         let _ = events.send(AppEvent::BatchFinished { outcome: BatchOutcome::from(&result) });
         Ok((plan, result))
     });
     task.await.map_err(|err| AppError::Pipeline(format!("runner blocking task failed: {err}")))?
+}
+
+/// Интервал поллера download-прогресса.
+const DOWNLOAD_POLL: Duration = Duration::from_secs(1);
+
+/// Размеры pending-файлов на шаре: имя → байты (из `SmbEntry.size`).
+type RemoteSizes = BTreeMap<String, u64>;
+
+/// Фактический download-прогресс: локальный размер / удалённый. `None` —
+/// удалённый размер неизвестен или локального файла ещё нет.
+fn download_pct(local: &Path, remote_size: u64) -> Option<f64> {
+    if remote_size == 0 {
+        return None;
+    }
+    let len = std::fs::metadata(local).ok()?.len();
+    Some(((len as f64 / remote_size as f64) * 100.0).min(100.0))
+}
+
+/// Фоновый поллер download-прогресса: раз в `period` для каждого pending-файла
+/// сверяет локальный размер с размером на шаре и шлёт фактический
+/// [`AppEvent::FileProgress`] (Download) — smbclient прогресс передачи не даёт.
+/// Событие — только при изменении целого процента (без спама одинаковыми).
+/// Гасится `abort`'ом после батча (см. `run_once`).
+async fn download_poller_loop(
+    sizes: RemoteSizes,
+    local_dir: PathBuf,
+    downloaded: SharedDownloads,
+    events: UnboundedSender<AppEvent>,
+    period: Duration,
+) {
+    let mut last_sent: BTreeMap<String, i64> = BTreeMap::new();
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        for (name, remote) in &sizes {
+            let local = local_dir.join(name);
+            let done = downloaded
+                .lock()
+                .map(|map| map.contains_key(&local.to_string_lossy().into_owned()))
+                .unwrap_or(false);
+            if done {
+                continue; // скачан и передан пайплайну — прогресс не нужен
+            }
+            let Some(pct) = download_pct(&local, *remote) else { continue };
+            let whole = pct as i64;
+            if last_sent.get(name).is_some_and(|sent| whole - *sent < 1) {
+                continue; // шлём только изменения ≥1%
+            }
+            last_sent.insert(name.clone(), whole);
+            let _ = events.send(AppEvent::FileProgress {
+                name: name.clone(),
+                stage: Stage::Download,
+                pct,
+                estimated: false, // поллер показывает фактический объём
+            });
+        }
+    }
 }
 
 /// Слияние retry-результата в общий итог: статусы замещаются по имени файла,
@@ -523,10 +600,15 @@ impl EngineOps for TeeEngine<'_> {
             // (доработка файла — upload/rename — тоже входит в «файл»).
             let boundary = matches!(event, EngineEvent::FileDone { .. } | EngineEvent::FileError { .. });
             match &event {
-                EngineEvent::Progress { file, stage, pct } => {
+                EngineEvent::Progress { file, stage, pct, estimated } => {
                     let name = file_name_of(file).to_string();
                     let event = if stage == "separate" {
-                        AppEvent::FileProgress { name, pct: *pct }
+                        AppEvent::FileProgress {
+                            name,
+                            stage: Stage::Separate,
+                            pct: *pct,
+                            estimated: *estimated,
+                        }
                     } else {
                         AppEvent::ModelProgress { pct: *pct } // load и пр. — глобально
                     };
@@ -535,7 +617,9 @@ impl EngineOps for TeeEngine<'_> {
                 EngineEvent::FileDone { file, .. } => {
                     let _ = events.send(AppEvent::FileProgress {
                         name: file_name_of(file).to_string(),
+                        stage: Stage::Separate,
                         pct: 100.0,
+                        estimated: false,
                     });
                 }
                 EngineEvent::FileError { file, error } => {
@@ -611,6 +695,7 @@ mod tests {
             file: local.join(names[0]).to_string_lossy().into_owned(),
             stage: "load".to_string(),
             pct: 50.0,
+            estimated: false,
         }];
         for (i, name) in names.iter().enumerate() {
             events.push(progress_event(local, name, 40.0 + i as f64 * 10.0));
@@ -660,7 +745,7 @@ mod tests {
 
     fn has_progress(events: &[AppEvent], name: &str, pct: f64) -> bool {
         events.iter().any(|event| {
-            matches!(event, AppEvent::FileProgress { name: n, pct: p } if n == name && (*p - pct).abs() < 1e-9)
+            matches!(event, AppEvent::FileProgress { name: n, pct: p, .. } if n == name && (*p - pct).abs() < 1e-9)
         })
     }
 
@@ -672,6 +757,81 @@ mod tests {
 
     fn result_status<'a>(result: &'a BatchResult, name: &str) -> &'a FileStatus {
         &result.results.iter().find(|r| r.name == name).expect("file in result").status
+    }
+
+    // --- download-прогресс (поллер фактического размера) ----------------------
+
+    #[test]
+    fn download_pct_measures_local_against_remote_size() {
+        let dir = temp_dir("dl_pct");
+        let local = dir.join("a.wav");
+        assert_eq!(download_pct(&local, 100), None, "файла ещё нет → нет процента");
+        std::fs::write(&local, vec![0u8; 50]).unwrap();
+        assert_eq!(download_pct(&local, 100), Some(50.0));
+        assert_eq!(download_pct(&local, 25), Some(100.0), "перелив клампится в 100");
+        assert_eq!(download_pct(&local, 0), None, "нулевой удалённый размер → нет процента");
+    }
+
+    #[tokio::test]
+    async fn download_poller_sends_rising_pct_while_file_grows() {
+        let dir = temp_dir("dl_poller_grow");
+        let local = dir.join("a.wav");
+        std::fs::write(&local, vec![0u8; 40]).unwrap();
+        let sizes: RemoteSizes = [("a.wav".to_string(), 100)].into_iter().collect();
+        let downloaded: SharedDownloads = Arc::new(Mutex::new(BTreeMap::new()));
+        let (tx, mut rx) = unbounded_channel();
+        let poller = tokio::spawn(download_poller_loop(
+            sizes,
+            dir.clone(),
+            downloaded,
+            tx,
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        std::fs::write(&local, vec![0u8; 90]).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        poller.abort();
+
+        let mut pcts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::FileProgress { name, stage: Stage::Download, pct, estimated } = event {
+                assert_eq!(name, "a.wav");
+                assert!(!estimated, "download-прогресс — фактический");
+                pcts.push(pct);
+            }
+        }
+        assert_eq!(pcts.first(), Some(&40.0), "первый тик: 40/100, события: {pcts:?}");
+        assert!(pcts.contains(&90.0), "рост файла виден: {pcts:?}");
+        assert!(pcts.windows(2).all(|w| w[0] < w[1]), "монотонно и без спама: {pcts:?}");
+    }
+
+    #[tokio::test]
+    async fn download_poller_skips_missing_files_and_downloaded() {
+        let dir = temp_dir("dl_poller_skip");
+        let done_local = dir.join("done.wav");
+        std::fs::write(&done_local, b"x").unwrap();
+        let downloaded: SharedDownloads = Arc::new(Mutex::new(BTreeMap::new()));
+        downloaded
+            .lock()
+            .expect("downloads lock")
+            .insert(done_local.to_string_lossy().into_owned(), "done.wav".to_string());
+        let sizes: RemoteSizes = [
+            ("missing.wav".to_string(), 100),
+            ("done.wav".to_string(), 100),
+        ]
+        .into_iter()
+        .collect();
+        let (tx, mut rx) = unbounded_channel();
+        let poller = tokio::spawn(download_poller_loop(
+            sizes,
+            dir.clone(),
+            downloaded,
+            tx,
+            Duration::from_millis(20),
+        ));
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        poller.abort();
+        assert!(rx.try_recv().is_err(), "отсутствующий и скачанный файлы молчат");
     }
 
     // --- полный мок-прогон ---------------------------------------------------
