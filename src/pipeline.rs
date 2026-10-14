@@ -93,6 +93,13 @@ pub enum EngineEvent {
         /// Неудачных файлов.
         failed: u32,
     },
+    /// Драйвер сообщил вычислительное устройство (сразу после загрузки
+    /// модели): имя CUDA-GPU или `cpu`. Пайплайн не использует — событие
+    /// для шапки TUI.
+    Device {
+        /// Имя GPU (`NVIDIA GeForce RTX 4090`) или `cpu`.
+        name: String,
+    },
 }
 
 /// Разбор строки stdout драйвера; `None` — пустая/не протокольная строка.
@@ -258,7 +265,8 @@ impl EngineRunner {
                 Some(format!("[engine] {file}: {stage} {pct:.1}%"))
             }
             EngineEvent::BatchDone { ok, failed } => Some(format!("[engine] batch done: ok={ok} failed={failed}")),
-            EngineEvent::FileDone { .. } | EngineEvent::FileError { .. } => None,
+            // Имя устройства — событие шапки TUI, `[engine]`-строки не даёт.
+            EngineEvent::FileDone { .. } | EngineEvent::FileError { .. } | EngineEvent::Device { .. } => None,
         }
     }
 
@@ -659,7 +667,8 @@ impl<'a> Pipeline<'a> {
         let mut on_event = |event: EngineEvent| match event {
             // `[engine]`-строки печатает сам EngineRunner (stderr-sink):
             // CLI — в терминал, TUI — в общий канал событий (таб Log).
-            EngineEvent::Progress { .. } | EngineEvent::BatchDone { .. } => {}
+            // Device — событие шапки TUI, пайплайн не использует.
+            EngineEvent::Progress { .. } | EngineEvent::BatchDone { .. } | EngineEvent::Device { .. } => {}
             EngineEvent::FileDone { file, stems, .. } => {
                 let result = self.finalize_separated(&file, &stems);
                 done.insert(file, result);
@@ -1355,6 +1364,14 @@ mod tests {
             (
                 r#"{"event":"batch_done","ok":2,"failed":1}"#,
                 EngineEvent::BatchDone { ok: 2, failed: 1 },
+            ),
+            (
+                r#"{"event":"device","name":"NVIDIA GeForce RTX 4090"}"#,
+                EngineEvent::Device { name: "NVIDIA GeForce RTX 4090".to_string() },
+            ),
+            (
+                r#"{"event":"device","name":"cpu"}"#,
+                EngineEvent::Device { name: "cpu".to_string() },
             ),
         ];
         for (line, expected) in cases {

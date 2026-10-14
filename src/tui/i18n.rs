@@ -78,6 +78,8 @@ pub struct StrTable {
     // --- шапка ---
     pub model_loading: fn(f64) -> String,
     pub gpu_na: &'static str,
+    /// Имя вычислительного устройства движка (событие `device` драйвера).
+    pub computing_on: fn(&str) -> String,
 
     // --- футер ---
     pub keyhints: &'static str,
@@ -236,6 +238,7 @@ static RU: StrTable = StrTable {
 
     model_loading: |pct| format!("модель: {pct:.0}%"),
     gpu_na: "GPU: n/a",
+    computing_on: |name| format!("Считает: {name}"),
 
     keyhints: "[s]тарт [p]ауза [r]етрай [m]одель [o]тчёт [?]справка [q]выход",
     files_word: "файлы",
@@ -390,6 +393,7 @@ static EN: StrTable = StrTable {
 
     model_loading: |pct| format!("model: {pct:.0}%"),
     gpu_na: "GPU: n/a",
+    computing_on: |name| format!("Compute: {name}"),
 
     keyhints: "[s]tart [p]ause [r]etry [m]odel [o]pen report [?]help [q]uit",
     files_word: "files",
@@ -584,5 +588,11 @@ mod tests {
         assert!(std::ptr::eq(tr(Lang::Ru), &RU));
         assert!(std::ptr::eq(tr(Lang::En), &EN));
         assert!(!std::ptr::eq(tr(Lang::Ru), tr(Lang::En)));
+    }
+
+    #[test]
+    fn computing_on_label_in_both_locales() {
+        assert_eq!((tr(Lang::Ru).computing_on)("RTX 4090"), "Считает: RTX 4090");
+        assert_eq!((tr(Lang::En).computing_on)("RTX 4090"), "Compute: RTX 4090");
     }
 }

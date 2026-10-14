@@ -14,6 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::Model;
 use crate::dedup::DedupSummary;
+use crate::envelope::StereoEnvelope;
 use crate::pipeline::{BatchResult, FileResult};
 use crate::tui::gpu::GpuEvent;
 
@@ -148,6 +149,9 @@ pub enum AppEvent {
     /// Прогресс по файлу (pct 0..100): стадия `Separate` из `EngineEvent::Progress`,
     /// `Download` — от поллера размеров (фактический локальный объём).
     FileProgress { name: String, stage: Stage, pct: f64, estimated: bool },
+    /// Драйвер сообщил вычислительное устройство (после загрузки модели):
+    /// шапка показывает «Считает: <name>» (GPU или `cpu`).
+    Device { name: String },
     /// Прогресс загрузки модели (глобальный, стадия `load` драйвера).
     ModelProgress { pct: f64 },
     /// Драйвер сообщил список стемов файла (`EngineEvent::FileDone`):
@@ -170,7 +174,7 @@ pub enum AppEvent {
     BatchFinished { outcome: BatchOutcome },
     /// Огибающая файла посчитана (после download, ровно 1 раз на файл);
     /// при терминальном статусе файла-адресата отбрасывается.
-    Envelope { path: PathBuf, peaks: Arc<[f32]> },
+    Envelope { path: PathBuf, envelope: Arc<StereoEnvelope> },
 }
 
 impl From<Event> for AppEvent {
@@ -314,15 +318,29 @@ mod tests {
     fn runner_events_are_cloneable_and_comparable() {
         let event = AppEvent::Envelope {
             path: PathBuf::from("/tmp/a.wav"),
-            peaks: Arc::from(vec![0.5_f32, 0.25]),
+            envelope: Arc::new(StereoEnvelope {
+                left: vec![0.5],
+                right: vec![0.25],
+            }),
         };
         let copy = event.clone();
 
         assert_eq!(event, copy);
         assert!(matches!(
             copy,
-            AppEvent::Envelope { ref path, ref peaks } if path == &PathBuf::from("/tmp/a.wav") && peaks.len() == 2
+            AppEvent::Envelope { ref path, ref envelope }
+                if path == &PathBuf::from("/tmp/a.wav")
+                    && envelope.left.len() == 1
+                    && envelope.right[0] == 0.25
         ));
+    }
+
+    #[test]
+    fn device_event_carries_engine_name() {
+        let event = AppEvent::Device { name: "NVIDIA GeForce RTX 4090".into() };
+        let copy = event.clone();
+        assert_eq!(event, copy);
+        assert!(matches!(copy, AppEvent::Device { ref name } if name.contains("RTX")));
     }
 
     #[test]

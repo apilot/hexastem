@@ -10,6 +10,9 @@ goes to stderr:
    "est": true|false}
   # est=true — оценка по времени (audio-separator не отдаёт прогресс separate);
   # est=false — точное значение (старт 0%, финал 100%).
+  {"event": "device", "name": "..."}
+  # сразу после load_model(): имя CUDA-GPU (torch.cuda.get_device_name(0))
+  # или "cpu", если CUDA недоступен.
   {"event": "file_done", "file": "...", "stems": ["...", ...], "seconds": 12.3}
   {"event": "file_error", "file": "...", "error": "..."}
   {"event": "batch_done", "ok": N, "failed": M}
@@ -91,6 +94,23 @@ def file_error_event(file: str, error: str) -> dict:
 
 def batch_done_event(ok: int, failed: int) -> dict:
     return {"event": "batch_done", "ok": ok, "failed": failed}
+
+
+def device_event(name: str) -> dict:
+    """Compute device report: CUDA GPU name or "cpu" (for the TUI header)."""
+    return {"event": "device", "name": name}
+
+
+def probe_device() -> str:
+    """GPU name via torch; "cpu" when CUDA is unavailable or torch is missing."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return str(torch.cuda.get_device_name(0))
+    except Exception:  # noqa: BLE001 — probe must never kill the batch
+        pass
+    return "cpu"
 
 
 def emit(event: dict) -> None:
@@ -278,6 +298,7 @@ def run_batch(
             emit_fn(file_error_event(str(path), message))
         return 0, len(config.files)
     emit_fn(progress_event(first, "load", 100))
+    emit_fn(device_event(probe_device()))
     tracker = RtfTracker(config.rtf_estimate)
     results = [
         process_file(separator, path, config.output_dir, emit_fn, tracker)

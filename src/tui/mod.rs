@@ -443,8 +443,9 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
     {
         return;
     }
-    // Высота статус-зоны та же, что у рендера: с текущим файлом — 4 ряда.
-    let status_height = widgets::status_zone_height(current_file_view(app, tr(app.lang())).is_some());
+    // Высота статус-зоны та же, что у рендера: крупная карта с текущим файлом.
+    let status_height =
+        widgets::status_zone_height(current_file_view(app, tr(app.lang())).is_some(), area.height);
     let zones = widgets::compute_zones(area, status_height);
     if covers(zones.tabs, mouse.row) {
         if let Some(tab) = widgets::tab_at(mouse.column, zones.tabs) {
@@ -541,12 +542,12 @@ fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
         estimated: view.estimated,
         phase: app.tick_count(),
         stage_elapsed: view.stage_started.map_or(0.0, |started| started.elapsed().as_secs_f64()),
-        // Огибающая из App по ссылке (Arc-клон, без копирования пиков).
+        // Огибающая из App по ссылке (Arc-клон, без копирования каналов).
         waveform: WaveformView {
             pct: view.pct.unwrap_or(0.0),
             duration_secs: None,
             estimated: view.estimated,
-            peaks: view.peaks.clone().unwrap_or_default(),
+            envelope: view.envelope.clone().unwrap_or_default(),
         },
     })
 }
@@ -555,8 +556,14 @@ fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
 /// индикатор загрузки модели — глобальный.
 fn header_view(app: &App) -> HeaderView {
     let model_pct = app.model_pct();
+    let compute_device = app.gpu_device_name().map(str::to_string);
     let Some(cfg) = app.config() else {
-        return HeaderView { gpu: app.gpu().cloned(), model_pct, ..HeaderView::default() };
+        return HeaderView {
+            gpu: app.gpu().cloned(),
+            compute_device,
+            model_pct,
+            ..HeaderView::default()
+        };
     };
     HeaderView {
         host: cfg.host.as_str().to_string(),
@@ -564,6 +571,7 @@ fn header_view(app: &App) -> HeaderView {
         remote_dir: cfg.remote_dir.as_str().to_string(),
         model: model_label(cfg.model).to_string(),
         gpu: app.gpu().cloned(),
+        compute_device,
         model_pct,
     }
 }
@@ -1041,6 +1049,20 @@ mod tests {
         assert!(!text.contains("n/a"));
     }
 
+    /// Событие `device` драйвера обновляет шапку («Считает: …»); до события —
+    /// прежний рендер (слота нет, GPU-виджет «n/a»).
+    #[test]
+    fn device_event_shows_computing_in_header() {
+        let mut app = running_app();
+        let text = render(100, 30, &app);
+        assert!(!text.contains("Считает:"), "до события device слота нет: {text}");
+        assert!(text.contains("GPU: n/a"), "прежний рендер шапки: {text}");
+
+        feed(&mut app, AppEvent::Device { name: "RTX 4090".into() });
+        let text = render(100, 30, &app);
+        assert!(text.contains("Считает: RTX 4090"), "событие device обновляет шапку: {text}");
+    }
+
     // --- валидация спеки (реальный диск, без сети) ----------------------------
 
     #[test]
@@ -1497,9 +1519,9 @@ mod tests {
         let mut app = App::new();
         feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
 
-        // Контент с y=8 (статус-зона 4 ряда в Running); строка таблицы 0 —
-        // с y=10 (рамка+заголовок), клик по y=11 — вторая строка.
-        handle_mouse(&mut app, click_up(10, 11), SCREEN);
+        // Контент с y=16 (крупная статус-зона 12 рядов на 30-строчном экране);
+        // строка таблицы 0 — с y=18 (рамка+заголовок), клик по y=19 — вторая.
+        handle_mouse(&mut app, click_up(10, 19), SCREEN);
 
         assert_eq!(app.selected_index(), 1, "клик по второй строке таблицы");
         assert_eq!(app.selected_file().map(|file| file.name.as_str()), Some("b.wav"));
@@ -1510,7 +1532,7 @@ mod tests {
         let mut app = App::new();
         feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
 
-        handle_mouse(&mut app, click_up(10, 20), SCREEN); // пустая зона таблицы
+        handle_mouse(&mut app, click_up(10, 25), SCREEN); // пустая зона таблицы
 
         assert_eq!(app.selected_index(), 2, "курсор не выходит за последнюю строку");
     }

@@ -111,6 +111,30 @@ def test_event_builders_shapes():
     assert error == {"event": "file_error", "file": "/a.wav", "error": "boom"}
     summary = sd.batch_done_event(2, 1)
     assert summary == {"event": "batch_done", "ok": 2, "failed": 1}
+    device = sd.device_event("NVIDIA GeForce RTX 4090")
+    assert device == {"event": "device", "name": "NVIDIA GeForce RTX 4090"}
+
+
+def test_probe_device_returns_a_device_name():
+    # В среде с torch/cuda — имя GPU, без него — "cpu"; в любом случае строка.
+    assert isinstance(sd.probe_device(), str) and sd.probe_device()
+
+
+def test_probe_device_falls_back_to_cpu_when_torch_missing():
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_torch(name, *args, **kwargs):
+        if name == "torch":
+            raise ImportError("torch blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = no_torch
+    try:
+        assert sd.probe_device() == "cpu"
+    finally:
+        builtins.__import__ = real_import
 
 
 def test_emit_writes_one_json_line():
@@ -130,18 +154,20 @@ def test_batch_success_events():
         events = collect_events(config, FakeFactory(fake))
         kinds = [e["event"] for e in events]
         assert kinds == [
-            "progress", "progress", "progress",
+            "progress", "progress", "device", "progress",
             "file_done", "batch_done", "exit_check",
         ]
         assert events[0]["stage"] == "load" and events[0]["pct"] == 0
         assert events[1]["stage"] == "load" and events[1]["pct"] == 100
-        assert events[2]["stage"] == "separate"
-        done = events[3]
+        # Событие device идёт сразу после загрузки модели: имя GPU либо cpu.
+        assert events[2] == {"event": "device", "name": sd.probe_device()}
+        assert events[3]["stage"] == "separate"
+        done = events[4]
         assert done["file"] == str(config.files[0])
         assert len(done["stems"]) == 6
         assert all(s.endswith(".flac") for s in done["stems"])
         assert done["seconds"] >= 0
-        assert events[4] == {"event": "batch_done", "ok": 1, "failed": 0}
+        assert events[5] == {"event": "batch_done", "ok": 1, "failed": 0}
 
 
 def test_failure_isolation_and_retry():
@@ -158,7 +184,7 @@ def test_failure_isolation_and_retry():
         kinds = [e["event"] for e in events]
         # both good files survive the failure of the middle one
         assert kinds == [
-            "progress", "progress",
+            "progress", "progress", "device",
             "progress", "file_done",
             "progress", "progress", "file_error",
             "progress", "file_done",
@@ -167,8 +193,8 @@ def test_failure_isolation_and_retry():
         bad_calls = [c for c in fake.calls if "bad.wav" in c]
         assert len(bad_calls) == 2, f"expected exactly 1 retry, got {len(bad_calls)} attempts"
         assert events[-2] == {"event": "batch_done", "ok": 2, "failed": 1}
-        assert events[6]["event"] == "file_error" and "gpu exploded" in events[6]["error"]
-        assert events[8]["event"] == "file_done" and "good2" in events[8]["file"]
+        assert events[7]["event"] == "file_error" and "gpu exploded" in events[7]["error"]
+        assert events[9]["event"] == "file_done" and "good2" in events[9]["file"]
 
 
 def test_model_load_failure_fails_all_files():
@@ -177,7 +203,9 @@ def test_model_load_failure_fails_all_files():
         config = make_config(tmp, ["a.wav", "b.wav"])
         events = collect_events(config, FakeFactory(error=RuntimeError("ckpt corrupted")))
         kinds = [e["event"] for e in events]
+        # Device event never fires: the model (and its device) never loaded.
         assert kinds == ["progress", "file_error", "file_error", "batch_done", "exit_check"]
+        assert all(e["event"] != "device" for e in events)
         assert events[0]["stage"] == "load" and events[0]["pct"] == 0
         assert events[-2] == {"event": "batch_done", "ok": 0, "failed": 2}
         assert all("ckpt corrupted" in e["error"] for e in events if e["event"] == "file_error")

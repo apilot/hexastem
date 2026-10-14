@@ -8,7 +8,7 @@
 //!
 //! - `TeeSmb`: list/get/create_dir/put/rename → стадии Queued → Download →
 //!   Separate → Upload → Rename; после успешного download запускает фоновый
-//!   расчёт огибающей (1 раз на файл, `envelope::wav_envelope`);
+//!   расчёт огибающей (1 раз на файл, `envelope::wav_stereo_envelope`);
 //! - `TeeEngine`: `EngineEvent` → Progress(pct)/ModelProgress/FileFailed;
 //!   на входе батча вычисляет дубли (скачано, но не в worklist) → DUP;
 //!   после доработки файла пайплайном — кооперативная пауза (граница файлов).
@@ -42,7 +42,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::envelope::wav_envelope;
+use crate::envelope::wav_stereo_envelope;
 use crate::error::AppError;
 use crate::pipeline::{
     plan as plan_batch, summarize_with_dedup, BatchPlan, BatchResult, DUPLICATE_PREFIX, EngineEvent,
@@ -456,9 +456,9 @@ impl TeeSmb<'_> {
         }
         let (path, columns, events, ctrl) =
             (local.to_path_buf(), self.envelope_columns, self.events.clone(), self.ctrl.clone());
-        self.runtime.spawn_blocking(move || match wav_envelope(&path, columns) {
-            Ok(peaks) if !ctrl.cancelled() => {
-                let _ = events.send(AppEvent::Envelope { path, peaks: Arc::from(peaks) });
+        self.runtime.spawn_blocking(move || match wav_stereo_envelope(&path, columns) {
+            Ok(envelope) if !ctrl.cancelled() => {
+                let _ = events.send(AppEvent::Envelope { path, envelope: Arc::new(envelope) });
             }
             _ => {}
         });
@@ -634,6 +634,10 @@ impl EngineOps for TeeEngine<'_> {
                         name: file_name_of(file).to_string(),
                         error: error.clone(),
                     });
+                }
+                // Имя вычислительного устройства — событие шапки TUI.
+                EngineEvent::Device { name } => {
+                    let _ = events.send(AppEvent::Device { name: name.clone() });
                 }
                 // Драйверная сводка: итог придёт авторитетным BatchResult.
                 EngineEvent::BatchDone { .. } => {}
@@ -908,6 +912,36 @@ mod tests {
             app.handle(event);
         }
         assert_eq!(app.files()[0].stems_done, Some(6), "колонка STEMS честна в Finished");
+    }
+
+    /// Событие `device` драйвера проходит сквозь tee в канал UI (шапка TUI).
+    #[tokio::test]
+    async fn device_event_is_forwarded_to_ui_channel() {
+        let dir = temp_dir("device");
+        let mut engine = engine_events(&dir, &["a.wav"]);
+        engine.insert(1, EngineEvent::Device { name: "NVIDIA GeForce RTX 4090".into() });
+        let rig = Rig {
+            smb: Arc::new(MockSmb::new().with_dir("/nas", &["a.wav"])),
+            engine: Arc::new(MockEngine::new(engine)),
+            opts: opts(&dir, 0),
+        };
+
+        let (events, result) = run_full(&rig).await;
+
+        result.expect("батч успешен");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AppEvent::Device { name } if name == "NVIDIA GeForce RTX 4090"
+            )),
+            "device доходит до UI: {events:?}"
+        );
+        // Шапка App обновляется тем же потоком событий прогона.
+        let mut app = App::new();
+        for event in &events {
+            app.handle(event);
+        }
+        assert_eq!(app.gpu_device_name(), Some("NVIDIA GeForce RTX 4090"));
     }
 
     #[tokio::test]
@@ -1303,11 +1337,16 @@ mod tests {
         let envelopes: Vec<&AppEvent> =
             events.iter().filter(|event| matches!(event, AppEvent::Envelope { .. })).collect();
         assert_eq!(envelopes.len(), 1, "огибающая считается ровно 1 раз на файл");
-        let Some(AppEvent::Envelope { path, peaks }) = envelopes.first() else {
+        let Some(AppEvent::Envelope { path, envelope }) = envelopes.first() else {
             panic!("checked above");
         };
         assert!(path.to_string_lossy().ends_with("a.wav"));
-        assert_eq!(peaks.len(), 8, "число колонок == columns");
-        assert!(peaks.iter().all(|p| *p > 0.55 && *p <= 0.65), "пик колонки ≈ амплитуде: {peaks:?}");
+        assert_eq!(envelope.left.len(), 8, "число колонок == columns");
+        assert_eq!(envelope.left, envelope.right, "моно-файл — оба канала одинаковы");
+        assert!(
+            envelope.left.iter().all(|p| *p > 0.55 && *p <= 0.65),
+            "пик колонки ≈ амплитуде: {:?}",
+            envelope.left
+        );
     }
 }

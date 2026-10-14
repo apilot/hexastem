@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableStat
 use ratatui::Frame;
 
 use crate::dedup::{KeeperReason, PairReport};
+use crate::envelope::StereoEnvelope;
 use crate::pipeline::EXPECTED_STEM_COUNT;
 use crate::tui::i18n::StrTable;
 use crate::tui::log::{LogBuffer, LogEntry};
@@ -31,11 +32,17 @@ use crate::tui::log::{LogBuffer, LogEntry};
 const WAVE_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Пикселей брайль-сетки в ячейке канваса (горизонталь, вертикаль).
 const BRAILLE_PX: (usize, usize) = (2, 4);
-/// Высота брайль-карты: 2–3 текстовые строки = 8–12 пиксельных рядов.
+/// Высота брайль-карты минимум: 2 текстовые строки = 8 пиксельных рядов.
 const WAVE_CANVAS_ROWS_MIN: u16 = 2;
-const WAVE_CANVAS_ROWS_MAX: u16 = 3;
-/// Статус-зона с текущим файлом: строка индикатора + карта (2 ряда) + подпись.
-const STATUS_TALL_ROWS: u16 = 4;
+/// Высота брайль-карты максимум: 12 текстовых рядов (48 пиксельных) —
+/// крупная карта статус-зоны (решение владельца 2026-10-14); Details держит
+/// свою зону в 5 рядах и ограничена площадью, не этой константой.
+const WAVE_CANVAS_ROWS_MAX: u16 = 12;
+/// Крупная статус-зона с текущим файлом: доля свободной высоты экрана.
+const STATUS_ZONE_SHARE: f64 = 0.4;
+/// Границы высоты статус-зоны с текущим файлом (текстовых рядов).
+const STATUS_ZONE_MIN_ROWS: u16 = 6;
+const STATUS_ZONE_MAX_ROWS: u16 = 14;
 const BAR_FILLED: char = '█';
 const BAR_EMPTY: char = '░';
 const PROGRESS_BAR_WIDTH: usize = 12;
@@ -54,10 +61,40 @@ const STYLE_DIM: Style = Style::new().fg(Color::DarkGray);
 const STYLE_FILL: Style = Style::new().fg(Color::Yellow);
 const STYLE_EMPTY: Style = Style::new().fg(Color::DarkGray);
 const STYLE_HEADER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-/// Заливка пройденной части карты (палитра UI: зелёный статуса «ГОТ»).
-const STYLE_WAVE_FILL: Color = Color::Green;
 /// Серые пики непройденной части карты.
 const STYLE_WAVE_PEAK: Color = Color::DarkGray;
+
+/// Опорные точки градиента пройденной части карты ПО АМПЛИТУДЕ пикселя
+/// (решение владельца 2026-10-14): 0.0 → зелёный, 0.5 → жёлтый, 1.0 →
+/// красный; между точками — линейная интерполяция RGB. Яркость 0xC0:
+/// достаточно контрастно на тёмном фоне и мягче полного 0xFF.
+const AMPLITUDE_GRADIENT: [(f32, [u8; 3]); 3] = [
+    (0.0, [0x00, 0xC0, 0x00]), // тишина/шёпот — зелёный (палитра статуса «ГОТ»)
+    (0.5, [0xC0, 0xC0, 0x00]), // середина — жёлтый
+    (1.0, [0xC0, 0x00, 0x00]), // пик — красный
+];
+
+/// Сегмент градиента для амплитуды 0..=1: (начало, конец, доля 0..=1
+/// внутри сегмента). Вход клампится, поэтому сегмент всегда найдётся.
+fn gradient_segment(amplitude: f32) -> ([u8; 3], [u8; 3], f32) {
+    let a = amplitude.clamp(0.0, 1.0);
+    let mut hi = 1;
+    while hi < AMPLITUDE_GRADIENT.len() - 1 && a > AMPLITUDE_GRADIENT[hi].0 {
+        hi += 1;
+    }
+    let (p0, c0) = AMPLITUDE_GRADIENT[hi - 1];
+    let (p1, c1) = AMPLITUDE_GRADIENT[hi];
+    let t = ((a - p0) / (p1 - p0)).clamp(0.0, 1.0);
+    (c0, c1, t)
+}
+
+/// Цвет пикселя пройденной части карты по амплитуде 0..=1 (вне диапазона —
+/// клампится): зелёный → жёлтый → красный по [`AMPLITUDE_GRADIENT`].
+fn amplitude_color(amplitude: f32) -> Color {
+    let (c0, c1, t) = gradient_segment(amplitude);
+    let mix = |a: u8, b: u8| (f32::from(a) + f32::from(b) * t - f32::from(a) * t).round() as u8;
+    Color::Rgb(mix(c0[0], c1[0]), mix(c0[1], c1[1]), mix(c0[2], c1[2]))
+}
 
 // --- бейджи ----------------------------------------------------------------------
 
@@ -123,6 +160,10 @@ pub struct HeaderView {
     pub model: String,
     /// Снимок GPU-поллера, когда он поднят.
     pub gpu: Option<GpuView>,
+    /// Имя вычислительного устройства движка (событие `device` драйвера):
+    /// шапка показывает «Считает: <name>»; `None` — слот скрыт, GPU-виджет
+    /// живёт прежней семантикой («GPU: n/a» до данных поллера).
+    pub compute_device: Option<String>,
     /// Прогресс загрузки модели (`Some` — видимый индикатор «модель: NN%»,
     /// гаснет по достижении 100%).
     pub model_pct: Option<f64>,
@@ -186,9 +227,9 @@ pub struct StemView {
     pub state: StemState,
 }
 
-/// Огибающая громкости (брайль-версия, решение владельца 2026-10-14):
-/// симметричная пиксельная карта в Canvas `Marker::Braille`, серые пики
-/// непройденной части, цветная заливка пройденной.
+/// Огибающая громкости (стерео-карта «в зеркале», брайль-версия): верхняя
+/// половина — L (вверх от центра), нижняя — R; серые пики непройденной
+/// части, пройденная — градиентом по амплитуде пикселя.
 #[derive(Debug, Clone, Default)]
 pub struct WaveformView {
     /// Прогресс separate, 0..=100.
@@ -197,8 +238,9 @@ pub struct WaveformView {
     pub duration_secs: Option<f64>,
     /// `true` — pct оценочный: подпись с тильдой «~NN%».
     pub estimated: bool,
-    /// Пики по колонкам 0.0..=1.0 (seq 03, `wav_envelope`); пусто → fallback-бар.
-    pub peaks: Arc<[f32]>,
+    /// Стерео-огибающая по каналам 0..1 (seq 03, `wav_stereo_envelope`);
+    /// пустая → fallback-бар.
+    pub envelope: Arc<StereoEnvelope>,
 }
 
 /// Панель Details выбранного файла.
@@ -437,35 +479,57 @@ fn pixel_amplitude(peaks: &[f32], px: usize, px_w: usize) -> f32 {
     column_peak(peaks, px, px_w).clamp(0.0, 1.0)
 }
 
-/// Пиксельный след колонки: (верх, низ) симметрично горизонтальной оси
-/// карты; `None` — тишина. Половина высоты следа `ceil(a × рядов/2)`:
-/// даже шёпот даёт видимые точки, максимум занимает все ряды.
-fn trace_span(amplitude: f32, rows_px: usize) -> Option<(usize, usize)> {
+/// Диапазон рядов верхней половины (канал L): от центра вверх на
+/// `ceil(a × полцентра)` рядов; `None` — тишина. Даже шёпот даёт видимую
+/// точку (ceil), максимум занимает всю половину.
+fn up_span(amplitude: f32, rows_px: usize) -> Option<(usize, usize)> {
     let center = rows_px / 2;
     let half = (amplitude.clamp(0.0, 1.0) * center as f32).ceil() as usize;
-    (half > 0).then_some((center - half, center + half - 1))
+    (half > 0).then_some((center - half, center - 1))
 }
 
-/// Вертикальные брайль-следы огибающей для колонок `range` пиксельной сетки.
-/// Растеризация на лету из `peaks` — без промежуточных буферов точек.
+/// Диапазон рядов нижней половины (канал R): от центра вниз — карта «в зеркале».
+fn down_span(amplitude: f32, rows_px: usize) -> Option<(usize, usize)> {
+    let center = rows_px / 2;
+    let half = (amplitude.clamp(0.0, 1.0) * center as f32).ceil() as usize;
+    (half > 0).then_some((center, center + half - 1))
+}
+
+/// Цвет пикселя по амплитуде колонки (fn-pointer: без захватов).
+type ColorOf = fn(f32) -> Color;
+
+/// Серые пики непройденной части (амплитуда на цвет не влияет).
+fn gray_color(_: f32) -> Color {
+    STYLE_WAVE_PEAK
+}
+
+/// Вертикальные следы стерео-огибающей для колонок `range` пиксельной сетки:
+/// L — вверх от центра, R — вниз («в зеркале»); каждый пиксель красится
+/// своим цветом `color_of` от амплитуды колонки (градиент/серый).
 struct EnvelopeTrace<'a> {
-    peaks: &'a [f32],
+    envelope: &'a StereoEnvelope,
     px_w: usize,
     px_h: usize,
     range: Range<usize>,
-    color: Color,
+    color_of: ColorOf,
 }
 
 impl Shape for EnvelopeTrace<'_> {
     fn draw(&self, painter: &mut Painter) {
         for px in self.range.clone() {
-            let Some((top, bottom)) =
-                trace_span(pixel_amplitude(self.peaks, px, self.px_w), self.px_h)
-            else {
-                continue;
-            };
-            for py in top..=bottom {
-                painter.paint(px, py, self.color);
+            let left = pixel_amplitude(&self.envelope.left, px, self.px_w);
+            if let Some((top, bottom)) = up_span(left, self.px_h) {
+                let color = (self.color_of)(left);
+                for py in top..=bottom {
+                    painter.paint(px, py, color);
+                }
+            }
+            let right = pixel_amplitude(&self.envelope.right, px, self.px_w);
+            if let Some((top, bottom)) = down_span(right, self.px_h) {
+                let color = (self.color_of)(right);
+                for py in top..=bottom {
+                    painter.paint(px, py, color);
+                }
             }
         }
     }
@@ -513,6 +577,12 @@ fn header_spans(view: &HeaderView, tr: &StrTable) -> Vec<Span<'static>> {
         // Глобальная загрузка модели: видна только пока идёт (до 100%).
         spans.push(Span::raw(" ─ "));
         spans.push(Span::styled((tr.model_loading)(pct), STYLE_FILL));
+    }
+    // Устройство движка («Считает: RTX 4090» / «cpu»): пока драйвер не
+    // сообщил — слота нет, GPU-виджет остаётся прежним.
+    if let Some(name) = &view.compute_device {
+        spans.push(Span::raw(" ─ "));
+        spans.push(Span::styled((tr.computing_on)(name), STYLE_FILL));
     }
     spans.push(Span::raw(" ─ "));
     spans.extend(gpu_spans(view.gpu.as_ref(), tr));
@@ -732,13 +802,14 @@ fn render_details_empty(frame: &mut Frame, area: Rect, tr: &StrTable) {
     frame.render_widget(Paragraph::new(hint), inner);
 }
 
-/// Waveform-прогресс: подпись, брайль-карта огибающей (Canvas 2–3 строки),
-/// метки времени. Без пиков или в тесную высоту — прежний fallback.
+/// Waveform-прогресс: подпись, брайль-карта стерео-огибающей (Canvas от 2
+/// до 12 рядов — сколько даёт зона), метки времени. Без огибающей или в
+/// тесную высоту — прежний fallback.
 pub fn render_waveform(frame: &mut Frame, area: Rect, view: &WaveformView, tr: &StrTable) {
     if area.is_empty() {
         return;
     }
-    if !view.peaks.is_empty() {
+    if !view.envelope.left.is_empty() {
         if let Some((canvas, label, labels)) = wave_areas(area, view.duration_secs.is_some()) {
             frame.render_widget(envelope_canvas(view, canvas), canvas);
             frame.render_widget(Paragraph::new(waveform_label_line(view, tr)), label);
@@ -755,9 +826,9 @@ pub fn render_waveform(frame: &mut Frame, area: Rect, view: &WaveformView, tr: &
     render_waveform_fallback(frame, area, view, tr);
 }
 
-/// Разметка виджета: брайль-карта (2–3 ряда), под ней подпись, ниже метки
-/// времени, когда влезают; `None` — на карту даже минимума высоты нет
-/// (fallback).
+/// Разметка виджета: брайль-карта (от [`WAVE_CANVAS_ROWS_MIN`] до
+/// [`WAVE_CANVAS_ROWS_MAX`] рядов), под ней подпись, ниже метки времени,
+/// когда влезают; `None` — на карту даже минимума высоты нет (fallback).
 fn wave_areas(area: Rect, with_labels: bool) -> Option<(Rect, Rect, Option<Rect>)> {
     if area.height < WAVE_CANVAS_ROWS_MIN + 1 {
         return None;
@@ -773,24 +844,36 @@ fn wave_areas(area: Rect, with_labels: bool) -> Option<(Rect, Rect, Option<Rect>
     Some((rows[0], rows[1], labels.then_some(rows[2])))
 }
 
-/// Брайль-канвас: серые пики всей карты, поверх — цветная заливка пройденной
-/// части. Один слой: ячейка брайля хранит один цвет, порядок отрисовки
-/// (серые → цвет) красит граничную ячейку заливкой — граница с точностью
-/// пиксельной колонки.
+/// Брайль-канвас: серые пики всей карты, поверх — пройденная часть
+/// градиентом по амплитуде пикселя. Один слой: ячейка брайля хранит один
+/// цвет, порядок отрисовки (серые → цвет) красит граничную ячейку заливкой
+/// — граница с точностью пиксельной колонки.
 fn envelope_canvas<'a>(view: &'a WaveformView, area: Rect) -> impl Widget + 'a {
     let px_w = usize::from(area.width) * BRAILLE_PX.0;
     let px_h = usize::from(area.height) * BRAILLE_PX.1;
     let fill = fill_columns(view.pct, px_w);
-    let peaks: &[f32] = &view.peaks;
+    let envelope: &StereoEnvelope = &view.envelope;
     Canvas::default()
         .marker(Marker::Braille)
         .x_bounds([0.0, px_w.saturating_sub(1) as f64])
         .y_bounds([0.0, px_h.saturating_sub(1) as f64])
         .paint(move |ctx| {
-            let gray = EnvelopeTrace { peaks, px_w, px_h, range: fill..px_w, color: STYLE_WAVE_PEAK };
-            let fill = EnvelopeTrace { peaks, px_w, px_h, range: 0..fill, color: STYLE_WAVE_FILL };
+            let gray = EnvelopeTrace {
+                envelope,
+                px_w,
+                px_h,
+                range: fill..px_w,
+                color_of: gray_color,
+            };
+            let passed = EnvelopeTrace {
+                envelope,
+                px_w,
+                px_h,
+                range: 0..fill,
+                color_of: amplitude_color,
+            };
             ctx.draw(&gray);
-            ctx.draw(&fill);
+            ctx.draw(&passed);
         })
 }
 
@@ -1177,9 +1260,10 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 // --- композиция кадра и карта для мыши ------------------------------------------
 
-/// Полный кадр: шапка → табы → статус-строка → контент активного таба → footer.
+/// Полный кадр: шапка → табы → статус-зона → контент активного таба → footer.
 pub fn render_screen(frame: &mut Frame, area: Rect, view: &ScreenView, tr: &StrTable) {
-    let zones = compute_zones(area, status_zone_height(view.current.is_some()));
+    let status_height = status_zone_height(view.current.is_some(), area.height);
+    let zones = compute_zones(area, status_height);
     render_header(frame, zones.header, &view.header, tr);
     render_tab_bar(frame, zones.tabs, view.tab, tr);
     render_status_line(frame, zones.status, view.banner.as_deref(), view.current.as_ref(), tr);
@@ -1207,8 +1291,9 @@ fn render_files_tab(frame: &mut Frame, zones: ScreenZones, view: &ScreenView, tr
 }
 
 /// Статус-зона: баннер отмены (приоритет, вся зона) либо индикатор текущего
-/// файла — строка «спиннер ▶ имя ─ стадия ─ бар NN%» + брайль-карта огибающей
-/// на всю ширину с подписью (зона 4 ряда, см. [`status_zone_height`]).
+/// файла — строка «спиннер ▶ имя ─ стадия ─ бар NN%» + крупная брайль-карта
+/// стерео-огибающей на всю ширину с подписью (высота зоны — clamp(40%
+/// экрана, 6, 14), см. [`status_zone_height`]).
 fn render_status_line(
     frame: &mut Frame,
     area: Rect,
@@ -1257,18 +1342,20 @@ pub fn files_table_area(content: Rect, has_details: bool) -> Rect {
     content_split(content, has_details).0
 }
 
-/// Высота статус-зоны: с индикатором текущего файла — индикатор + карта +
-/// подпись ([`STATUS_TALL_ROWS`]); иначе одна строка (баннер/пусто).
-/// Значение общее для рендера и карты кликов мыши.
-pub fn status_zone_height(has_current: bool) -> u16 {
-    if has_current {
-        STATUS_TALL_ROWS
-    } else {
-        1
+/// Высота статус-зоны: без текущего файла — одна строка (баннер/пусто);
+/// с индикатором — КРУПНАЯ карта: clamp(40% высоты экрана, 6, 14) текстовых
+/// рядов (решение владельца 2026-10-14). Значение общее для рендера и карты
+/// кликов мыши — расхождений зон нет.
+pub fn status_zone_height(has_current: bool, screen_height: u16) -> u16 {
+    if !has_current {
+        return 1;
     }
+    let share = (f64::from(screen_height) * STATUS_ZONE_SHARE).round() as u16;
+    share.clamp(STATUS_ZONE_MIN_ROWS, STATUS_ZONE_MAX_ROWS)
 }
 
-/// Зоны кадра: шапка 3, табы 1, статус-зона (1 или 4), контент Min(1), footer 1.
+/// Зоны кадра: шапка 3, табы 1, статус-зона (1 или крупная карта, см.
+/// [`status_zone_height`]), контент Min(1), footer 1.
 pub fn compute_zones(area: Rect, status_height: u16) -> ScreenZones {
     let rows = Layout::vertical([
         Constraint::Length(3),
@@ -1403,25 +1490,80 @@ mod tests {
     }
 
     #[test]
-    fn trace_span_silence_is_empty() {
-        assert_eq!(trace_span(0.0, 8), None, "тишина — точек нет");
-        assert_eq!(trace_span(-0.5, 12), None, "отрицательное клампится в 0");
+    fn wave_span_silence_is_empty() {
+        assert_eq!(up_span(0.0, 8), None, "тишина — точек нет");
+        assert_eq!(down_span(0.0, 8), None);
+        assert_eq!(up_span(-0.5, 12), None, "отрицательное клампится в 0");
     }
 
     #[test]
-    fn trace_span_full_peak_covers_all_rows() {
-        assert_eq!(trace_span(1.0, 8), Some((0, 7)), "полная амплитуда — все ряды");
-        assert_eq!(trace_span(1.5, 12), Some((0, 11)), "клампится в 1.0");
+    fn wave_span_full_peak_fills_its_half() {
+        // Полная амплитуда: L занимает верхнюю половину, R — нижнюю.
+        assert_eq!(up_span(1.0, 8), Some((0, 3)));
+        assert_eq!(down_span(1.0, 8), Some((4, 7)));
+        // Клампинг выше 1.0.
+        assert_eq!(up_span(1.5, 12), Some((0, 5)));
+        assert_eq!(down_span(1.5, 12), Some((6, 11)));
     }
 
     #[test]
-    fn trace_span_is_symmetric_around_midline() {
-        // Половина амплитуды: центр 4 из 8 → ряды 2..=5 (симметрично оси 3.5).
-        assert_eq!(trace_span(0.5, 8), Some((2, 5)));
-        // 12 рядов: центр 6 → 3..=8.
-        assert_eq!(trace_span(0.5, 12), Some((3, 8)));
-        // Шёпот: ceil даёт видимый след из одной пары точек вокруг оси.
-        assert_eq!(trace_span(0.01, 8), Some((3, 4)));
+    fn wave_span_half_amplitude_is_symmetric_mirror() {
+        // Половина амплитуды: центр 4 из 8 → L ряды 2..=3, R ряды 4..=5.
+        assert_eq!(up_span(0.5, 8), Some((2, 3)));
+        assert_eq!(down_span(0.5, 8), Some((4, 5)));
+        // 12 рядов: центр 6 → L 3..=5, R 6..=8.
+        assert_eq!(up_span(0.5, 12), Some((3, 5)));
+        assert_eq!(down_span(0.5, 12), Some((6, 8)));
+        // Шёпот: ceil даёт видимые точки вокруг оси (L над центром, R под).
+        assert_eq!(up_span(0.01, 8), Some((3, 3)));
+        assert_eq!(down_span(0.01, 8), Some((4, 4)));
+    }
+
+    // --- градиент амплитуды (пройденная часть карты) ---
+
+    #[test]
+    fn gradient_endpoints_green_and_red() {
+        assert_eq!(amplitude_color(0.0), Color::Rgb(0x00, 0xC0, 0x00));
+        assert_eq!(amplitude_color(1.0), Color::Rgb(0xC0, 0x00, 0x00));
+    }
+
+    #[test]
+    fn gradient_midpoint_is_yellow() {
+        assert_eq!(amplitude_color(0.5), Color::Rgb(0xC0, 0xC0, 0x00));
+    }
+
+    #[test]
+    fn gradient_interpolates_between_stops() {
+        // 0.25 — середина зелёно-жёлтого сегмента: красный канал на полпути.
+        assert_eq!(amplitude_color(0.25), Color::Rgb(0x60, 0xC0, 0x00));
+        // 0.75 — середина жёлто-красного: зелёный канал на полпути вниз.
+        assert_eq!(amplitude_color(0.75), Color::Rgb(0xC0, 0x60, 0x00));
+    }
+
+    #[test]
+    fn gradient_clamps_out_of_range() {
+        assert_eq!(amplitude_color(-0.5), amplitude_color(0.0));
+        assert_eq!(amplitude_color(1.5), amplitude_color(1.0));
+    }
+
+    #[test]
+    fn gradient_is_monotonic_in_red_channel() {
+        let red = |a: f32| match amplitude_color(a) {
+            Color::Rgb(r, _, _) => r,
+            _ => panic!("градиент должен давать Rgb"),
+        };
+        let mut prev = 0_u8;
+        for step in 1..=10_u32 {
+            let r = red(step as f32 / 10.0);
+            assert!(r >= prev, "красный канал растёт с амплитудой: {r} < {prev}");
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn gray_color_ignores_amplitude() {
+        assert_eq!(gray_color(0.0), Color::DarkGray);
+        assert_eq!(gray_color(1.0), Color::DarkGray);
     }
 
     #[test]
@@ -1526,10 +1668,18 @@ mod tests {
 
     #[test]
     fn zones_grow_status_zone_for_current_file() {
-        let zones = compute_zones(Rect::new(0, 0, 80, 24), status_zone_height(true));
-        assert_eq!(zones.status, Rect::new(0, 4, 80, 4), "индикатор + карта + подпись");
-        assert_eq!(zones.content, Rect::new(0, 8, 80, 15), "контент ужался, но жив");
-        assert_eq!(status_zone_height(false), 1, "без текущего файла — одна строка");
+        let zones = compute_zones(Rect::new(0, 0, 80, 24), status_zone_height(true, 24));
+        assert_eq!(zones.status, Rect::new(0, 4, 80, 10), "крупная карта: 40% от 24 → 10 рядов");
+        assert_eq!(zones.content, Rect::new(0, 14, 80, 9), "контент ужался, но жив");
+        assert_eq!(status_zone_height(false, 24), 1, "без текущего файла — одна строка");
+    }
+
+    #[test]
+    fn status_zone_height_clamps_share_of_screen() {
+        assert_eq!(status_zone_height(true, 24), 10, "40% от 24 → 10");
+        assert_eq!(status_zone_height(true, 30), 12, "40% от 30 → 12");
+        assert_eq!(status_zone_height(true, 40), 14, "40% от 40 = 16 → cap 14");
+        assert_eq!(status_zone_height(true, 10), 6, "40% от 10 = 4 → floor 6");
     }
 
     // --- инфографика: таймеры/ETA/анимация (багфикс-волна G) ---
@@ -1651,7 +1801,7 @@ mod tests {
                 pct: 50.0,
                 duration_secs: None,
                 estimated: false,
-                peaks: flat_peaks(80, 0.75),
+                envelope: flat_envelope(80, 0.75),
             },
         };
         // Зона 4 ряда: строка индикатора + карта 2 ряда + подпись.
@@ -1659,8 +1809,10 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("▶ a.wav"), "индикатор в первой строке: {text}");
         assert!(text.contains("50%"), "подпись под картой: {text}");
-        // Карта — брайль-точки на всю ширину; заливка слева, серые пики справа.
-        assert_eq!(fg_at(&terminal, 5, 2), Color::Green);
+        // Карта — брайль-точки на всю ширину; пройденная часть слева —
+        // градиент по амплитуде (0.75 → середина жёлто-красного), справа
+        // серые пики.
+        assert_eq!(fg_at(&terminal, 5, 2), MID_PEAK_COLOR);
         assert_eq!(fg_at(&terminal, 75, 2), Color::DarkGray);
     }
 
@@ -1693,14 +1845,14 @@ mod tests {
                 pct: 50.0,
                 duration_secs: None,
                 estimated: false,
-                peaks: flat_peaks(80, 0.75),
+                envelope: flat_envelope(80, 0.75),
             },
         };
         let terminal = render_frame(80, 4, |f, a| {
             render_status_line(f, a, Some("Прерывание…"), Some(&current), tr())
         });
         assert!(buffer_text(&terminal).contains("Прерывание…"));
-        assert_ne!(fg_at(&terminal, 5, 2), Color::Green, "карта скрыта под баннером");
+        assert_ne!(fg_at(&terminal, 5, 2), MID_PEAK_COLOR, "карта скрыта под баннером");
     }
 
     #[test]
@@ -1729,8 +1881,32 @@ mod tests {
             remote_dir: "/recordings".into(),
             model: "sw".into(),
             gpu: None,
+            compute_device: None,
             model_pct: None,
         }
+    }
+
+    #[test]
+    fn header_shows_computing_device_when_known() {
+        let mut view = header_view();
+        view.compute_device = Some("NVIDIA GeForce RTX 4090".into());
+
+        let text = buffer_text(&render_frame(140, 3, |f, a| render_header(f, a, &view, tr())));
+        assert!(text.contains("Считает: NVIDIA GeForce RTX 4090"), "ru: {text}");
+        assert!(text.contains("GPU"), "GPU-виджет не вытесняется слотом устройства");
+
+        let en = i18n::tr(Lang::En);
+        let text = buffer_text(&render_frame(140, 3, |f, a| render_header(f, a, &view, en)));
+        assert!(text.contains("Compute: NVIDIA GeForce RTX 4090"), "en: {text}");
+        assert!(!text.contains("Считает:"), "ru-строка ушла: {text}");
+    }
+
+    #[test]
+    fn header_without_device_keeps_gpu_na_slot() {
+        let view = header_view();
+        let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &view, tr())));
+        assert!(text.contains("GPU: n/a"), "прежнее поведение до события device: {text}");
+        assert!(!text.contains("Считает:"), "слот устройства скрыт, пока неизвестно");
     }
 
     fn file_row_view(badge: FileBadge, name: &str, pct: f64, stems: Option<u8>) -> FileRowView {
@@ -1746,10 +1922,16 @@ mod tests {
         }
     }
 
-    /// Синтетическая огибающая: все колонки одинаковые — детерминированный golden.
-    fn flat_peaks(columns: usize, peak: f32) -> Arc<[f32]> {
-        Arc::from(vec![peak; columns])
+    /// Плоская стерео-огибающая: все колонки обоих каналов одинаковые —
+    /// детерминированный golden. Цвет пройденной части при `peak = 0.75` —
+    /// середина жёлто-красного сегмента градиента.
+    fn flat_envelope(columns: usize, peak: f32) -> Arc<StereoEnvelope> {
+        Arc::new(StereoEnvelope { left: vec![peak; columns], right: vec![peak; columns] })
     }
+
+    /// Цвет пройденной части карты при амплитуде 0.75 (t=0.5 в жёлто-красном
+    /// сегменте [`AMPLITUDE_GRADIENT`]).
+    const MID_PEAK_COLOR: Color = Color::Rgb(0xC0, 0x60, 0x00);
 
     #[test]
     fn header_renders_connection_model_and_gpu_placeholder() {
@@ -1880,36 +2062,36 @@ mod tests {
 
     #[test]
     fn waveform_at_zero_percent_all_dim() {
-        let view = WaveformView { pct: 0.0, duration_secs: Some(120.0), estimated: false, peaks: flat_peaks(80, 0.75) };
+        let view = WaveformView { pct: 0.0, duration_secs: Some(120.0), estimated: false, envelope: flat_envelope(80, 0.75) };
         let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("0% · обработано 00:00 · осталось 02:00"));
-        // Ни одной залитой колонки на рядах карты (y=1..3).
-        for y in 1..4 {
-            assert_ne!(fg_at(&terminal, 0, y), Color::Green);
-            assert_ne!(fg_at(&terminal, 79, y), Color::Green);
+        // Ни одной окрашенной колонки на рядах карты (y=0..2): только серые пики.
+        for y in 0..3 {
+            assert_eq!(fg_at(&terminal, 0, y), Color::DarkGray);
+            assert_eq!(fg_at(&terminal, 79, y), Color::DarkGray);
         }
     }
 
     #[test]
     fn waveform_at_fifty_percent_boundary_on_column() {
-        let view = WaveformView { pct: 50.0, duration_secs: Some(120.0), estimated: false, peaks: flat_peaks(80, 0.75) };
+        let view = WaveformView { pct: 50.0, duration_secs: Some(120.0), estimated: false, envelope: flat_envelope(80, 0.75) };
         let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         assert!(buffer_text(&terminal).contains("50% · обработано 01:00 · осталось 01:00"));
         // Граница заливки в пикселях канваса (2 px на колонку): 40 колонок
-        // залиты, 41-я — серая.
-        assert_eq!(fg_at(&terminal, 39, 2), Color::Green);
+        // окрашены градиентом (амплитуда 0.75), 41-я — серая.
+        assert_eq!(fg_at(&terminal, 39, 2), MID_PEAK_COLOR);
         assert_eq!(fg_at(&terminal, 40, 2), Color::DarkGray);
     }
 
     #[test]
     fn waveform_at_hundred_percent_all_bright() {
-        let view = WaveformView { pct: 100.0, duration_secs: Some(120.0), estimated: false, peaks: flat_peaks(80, 0.75) };
+        let view = WaveformView { pct: 100.0, duration_secs: Some(120.0), estimated: false, envelope: flat_envelope(80, 0.75) };
         let terminal = render_frame(80, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("100% · обработано 02:00 · осталось 00:00"));
-        assert_eq!(fg_at(&terminal, 0, 2), Color::Green);
-        assert_eq!(fg_at(&terminal, 79, 2), Color::Green);
+        assert_eq!(fg_at(&terminal, 0, 2), MID_PEAK_COLOR);
+        assert_eq!(fg_at(&terminal, 79, 2), MID_PEAK_COLOR);
         assert!(text.contains("00:00"));
         assert!(text.contains("02:00"));
     }
@@ -1919,7 +2101,7 @@ mod tests {
         // Карта — брайль-символы: полная амплитуда в средней строке канваса
         // закрашивает все 2×4 точки ячейки → «⣿»; в ячейку колонки попадают
         // обе пиксельные колонки (2× разрешение по горизонтали).
-        let view = WaveformView { pct: 0.0, duration_secs: None, estimated: false, peaks: flat_peaks(80, 1.0) };
+        let view = WaveformView { pct: 0.0, duration_secs: None, estimated: false, envelope: flat_envelope(80, 1.0) };
         let terminal = render_frame(80, 4, |f, area| render_waveform(f, area, &view, tr()));
         let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         assert_eq!(symbol_at(0, 2), "⣿", "полный след — все точки ячейки");
@@ -1930,20 +2112,49 @@ mod tests {
     #[test]
     fn waveform_silence_renders_no_dots() {
         // Тихие колонки дают пустую ячейку (след симметрично сжат в точку).
-        let view = WaveformView { pct: 0.0, duration_secs: None, estimated: false, peaks: flat_peaks(80, 0.0) };
+        let view = WaveformView { pct: 0.0, duration_secs: None, estimated: false, envelope: flat_envelope(80, 0.0) };
         let terminal = render_frame(80, 4, |f, area| render_waveform(f, area, &view, tr()));
         let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         assert_eq!(symbol_at(0, 2), " ", "тишина — точек нет");
         assert!(buffer_text(&terminal).contains("0%"));
     }
 
+    /// Карта «в зеркале»: L растёт вверх от центра, R — вниз; цвет
+    /// пройденной части — градиент по амплитуде пикселя.
+    #[test]
+    fn mirror_map_draws_left_up_and_right_down() {
+        let loud_left = WaveformView {
+            pct: 100.0,
+            duration_secs: None,
+            estimated: false,
+            envelope: Arc::new(StereoEnvelope { left: vec![1.0; 80], right: vec![0.0; 80] }),
+        };
+        let terminal = render_frame(80, 4, |f, area| render_waveform(f, area, &loud_left, tr()));
+        let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
+        assert_ne!(symbol_at(0, 0), " ", "верх карты — канал L");
+        assert_eq!(symbol_at(0, 2), " ", "низ карты пуст: R тише");
+        assert_eq!(fg_at(&terminal, 0, 0), amplitude_color(1.0), "пройденное — градиент");
+
+        let loud_right = WaveformView {
+            pct: 0.0,
+            duration_secs: None,
+            estimated: false,
+            envelope: Arc::new(StereoEnvelope { left: vec![0.0; 80], right: vec![1.0; 80] }),
+        };
+        let terminal = render_frame(80, 4, |f, area| render_waveform(f, area, &loud_right, tr()));
+        let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
+        assert_eq!(symbol_at(0, 0), " ", "верх пуст: L тише");
+        assert_ne!(symbol_at(0, 2), " ", "низ карты — канал R");
+        assert_eq!(fg_at(&terminal, 0, 2), Color::DarkGray, "серые пики вне pct");
+    }
+
     #[test]
     fn waveform_label_marks_estimated_with_tilde() {
-        let estimated = WaveformView { pct: 42.0, duration_secs: None, estimated: true, peaks: Vec::new().into() };
+        let estimated = WaveformView { pct: 42.0, duration_secs: None, estimated: true, envelope: Arc::default() };
         let terminal = render_frame(40, 2, |f, area| render_waveform(f, area, &estimated, tr()));
         assert!(buffer_text(&terminal).contains("~42%"));
 
-        let real = WaveformView { pct: 42.0, duration_secs: None, estimated: false, peaks: Vec::new().into() };
+        let real = WaveformView { pct: 42.0, duration_secs: None, estimated: false, envelope: Arc::default() };
         let text = buffer_text(&render_frame(40, 2, |f, area| render_waveform(f, area, &real, tr())));
         assert!(text.contains("42%"), "фактический — без тильды: {text}");
         assert!(!text.contains('~'), "никаких тильд у фактического: {text}");
@@ -1953,17 +2164,17 @@ mod tests {
     fn waveform_narrow_height_degrades_to_two_canvas_rows() {
         // 3 ряда: карта 2 ряда (8 пиксельных) + подпись под ней; метки времени
         // уходят первыми.
-        let view = WaveformView { pct: 50.0, duration_secs: Some(120.0), estimated: false, peaks: flat_peaks(40, 0.75) };
+        let view = WaveformView { pct: 50.0, duration_secs: Some(120.0), estimated: false, envelope: flat_envelope(40, 0.75) };
         let terminal = render_frame(40, 3, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("50% ·"), "подпись под картой: {text}");
-        assert_eq!(fg_at(&terminal, 5, 1), Color::Green, "карта жива: залитые колонки");
+        assert_eq!(fg_at(&terminal, 5, 1), MID_PEAK_COLOR, "карта жива: окрашенные колонки");
         assert!(!text.contains("00:00"), "метки времени не влезли — скрыты");
     }
 
     #[test]
     fn waveform_falls_back_to_plain_bar_without_peaks() {
-        let view = WaveformView { pct: 40.0, duration_secs: Some(120.0), estimated: false, peaks: Vec::new().into() };
+        let view = WaveformView { pct: 40.0, duration_secs: Some(120.0), estimated: false, envelope: Arc::default() };
         let terminal = render_frame(40, 5, |f, area| render_waveform(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains('█'));
@@ -1973,7 +2184,7 @@ mod tests {
 
     #[test]
     fn waveform_too_short_area_falls_back_without_panic() {
-        let view = WaveformView { pct: 50.0, duration_secs: None, estimated: false, peaks: flat_peaks(40, 0.75) };
+        let view = WaveformView { pct: 50.0, duration_secs: None, estimated: false, envelope: flat_envelope(40, 0.75) };
         render_frame(40, 1, |f, area| render_waveform(f, area, &view, tr()));
         render_frame(0, 0, |f, area| render_waveform(f, area, &view, tr()));
     }
@@ -2082,7 +2293,7 @@ mod tests {
                 pct: 50.0,
                 duration_secs: Some(120.0),
                 estimated: false,
-                peaks: flat_peaks(34, 0.6),
+                envelope: flat_envelope(34, 0.6),
             },
         };
         let view = screen_view(files.into(), Some(details));
@@ -2108,16 +2319,78 @@ mod tests {
                 pct: 50.0,
                 duration_secs: None,
                 estimated: false,
-                peaks: flat_peaks(80, 0.75),
+                envelope: flat_envelope(80, 0.75),
             },
         });
         let terminal = render_frame(80, 24, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("▶ a.wav"), "индикатор текущего файла: {text}");
         assert!(text.contains("50%"), "подпись карты в статус-зоне: {text}");
-        // Карта на всю ширину: слева заливка, справа серые пики.
-        assert_eq!(fg_at(&terminal, 5, 6), Color::Green);
+        // Карта на всю ширину: слева градиент по амплитуде, справа серые пики.
+        assert_eq!(fg_at(&terminal, 5, 6), MID_PEAK_COLOR);
         assert_eq!(fg_at(&terminal, 75, 6), Color::DarkGray);
+    }
+
+    /// Мин-гейт 80×24: крупная карта статус-зоны (10 рядов) — канвас реально
+    /// высокий, таблица FILES под ним жива.
+    #[test]
+    fn screen_running_map_is_tall_on_min_terminal() {
+        let files = [file_row_view(FileBadge::Run, "a.wav", 50.0, Some(3))];
+        let mut view = screen_view(files.into(), None);
+        view.current = Some(CurrentFileView {
+            name: "a.wav".into(),
+            stage: "separate".into(),
+            pct: Some(50.0),
+            estimated: false,
+            phase: 0,
+            stage_elapsed: 3.0,
+            waveform: WaveformView {
+                pct: 50.0,
+                duration_secs: None,
+                estimated: false,
+                envelope: flat_envelope(80, 1.0),
+            },
+        });
+        let terminal = render_frame(80, 24, |f, area| render_screen(f, area, &view, tr()));
+        let text = buffer_text(&terminal);
+        let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
+        assert!(text.contains("ФАЙЛЫ"), "таблица FILES жива: {text}");
+        assert!(text.contains("a.wav"), "строка файла на месте: {text}");
+        assert_eq!(symbol_at(5, 5), "⣿", "карта начинается сразу под индикатором");
+        assert_eq!(symbol_at(5, 11), "⣿", "карта высокая — рисует в нижних рядах зоны");
+        assert!(text.contains("50%"), "подпись под картой: {text}");
+    }
+
+    /// Большой терминал 80×40 (golden): статус-зона 14 рядов (cap), карта
+    /// реально высокая (12 рядов канваса = 48 пиксельных), FILES жива.
+    #[test]
+    fn screen_running_map_is_tall_on_big_terminal() {
+        let files = [file_row_view(FileBadge::Run, "a.wav", 50.0, Some(3))];
+        let mut view = screen_view(files.into(), None);
+        view.current = Some(CurrentFileView {
+            name: "a.wav".into(),
+            stage: "separate".into(),
+            pct: Some(50.0),
+            estimated: false,
+            phase: 0,
+            stage_elapsed: 3.0,
+            waveform: WaveformView {
+                pct: 50.0,
+                duration_secs: None,
+                estimated: false,
+                envelope: flat_envelope(80, 1.0),
+            },
+        });
+        let terminal = render_frame(80, 40, |f, area| render_screen(f, area, &view, tr()));
+        let text = buffer_text(&terminal);
+        let symbol_at = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
+        assert_eq!(status_zone_height(true, 40), 14, "40% от 40 → cap 14");
+        assert!(text.contains("ФАЙЛЫ"), "таблица FILES жива: {text}");
+        assert!(text.contains("a.wav"), "строка файла на месте: {text}");
+        assert_eq!(symbol_at(5, 5), "⣿", "верх карты");
+        assert_eq!(symbol_at(5, 15), "⣿", "карта реально высокая (12 рядов канваса)");
+        assert_ne!(symbol_at(5, 17), "⣿", "ниже карты — подпись, не канвас");
+        assert!(text.contains("50%"), "подпись под картой: {text}");
     }
 
     #[test]

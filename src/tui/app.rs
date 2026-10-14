@@ -14,6 +14,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::Model;
+use crate::envelope::StereoEnvelope;
 use crate::pipeline::{FileStatus, EXPECTED_STEM_COUNT};
 use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
 use crate::tui::gpu::{GpuEvent, GpuInfo};
@@ -93,8 +94,8 @@ pub struct FileView {
     /// `true` — pct оценочный (драйвер не знает реальный прогресс separate),
     /// UI помечает такой процент тильдой «~NN%».
     pub estimated: bool,
-    /// Полная огибающая пиков (после download; ровно 1 раз на файл).
-    pub peaks: Option<Arc<[f32]>>,
+    /// Полная стерео-огибающая пиков (после download; ровно 1 раз на файл).
+    pub envelope: Option<Arc<StereoEnvelope>>,
     /// Терминальный исход (Ok/Failed/Duplicate/Skipped).
     pub outcome: Option<FileOutcome>,
     /// Готовых стемов (факт от драйвера); `None` — счётчик неизвестен:
@@ -458,6 +459,9 @@ pub struct App {
     pending_start: Option<RunSpec>,
     /// Снимок GPU-поллера для шапки.
     gpu: Option<GpuView>,
+    /// Имя вычислительного устройства движка (событие `device` драйвера):
+    /// шапка показывает «Считает: <name>»; пока не пришло — `None`.
+    gpu_device_name: Option<String>,
     /// История утилизации GPU (%) для спарклайна в шапке (btop-стиль).
     gpu_history: VecDeque<u8>,
     /// Активный таб нижней навигации.
@@ -645,6 +649,11 @@ impl App {
         self.gpu.as_ref()
     }
 
+    /// Имя вычислительного устройства движка (`None` — драйвер ещё не сообщил).
+    pub fn gpu_device_name(&self) -> Option<&str> {
+        self.gpu_device_name.as_deref()
+    }
+
     /// Активный таб (для рендера и кликов по строке табов).
     pub fn active_tab(&self) -> Tab {
         self.active_tab
@@ -717,6 +726,8 @@ impl App {
             AppEvent::ModelProgress { pct } => {
                 self.model_pct = if *pct >= 100.0 { None } else { Some(*pct) };
             }
+            // Устройство движка (после загрузки модели) — для шапки.
+            AppEvent::Device { name } => self.gpu_device_name = Some(name.clone()),
             // Живой счётчик стемов (список пришёл от драйвера).
             AppEvent::FileStems { name, count } => {
                 self.update_file(name, |file| file.stems_done = Some(*count));
@@ -747,7 +758,7 @@ impl App {
             // event loop (`log_event`).
             AppEvent::EngineLog { .. } => {}
             AppEvent::BatchFinished { outcome } => self.on_batch_finished(outcome),
-            AppEvent::Envelope { path, peaks } => self.on_envelope(path, peaks.clone()),
+            AppEvent::Envelope { path, envelope } => self.on_envelope(path, envelope.clone()),
             // Тик двигает анимации; Resize/Ignored на автомат не влияют.
             AppEvent::Tick => self.tick_count += 1,
             AppEvent::Resize { .. } | AppEvent::Ignored => {}
@@ -1020,6 +1031,8 @@ impl App {
         self.paste_prefill = None;
         self.run_started_at = Some(Instant::now());
         self.tick_count = 0;
+        // Устройство движка нового прогона придёт своим событием device.
+        self.gpu_device_name = None;
         // Пустой план — не «тихое отработало»: явная подсказка в журнале.
         if plan.is_empty() {
             let hint = tr(self.lang).empty_plan_hint;
@@ -1063,13 +1076,13 @@ impl App {
 
     /// Огибающая принимается только для известного файла без терминального
     /// исхода (отмена при FAIL/SKIP/DUP — данные уже не нужны виджету).
-    fn on_envelope(&mut self, path: &Path, peaks: Arc<[f32]>) {
+    fn on_envelope(&mut self, path: &Path, envelope: Arc<StereoEnvelope>) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return;
         };
         self.update_file(name, |file| {
             if file.outcome.is_none() {
-                file.peaks = Some(peaks.clone());
+                file.envelope = Some(envelope.clone());
             }
         });
     }
@@ -1707,14 +1720,15 @@ mod tests {
     fn envelope_stored_for_running_file() {
         let mut app = App::new();
         start_run(&mut app);
-        let peaks: Arc<[f32]> = Arc::from(vec![0.5, 0.25]);
+        let envelope = Arc::new(StereoEnvelope { left: vec![0.5], right: vec![0.25] });
+        let expected = envelope.clone();
 
         app.handle(&AppEvent::Envelope {
             path: PathBuf::from("/work/local/a.wav"),
-            peaks: peaks.clone(),
+            envelope,
         });
 
-        assert_eq!(app.files()[0].peaks, Some(peaks));
+        assert_eq!(app.files()[0].envelope, Some(expected));
     }
 
     #[test]
@@ -1722,11 +1736,11 @@ mod tests {
         let mut app = App::new();
         start_run(&mut app);
         app.handle(&AppEvent::FileFailed { name: "a.wav".into(), error: "boom".into() });
-        let peaks: Arc<[f32]> = Arc::from(vec![0.5]);
+        let envelope = Arc::new(StereoEnvelope { left: vec![0.5], right: vec![0.5] });
 
-        app.handle(&AppEvent::Envelope { path: PathBuf::from("/work/a.wav"), peaks });
+        app.handle(&AppEvent::Envelope { path: PathBuf::from("/work/a.wav"), envelope });
 
-        assert_eq!(app.files()[0].peaks, None, "FAIL отменяет приём огибающей");
+        assert_eq!(app.files()[0].envelope, None, "FAIL отменяет приём огибающей");
     }
 
     #[test]
@@ -1734,9 +1748,45 @@ mod tests {
         let mut app = App::new();
         start_run(&mut app);
 
-        app.handle(&AppEvent::Envelope { path: PathBuf::from("/work/ghost.wav"), peaks: Arc::from(vec![0.5]) });
+        let envelope = Arc::new(StereoEnvelope { left: vec![0.5], right: vec![0.5] });
+        app.handle(&AppEvent::Envelope { path: PathBuf::from("/work/ghost.wav"), envelope });
 
-        assert!(app.files().iter().all(|f| f.peaks.is_none()));
+        assert!(app.files().iter().all(|f| f.envelope.is_none()));
+    }
+
+    // --- устройство движка (шапка «Считает:») -----------------------------------
+
+    #[test]
+    fn device_event_sets_engine_name() {
+        let mut app = App::new();
+        start_run(&mut app);
+
+        app.handle(&AppEvent::Device { name: "NVIDIA GeForce RTX 4090".into() });
+
+        assert_eq!(app.gpu_device_name(), Some("NVIDIA GeForce RTX 4090"));
+    }
+
+    #[test]
+    fn device_name_resets_on_new_run_until_driver_reports() {
+        let mut app = App::new();
+        start_run(&mut app);
+        app.handle(&AppEvent::Device { name: "RTX".into() });
+        app.handle(&AppEvent::BatchFinished { outcome: outcome_fixture() });
+
+        start_run(&mut app);
+
+        assert_eq!(app.gpu_device_name(), None, "новый прогон — старое имя не тянется");
+    }
+
+    #[test]
+    fn device_event_without_name_state_stays_none() {
+        let mut app = App::new();
+
+        app.handle(&AppEvent::RunStarted {
+            plan: PlanSummary { pending: ["a.wav".to_string()].into_iter().collect(), ..Default::default() },
+        });
+
+        assert_eq!(app.gpu_device_name(), None, "до события device шапка без «Считает:»");
     }
 
     // --- итог батча и ошибка прогона -------------------------------------------
