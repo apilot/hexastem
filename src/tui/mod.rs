@@ -60,7 +60,9 @@ use crate::tui::gpu::GpuEvent;
 use crate::tui::i18n::{tr, Lang, StrTable};
 use crate::tui::persist::TuiSettings;
 use crate::tui::runner::{RunnerHandle, RunnerOptions};
-use crate::tui::widgets::{CurrentFileView, FileBadge, FileRowView, FooterView, HeaderView, ScreenView};
+use crate::tui::widgets::{
+    CurrentFileView, FileBadge, FileRowView, FooterView, HeaderView, ScreenView, WaveformView,
+};
 
 use app::{App, FileOutcome, FileView, State};
 
@@ -71,8 +73,9 @@ pub const MIN_HEIGHT: u16 = 24;
 const TICK_MILLIS: u64 = 250;
 /// Формат стемов и расширение для resume-плана (как у CLI по умолчанию).
 const OUTPUT_FORMAT: &str = "flac";
-/// Колонки waveform-огибающей (сжимается под ширину Details при рендере).
-const ENVELOPE_COLUMNS: usize = 48;
+/// Колонки waveform-огибающей: брайль-карта рисует 2 пиксельные колонки на
+/// колонку терминала (160 px при ширине 80) — берём с запасом на широкие экраны.
+const ENVELOPE_COLUMNS: usize = 200;
 /// Кооперативная пауза при включённой паузе (применяется на границе файлов).
 const PAUSE_WHEN_PAUSED: Duration = Duration::from_secs(30);
 
@@ -440,7 +443,9 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
     {
         return;
     }
-    let zones = widgets::compute_zones(area);
+    // Высота статус-зоны та же, что у рендера: с текущим файлом — 4 ряда.
+    let status_height = widgets::status_zone_height(current_file_view(app, tr(app.lang())).is_some());
+    let zones = widgets::compute_zones(area, status_height);
     if covers(zones.tabs, mouse.row) {
         if let Some(tab) = widgets::tab_at(mouse.column, zones.tabs) {
             app.set_tab(tab);
@@ -523,6 +528,7 @@ fn cancel_banner(app: &App, table: &StrTable) -> Option<String> {
 }
 
 /// Индикатор текущего файла: первый файл без терминального исхода в Running.
+/// Наличие индикатора определяет и высоту статус-зоны (рендер и мышь).
 fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
     if app.state() != State::Running {
         return None;
@@ -535,6 +541,13 @@ fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
         estimated: view.estimated,
         phase: app.tick_count(),
         stage_elapsed: view.stage_started.map_or(0.0, |started| started.elapsed().as_secs_f64()),
+        // Огибающая из App по ссылке (Arc-клон, без копирования пиков).
+        waveform: WaveformView {
+            pct: view.pct.unwrap_or(0.0),
+            duration_secs: None,
+            estimated: view.estimated,
+            peaks: view.peaks.clone().unwrap_or_default(),
+        },
     })
 }
 
@@ -1484,8 +1497,9 @@ mod tests {
         let mut app = App::new();
         feed(&mut app, AppEvent::RunStarted { plan: plan_with_three_files() });
 
-        // Контент с y=5 (статус-строка); строка таблицы 0 — с y=7 (рамка+заголовок).
-        handle_mouse(&mut app, click_up(10, 8), SCREEN);
+        // Контент с y=8 (статус-зона 4 ряда в Running); строка таблицы 0 —
+        // с y=10 (рамка+заголовок), клик по y=11 — вторая строка.
+        handle_mouse(&mut app, click_up(10, 11), SCREEN);
 
         assert_eq!(app.selected_index(), 1, "клик по второй строке таблицы");
         assert_eq!(app.selected_file().map(|file| file.name.as_str()), Some("b.wav"));
