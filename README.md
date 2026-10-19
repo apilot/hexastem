@@ -121,7 +121,7 @@ hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
 ### Пример: тестовая шара
 
 ```bash
-SMB_USER=backup SMB_PASS=secret \
+SMB_USER=user SMB_PASS=pass \
 ./target/release/hexastem \
   --host nas.local --share music \
   --remote-dir kirtan/2026-10 \

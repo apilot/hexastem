@@ -117,8 +117,8 @@ mod tests {
         let cases = [
             // Боевой случай: drag&drop папки из файлового менеджера.
             (
-                "/run/user/1000/gvfs/smb-share:server=192.168.1.88,share=public/from_share_BBGS_archive/2024/ZOOM0003",
-                hint("192.168.1.88", "public", "from_share_BBGS_archive/2024/ZOOM0003"),
+                "/run/user/1000/gvfs/smb-share:server=192.0.2.10,share=public/from_archive/2024/ZOOM0003",
+                hint("192.0.2.10", "public", "from_archive/2024/ZOOM0003"),
             ),
             // Корень шары: без rel и с завершающим слэшем.
             ("/run/user/1000/gvfs/smb-share:server=nas.local,share=media", hint("nas.local", "media", "")),
@@ -136,7 +136,7 @@ mod tests {
                 "smb://admin@nas.local:445/media/rec/a b/Привет.wav",
                 hint("nas.local", "media", "rec/a b/Привет.wav"),
             ),
-            ("smb://192.168.1.88/public/from_share/ZOOM0003", hint("192.168.1.88", "public", "from_share/ZOOM0003")),
+            ("smb://192.0.2.10/public/from_share/ZOOM0003", hint("192.0.2.10", "public", "from_share/ZOOM0003")),
             ("smb://nas/media", hint("nas", "media", "")),
             ("smb://NAS/Media/", hint("NAS", "Media", "")),
             ("smb://@host/share", hint("host", "share", "")),
@@ -152,7 +152,7 @@ mod tests {
         let garbage = [
             "",
             "   ",
-            "/mnt/docs/develop/split_audio",
+            "/home/user/recordings",
             "records/ZOOM0003",
             "file:///mnt/x",
             "//nas/share",

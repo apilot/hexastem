@@ -1211,7 +1211,7 @@ mod tests {
     #[test]
     fn global_paste_prefill_applies_smb_hint() {
         let mut app = App::new();
-        let gvfs = "/run/user/1000/gvfs/smb-share:server=192.168.1.88,share=public/from_share/ZOOM0003";
+        let gvfs = "/run/user/1000/gvfs/smb-share:server=192.0.2.10,share=public/from_share/ZOOM0003";
         app.handle(&AppEvent::Paste { text: gvfs.to_string() });
         assert_eq!(app.state(), State::Config, "paste пути открывает попап");
         let dir = app.take_paste_prefill().expect("путь в преффилле");
@@ -1221,7 +1221,7 @@ mod tests {
         app.prefill_remote_dir(&dir);
 
         let cfg = app.config().expect("попап открыт");
-        assert_eq!(cfg.host.as_str(), "192.168.1.88");
+        assert_eq!(cfg.host.as_str(), "192.0.2.10");
         assert_eq!(cfg.share.as_str(), "public");
         assert_eq!(cfg.remote_dir.as_str(), "from_share/ZOOM0003");
         assert!(!cfg.local_mode, "GVFS-путь переключает в SMB-режим");
