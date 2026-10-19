@@ -2,7 +2,7 @@
 """Compatibility launcher: the full driver lives in ../python/separator_driver.py.
 
 This thin entry point exists so the driver can be invoked from the canonical
-orchestrator path audio_split/driver/split_driver.py without duplicating logic.
+orchestrator path hexastem/driver/split_driver.py without duplicating logic.
 """
 
 from __future__ import annotations

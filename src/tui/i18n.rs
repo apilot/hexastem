@@ -9,7 +9,7 @@
 //! файлов/путей, метки модели (`sw`/`6s`), числовые форматы (ETA, GiB).
 //!
 //! Переключение — клавиша `l` (см. `app.rs::on_key_global`), выбор
-//! сохраняется в `~/.config/audio_split/tui.toml` (`persist.rs`).
+//! сохраняется в `~/.config/hexastem/tui.toml` (`persist.rs`).
 
 /// Язык интерфейса. Дефолт — русский (решение владельца).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

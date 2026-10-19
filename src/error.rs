@@ -36,4 +36,8 @@ pub enum AppError {
     /// Некорректная конфигурация прогона.
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    /// Ошибка DSP-модуля нативного движка (формат аудио, математика, границы).
+    #[error("dsp error: {0}")]
+    Dsp(String),
 }

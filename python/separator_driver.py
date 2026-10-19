@@ -41,7 +41,7 @@ from typing import Any, Callable
 DEFAULT_MODEL = "BS-Roformer-SW.ckpt"
 FALLBACK_MODEL = "htdemucs_6s.yaml"
 DEFAULT_OUTPUT_FORMAT = "FLAC"
-# audio_split/.models — persistent model cache (git-ignored)
+# hexastem/.models — persistent model cache (git-ignored)
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / ".models"
 ATTEMPTS_PER_FILE = 2  # 1 try + 1 retry
 # audio-separator не отдаёт прогресс separate: пока работает worker-поток,
@@ -323,7 +323,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path,
                         help="root output dir; stems go to <output-dir>/<file stem>/")
     parser.add_argument("--model-file-dir", type=Path, default=DEFAULT_MODEL_DIR,
-                        help="model cache dir (default: audio_split/.models)")
+                        help="model cache dir (default: hexastem/.models)")
     parser.add_argument("--output-format", default=DEFAULT_OUTPUT_FORMAT,
                         help="stem format: FLAC | WAV | MP3 (default: FLAC)")
     parser.add_argument("--rtf-estimate", type=float, default=DEFAULT_RTF_ESTIMATE,

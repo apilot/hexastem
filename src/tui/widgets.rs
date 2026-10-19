@@ -550,9 +550,9 @@ fn column_peak(peaks: &[f32], col: usize, columns: usize) -> f32 {
 
 // --- рендеры ---------------------------------------------------------------------
 
-/// Шапка: `audio_split ─ //host/share ─ dir ─ модель ─ GPU [бар] mem`.
+/// Шапка: `hexastem ─ //host/share ─ dir ─ модель ─ GPU [бар] mem`.
 pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView, tr: &StrTable) {
-    let block = Block::bordered().border_type(BorderType::Rounded).title(" audio_split ");
+    let block = Block::bordered().border_type(BorderType::Rounded).title(" hexastem ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -565,7 +565,7 @@ pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView, tr: &StrT
 /// Спаны шапки: подключение, директория, модель (+загрузка), GPU-слот.
 fn header_spans(view: &HeaderView, tr: &StrTable) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::styled("audio_split", STYLE_HEADER),
+        Span::styled("hexastem", STYLE_HEADER),
         Span::raw(" ─ "),
         Span::styled(format!("//{}/{}", view.host, view.share), Style::new().fg(Color::Cyan)),
         Span::raw(" ─ "),
@@ -1937,7 +1937,7 @@ mod tests {
     fn header_renders_connection_model_and_gpu_placeholder() {
         let terminal = render_frame(80, 3, |f, area| render_header(f, area, &header_view(), tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("audio_split"));
+        assert!(text.contains("hexastem"));
         assert!(text.contains("//nas.local/media"));
         assert!(text.contains("/recordings"));
         assert!(text.contains("sw"));
@@ -2257,7 +2257,7 @@ mod tests {
         let view = screen_view(Vec::new(), None);
         let terminal = render_frame(100, 30, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("audio_split"));
+        assert!(text.contains("hexastem"));
         assert!(text.contains("[1]Файлы"));
         assert!(text.contains("[4]Справка"));
         assert!(text.contains("нет файлов — Esc → настройка"));
@@ -2417,7 +2417,7 @@ mod tests {
         // в 40 колонок влезает только она (новое правило приоритета footer).
         let terminal = render_frame(40, 12, |f, area| render_screen(f, area, &view, tr()));
         let text = buffer_text(&terminal);
-        assert!(text.contains("audio_split"));
+        assert!(text.contains("hexastem"));
         assert!(text.contains("ETA 04:12"), "сводка видна даже в узком кадре");
     }
 

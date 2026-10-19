@@ -238,7 +238,7 @@ pub struct ConfigState {
 }
 
 impl ConfigState {
-    /// Преффилл из пресета (`~/.config/audio_split/tui.toml`).
+    /// Преффилл из пресета (`~/.config/hexastem/tui.toml`).
     pub fn from_preset(preset: &TuiSettings) -> Self {
         Self {
             host: TextField::new(preset.host.clone()),

@@ -105,7 +105,7 @@ pub fn generate_markdown(batch: &BatchResult, skipped: &Skipped, config: &Config
 /// Человекочитаемая консольная сводка — ЧИСТАЯ функция (печать — на вызывающем).
 pub fn console_summary(batch: &BatchResult, skipped: &Skipped) -> String {
     let mut out = format!(
-        "audio_split: всего={} ok={} failed={} skip(resume)={} skip(converted)={} dup={} время={}\n",
+        "hexastem: всего={} ok={} failed={} skip(resume)={} skip(converted)={} dup={} время={}\n",
         batch.total,
         batch.ok,
         batch.failed,
@@ -131,7 +131,7 @@ fn model_name(model: Model) -> &'static str {
 /// Шапка: когда/где/чем гоняли (дата-время, host/share, remote-dir, модель).
 fn markdown_header(config: &Config, run_time: SystemTime) -> String {
     format!(
-        "# audio_split — отчёт о прогоне\n\n\
+        "# hexastem — отчёт о прогоне\n\n\
          - Дата/время (UTC): {ts}\n\
          - Хост/шара: //{host}/{share}\n\
          - Удалённая директория: {dir}\n\
@@ -360,6 +360,8 @@ mod tests {
             model: Model::Sw,
             venv_path: PathBuf::from("/opt/venv"),
             output_format: "flac".into(),
+            engine: crate::EngineKind::Python,
+            onnx_model: PathBuf::from("/opt/onnx/model.onnx"),
             smb_creds_file: None,
             local: false,
             no_dedup: false,
@@ -372,7 +374,7 @@ mod tests {
 
     /// Уникальная локальная директория теста (параллельные тесты не пересекаются).
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audio_split_report_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hexastem_report_{}_{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -461,7 +463,7 @@ mod tests {
             result_ok("c.wav", Duration::from_secs(847)),
         ];
         let batch = batch(results, Duration::from_secs(65));
-        let expected = r#"# audio_split — отчёт о прогоне
+        let expected = r#"# hexastem — отчёт о прогоне
 
 - Дата/время (UTC): 2001-09-09 01:46:40
 - Хост/шара: //nas.local/music

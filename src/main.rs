@@ -7,13 +7,14 @@ use std::time::SystemTime;
 
 use clap::Parser;
 
-use audio_split::pipeline::{plan, BatchPlan, BatchResult, EngineOps, EngineRunner, Pipeline, SmbOps};
-use audio_split::report::{self, Skipped};
-use audio_split::smb::SmbClient;
-use audio_split::Config;
+use hexastem::pipeline::{plan, BatchPlan, BatchResult, EngineOps, EngineRunner, Pipeline, SmbOps};
+use hexastem::report::{self, Skipped};
+use hexastem::smb::SmbClient;
+use hexastem::{Config, EngineKind};
 
-use audio_split::error::AppError;
-use audio_split::local_fs::LocalFs;
+use hexastem::engine::native::NativeEngine;
+use hexastem::error::AppError;
+use hexastem::local_fs::LocalFs;
 
 fn main() {
     let config = Config::parse();
@@ -21,15 +22,21 @@ fn main() {
 }
 
 /// Прогон целиком: бэкенды из конфига → полный цикл → код возврата
-/// (0/1 по отказам батча). Инфраструктурная ошибка (скан/отчёт) —
+/// (0/1 по отказам батча). Инфраструктурная ошибка (скан/конфиг/отчёт) —
 /// в stderr и код 1; отдельные файлы отказом прогон не роняют.
 fn run(config: &Config) -> i32 {
     let smb = storage_backend(config);
-    let engine = engine_runner(config);
+    let engine = match engine_runner(config) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("hexastem: {err}");
+            return 1;
+        }
+    };
     match assemble(config, smb.as_ref(), engine.as_ref()) {
         Ok(outcome) => report::exit_code(&outcome.batch),
         Err(err) => {
-            eprintln!("audio_split: {err}");
+            eprintln!("hexastem: {err}");
             1
         }
     }
@@ -49,15 +56,28 @@ fn storage_backend(config: &Config) -> Box<dyn SmbOps> {
     }
 }
 
-/// Драйвер разделения: venv из конфига, скрипт — `python/` крейта
-/// (кэш моделей драйвер ведёт сам в `<крейт>/.models`).
-fn engine_runner(config: &Config) -> Box<dyn EngineOps> {
-    Box::new(EngineRunner::new(
-        &config.venv_path,
-        &driver_script(),
-        config.model.checkpoint(),
-        &config.output_format,
-    ))
+/// Драйвер разделения: `--engine python` — python-драйвер (venv из конфига,
+/// скрипт — `python/` крейта), `--engine native` — нативный DSP-движок
+/// (ONNX-модель из конфига; dylib ONNX Runtime — через ORT_DYLIB_PATH).
+/// Native пишет только FLAC: другой output_format — ошибка конфигурации.
+fn engine_runner(config: &Config) -> Result<Box<dyn EngineOps>, AppError> {
+    match config.engine {
+        EngineKind::Python => Ok(Box::new(EngineRunner::new(
+            &config.venv_path,
+            &driver_script(),
+            config.model.checkpoint(),
+            &config.output_format,
+        ))),
+        EngineKind::Native => {
+            if !config.output_format.eq_ignore_ascii_case("flac") {
+                return Err(AppError::Config(format!(
+                    "native engine writes FLAC stems only, --output-format `{}` is not supported",
+                    config.output_format
+                )));
+            }
+            Ok(Box::new(NativeEngine::new(&config.onnx_model)))
+        }
+    }
 }
 
 /// Python-драйвер относительно крейта (путь фиксируется при сборке).
@@ -106,9 +126,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use audio_split::pipeline::{EngineEvent, EXPECTED_STEMS};
-    use audio_split::smb::SmbEntry;
-    use audio_split::{Config, Model};
+    use hexastem::pipeline::{EngineEvent, EXPECTED_STEMS};
+    use hexastem::smb::SmbEntry;
+    use hexastem::{Config, Model};
 
     use super::*;
 
@@ -310,7 +330,7 @@ mod tests {
 
     /// Пара уникальных директорий теста: remote-«шара» и local-рабочая.
     fn temp_pair(tag: &str) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!("audio_split_main_{}_{tag}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hexastem_main_{}_{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let (remote, local) = (base.join("remote"), base.join("local"));
         fs::create_dir_all(&remote).unwrap();
@@ -328,6 +348,8 @@ mod tests {
             model: Model::Sw,
             venv_path: PathBuf::from("/unused/venv"),
             output_format: "flac".to_string(),
+            engine: EngineKind::Python,
+            onnx_model: PathBuf::from("/unused/onnx/model.onnx"),
             smb_creds_file: None,
             local: true,
             no_dedup: false,

@@ -6,6 +6,15 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
+/// Движок разделения стемов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EngineKind {
+    /// Python-драйвер audio-separator (subprocess) — текущий путь, дефолт.
+    Python,
+    /// Нативный Rust-DSP движок (ONNX напрямую, FLAC 24-bit).
+    Native,
+}
+
 /// Модель разделения и её чекпойнт для движка audio-separator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Model {
@@ -37,7 +46,7 @@ impl Model {
 
 /// Настройки одного прогона пайплайна.
 #[derive(Debug, Clone, Parser)]
-#[command(name = "audio_split", about = "SMB batch stem-separation pipeline")]
+#[command(name = "hexastem", about = "SMB batch stem-separation pipeline")]
 pub struct Config {
     /// Хост SMB-сервера (сервис будет //host/share).
     #[arg(long)]
@@ -67,6 +76,15 @@ pub struct Config {
     #[arg(long, default_value = "flac")]
     pub output_format: String,
 
+    /// Движок разделения: python (subprocess audio-separator, текущий путь)
+    /// или native (Rust DSP + ONNX напрямую, FLAC 24-bit).
+    #[arg(long, value_enum, default_value = "python")]
+    pub engine: EngineKind,
+
+    /// ONNX-модель нативного движка (--engine native).
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/.models/onnx/bs_roformer_sw_6stem_fp32.onnx"))]
+    pub onnx_model: PathBuf,
+
     /// Файл SMB-креденшелов для smbclient (-A); опционально.
     #[arg(long)]
     pub smb_creds_file: Option<PathBuf>,
@@ -89,7 +107,7 @@ mod tests {
     /// Минимальный валидный набор аргументов (без опциональных).
     fn base_args() -> Vec<&'static str> {
         vec![
-            "audio_split",
+            "hexastem",
             "--host", "nas.local",
             "--share", "music",
             "--remote-dir", "kirtan",
@@ -140,7 +158,7 @@ mod tests {
     #[test]
     fn venv_defaults_to_crate_and_local_flag_is_opt_in() {
         let minimal = Config::try_parse_from([
-            "audio_split", "--host", "nas.local", "--share", "music", "--remote-dir", "kirtan", "--local-dir", "/tmp/work",
+            "hexastem", "--host", "nas.local", "--share", "music", "--remote-dir", "kirtan", "--local-dir", "/tmp/work",
         ])
         .expect("valid args without optional flags");
 
@@ -148,7 +166,7 @@ mod tests {
         assert!(!minimal.local, "SMB is the default backend");
 
         let local = Config::try_parse_from([
-            "audio_split", "--host", "h", "--share", "s", "--remote-dir", "r", "--local-dir", "/tmp/w", "--local",
+            "hexastem", "--host", "h", "--share", "s", "--remote-dir", "r", "--local-dir", "/tmp/w", "--local",
         ])
         .expect("valid args with --local");
 
@@ -165,5 +183,38 @@ mod tests {
         )
         .expect("valid args with --no-dedup");
         assert!(disabled.no_dedup, "--no-dedup выключает дедупликацию");
+    }
+
+    #[test]
+    fn engine_defaults_to_python_and_switches_to_native() {
+        // До приёмки native-пути дефолт — python (T10).
+        let default = Config::try_parse_from(base_args()).expect("valid args");
+        assert_eq!(default.engine, EngineKind::Python);
+        assert!(default.onnx_model.ends_with("bs_roformer_sw_6stem_fp32.onnx"));
+
+        let native = Config::try_parse_from(
+            base_args().into_iter().chain(["--engine", "native"]).collect::<Vec<_>>(),
+        )
+        .expect("valid args with --engine native");
+        assert_eq!(native.engine, EngineKind::Native);
+    }
+
+    #[test]
+    fn unknown_engine_is_rejected() {
+        let args = base_args()
+            .into_iter()
+            .chain(["--engine", "bogus"])
+            .collect::<Vec<_>>();
+        assert!(Config::try_parse_from(args).is_err(), "unknown engine must fail parsing");
+    }
+
+    #[test]
+    fn onnx_model_default_is_crate_relative() {
+        let cfg = Config::try_parse_from(base_args()).expect("valid args");
+        assert!(
+            cfg.onnx_model.starts_with(env!("CARGO_MANIFEST_DIR")),
+            "дефолт ONNX-модели — относительно крейта: {}",
+            cfg.onnx_model.display()
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! TUI-бинарник `audio_split_tui`: event loop, интеграция раннера и GPU,
+//! TUI-бинарник `hexastem_tui`: event loop, интеграция раннера и GPU,
 //! композиция кадра (экран + попап старта).
 //!
 //! Потоки данных:
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn idle_screen_renders_frame_with_empty_state() {
         let text = render(100, 30, &App::new());
-        assert!(text.contains("audio_split"));
+        assert!(text.contains("hexastem"));
         assert!(text.contains("нет файлов — Esc → настройка"));
         assert!(text.contains("[s]тарт"));
     }
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn min_size_still_renders_main_ui() {
         let text = render(MIN_WIDTH, MIN_HEIGHT, &App::new());
-        assert!(text.contains("audio_split"));
+        assert!(text.contains("hexastem"));
         assert!(!text.contains("маленький"));
     }
 
@@ -953,7 +953,7 @@ mod tests {
 
         // ru (дефолт): шапка-приложение, табы, таблица, футер.
         let text = render(100, 30, &app);
-        assert!(text.contains("audio_split"), "шапка: {text}");
+        assert!(text.contains("hexastem"), "шапка: {text}");
         assert!(text.contains("[1]Файлы"), "табы ru: {text}");
         assert!(text.contains("СТАДИЯ"), "заголовок таблицы ru: {text}");
         assert!(text.contains("файлы 0/1"), "футер ru: {text}");
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[test]
     fn validate_local_spec_with_existing_dirs_is_ok() {
-        let base = std::env::temp_dir().join(format!("audio_split_mod_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hexastem_mod_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let spec = RunSpec {
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn validate_counts_wav_files_in_local_dir() {
-        let base = std::env::temp_dir().join(format!("audio_split_mod_wav_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hexastem_mod_wav_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.wav"), b"x").unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn validate_reports_missing_remote_directory() {
-        let base = std::env::temp_dir().join(format!("audio_split_mod_missing_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hexastem_mod_missing_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let spec = RunSpec {
@@ -1274,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_run_completes_with_zero_files_and_exit_code_zero() {
-        let base = std::env::temp_dir().join(format!("audio_split_mod_run_{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("hexastem_mod_run_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let (tx_events, mut rx_events) = mpsc::unbounded_channel();

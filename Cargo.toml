@@ -1,9 +1,15 @@
 [package]
-name = "audio_split"
+name = "hexastem"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
-description = "SMB batch stem-separation pipeline"
+rust-version = "1.99"
+description = "Batch AI stem separation (6-stem BS-Roformer): native CUDA engine via ONNX Runtime, SMB pipeline, ratatui TUI"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/apilot/hexastem"
+keywords = ["audio", "stem-separation", "ai", "music", "tui"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
 
 [dependencies]
 # CLI: парсинг аргументов прогона (derive API)
@@ -21,7 +27,24 @@ crossterm = "0.29"
 # process — GPU-поллер (tokio::process::Command → nvidia-smi, tui/gpu.rs)
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
 toml = "1.1.8"
+# DSP нативного движка: WAV I/O (PCM 16/24/32), FFT для STFT/iSTFT, ресемплинг 48k<->44.1k
+hound = "3.5.1"
+rustfft = "6.4.1"
+rubato = "5.0.1"
+# Инференс ONNX (BS-Roformer-SW): rc-серия — пин точный (API нестабилен между rc).
+# load-dynamic: ORT грузится из dylib в рантайме (ORT_DYLIB_PATH), без пребилда ort-sys.
+# api-30: допустим dylib вплоть до ORT 1.30 C-API (мультиверсионность).
+ort = { version = "=2.0.0-rc.14", features = ["load-dynamic", "cuda", "api-30"] }
+# FLAC-энкодер стемов нативного движка (чистый Rust; 24-bit через i32-сэмплы).
+flacenc = "0.5.1"
+
+[dev-dependencies]
+# Golden-тесты: чтение reference.npz (PyTorch-фикстуры из bs-roformer-sw-6stem-onnx)
+ndarray = "0.17"
+ndarray-npy = { version = "0.10", features = ["npz", "compressed_npz"] }
+# Тесты FLAC-записи нативного движка: чтение/проверка 24-bit стемов
+claxon = "0.4.3"
 
 [[bin]]
-name = "audio_split_tui"
-path = "src/bin/audio_split_tui.rs"
+name = "hexastem_tui"
+path = "src/bin/hexastem_tui.rs"

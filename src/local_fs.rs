@@ -100,7 +100,7 @@ mod tests {
 
     /// Уникальная локальная директория теста (параллельные тесты не пересекаются).
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audio_split_local_fs_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hexastem_local_fs_{}_{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

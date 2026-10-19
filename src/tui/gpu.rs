@@ -81,7 +81,7 @@ async fn poll_loop(tx: UnboundedSender<GpuEvent>, period: Duration) {
                 // Допустимый единственный eprintln в TUI-пути: поллер стартует уже на
                 // alt-screen, строку затирает первый draw — видимого вывода не создаёт
                 // (дублировать её в общий канал событий рано: UI ещё не читает лог).
-                eprintln!("audio_split_tui: nvidia-smi недоступна — в шапке «GPU: n/a»");
+                eprintln!("hexastem_tui: nvidia-smi недоступна — в шапке «GPU: n/a»");
             }
             None => {} // тихий поллинг: одно сообщение, не на каждый тик
         }

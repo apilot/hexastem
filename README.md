@@ -1,4 +1,4 @@
-# audio_split
+# HexaStem
 
 SMB batch stem-separation pipeline: берёт `.wav`-записи из директории на NAS
 (по SMB, без монтирования), разделяет их нейросетью на 6 стемов
@@ -86,19 +86,19 @@ resume. Обход в `SmbClient::create_dir`: директория стемов
 ## Сборка
 
 ```bash
-cd audio_split
-cargo build --release   # бинарник target/release/audio_split
+cd hexastem
+cargo build --release   # бинарник target/release/hexastem
 cargo test              # юнит- и e2e-тесты (моки: без сети и без GPU)
 ```
 
-Требования: Rust stable ≥ 1.91; для реального прогона — python 3.11 venv с
+Требования: Rust stable ≥ 1.99; для реального прогона — python 3.11 venv с
 `audio-separator[gpu]==0.47.0` (torch пин `2.7.1+cu126` для Pascal-видеокарт),
 `smbclient` в системе, ffmpeg (для декодирования не-wav источников библиотекой).
 
 ## Запуск
 
 ```bash
-audio_split --host <host> --share <share> --remote-dir <dir-on-share> \
+hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
             --local-dir <work-dir> [--model sw|6s] [--output-format flac] \
             [--venv-path <dir>] [--smb-creds-file <file>] [--local]
 ```
@@ -122,22 +122,22 @@ audio_split --host <host> --share <share> --remote-dir <dir-on-share> \
 
 ```bash
 SMB_USER=backup SMB_PASS=secret \
-./target/release/audio_split \
+./target/release/hexastem \
   --host nas.local --share music \
   --remote-dir kirtan/2026-10 \
-  --local-dir /var/tmp/audio_split_work \
+  --local-dir /var/tmp/hexastem_work \
   --model sw
 ```
 
 Ожидаемый результат на шаре: `kirtan/2026-10/<трек>/<stem>.flac` × 6,
 исходник переименован в `CONVERTED_<трек>.wav`, в корне `remote-dir` —
 `split_report_*.md`; в stdout — строка сводки вида
-`audio_split: всего=2 ok=2 failed=0 skip(resume)=0 skip(converted)=1 время=…`.
+`hexastem: всего=2 ok=2 failed=0 skip(resume)=0 skip(converted)=1 время=…`.
 
 ### Пример: локальная отладка без сети
 
 ```bash
-./target/release/audio_split --local \
+./target/release/hexastem --local \
   --host local --share local \
   --remote-dir /tmp/music_in --local-dir /tmp/music_work \
   --venv-path .venv

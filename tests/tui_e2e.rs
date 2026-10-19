@@ -11,15 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use audio_split::error::AppError;
-use audio_split::pipeline::{EngineEvent, EngineOps, FileStatus, SmbOps};
-use audio_split::smb::SmbEntry;
-use audio_split::tui::app::{App, State};
-use audio_split::tui::event::{AppEvent, RunSpec};
-use audio_split::tui::gpu::{GpuEvent, parse_nvidia_smi_csv};
-use audio_split::tui::persist::TuiSettings;
-use audio_split::tui::runner::{RunnerDeps, RunnerOptions, exit_code, spawn};
-use audio_split::tui::{apply_event, draw, handle_mouse, validate_spec};
+use hexastem::error::AppError;
+use hexastem::pipeline::{EngineEvent, EngineOps, FileStatus, SmbOps};
+use hexastem::smb::SmbEntry;
+use hexastem::tui::app::{App, State};
+use hexastem::tui::event::{AppEvent, RunSpec};
+use hexastem::tui::gpu::{GpuEvent, parse_nvidia_smi_csv};
+use hexastem::tui::persist::TuiSettings;
+use hexastem::tui::runner::{RunnerDeps, RunnerOptions, exit_code, spawn};
+use hexastem::tui::{apply_event, draw, handle_mouse, validate_spec};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -58,7 +58,7 @@ fn render(app: &App) -> String {
 
 /// Уникальная локальная рабочая директория теста.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("audio_split_e2e_{}_{tag}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hexastem_e2e_{}_{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
@@ -332,7 +332,7 @@ impl EngineOps for MockEngine {
 
 /// Локальные пути стемов файла (6 штук, порядок EXPECTED_STEMS).
 fn stem_paths(local_dir: &Path, base: &str) -> Vec<String> {
-    audio_split::pipeline::EXPECTED_STEMS
+    hexastem::pipeline::EXPECTED_STEMS
         .iter()
         .map(|stem| local_dir.join(base).join(format!("{stem}.{EXT}")).to_string_lossy().into_owned())
         .collect()
@@ -366,7 +366,7 @@ fn engine_events(local: &Path, names: &[&str]) -> Vec<EngineEvent> {
 }
 
 fn result_status<'a>(
-    result: &'a audio_split::pipeline::BatchResult,
+    result: &'a hexastem::pipeline::BatchResult,
     name: &str,
 ) -> &'a FileStatus {
     &result.results.iter().find(|r| r.name == name).expect("файл в итоге").status
@@ -396,7 +396,7 @@ async fn e2e_popup_to_finished_with_summary_dedup_log_and_gpu() {
     // Попап: paste путей → спека → та же валидация, что в event loop.
     let mut app = App::new();
     let spec = start_from_popup(&mut app, &base, &work);
-    let wav_count = validate_spec(&spec, audio_split::tui::i18n::Lang::Ru).expect("валидация реальных директорий проходит");
+    let wav_count = validate_spec(&spec, hexastem::tui::i18n::Lang::Ru).expect("валидация реальных директорий проходит");
     apply_event(&mut app, &AppEvent::ValidationFinished { spec: spec.clone(), error: None, wav_count });
     assert_eq!(app.state(), State::Config, "после проверки попап ждёт подтверждения");
     app.handle(&key(KeyCode::Enter)); // подтверждение старта после показа факта
@@ -542,7 +542,7 @@ async fn e2e_cancel_confirmed_through_quit_dialog_fails_run() {
     loop {
         let event = tokio::time::timeout(RUN_TIMEOUT, rx.recv()).await.expect("завис").expect("закрыт");
         let started_download =
-            matches!(&event, AppEvent::FileStage { name, stage: audio_split::tui::event::Stage::Download } if name == "a.wav");
+            matches!(&event, AppEvent::FileStage { name, stage: hexastem::tui::event::Stage::Download } if name == "a.wav");
         apply_event(&mut app, &event);
         if started_download {
             break;
@@ -607,7 +607,7 @@ async fn e2e_second_run_skips_converted_duplicate_and_fully_stemmed() {
     // Состояние шары после прогонов: переименованный, дубль, файл со всеми
     // 6 стемами на NAS (resume-done) и новый файл.
     let stems_dir = remote.join("resume");
-    let stems: Vec<SmbEntry> = audio_split::pipeline::EXPECTED_STEMS
+    let stems: Vec<SmbEntry> = hexastem::pipeline::EXPECTED_STEMS
         .iter()
         .map(|stem| MockSmb::entry(&format!("{stem}.{EXT}")))
         .collect();
@@ -673,7 +673,7 @@ async fn e2e_validation_rejects_missing_remote_dir_and_stays_in_popup() {
     let mut app = App::new();
 
     let spec = start_from_popup(&mut app, &base.join("nope"), &work);
-    let error = validate_spec(&spec, audio_split::tui::i18n::Lang::Ru).expect_err("несуществующая директория — ошибка");
+    let error = validate_spec(&spec, hexastem::tui::i18n::Lang::Ru).expect_err("несуществующая директория — ошибка");
     assert!(error.contains("No such file") || error.contains("no such file"), "{error}");
 
     apply_event(&mut app, &AppEvent::ValidationFinished { spec, error: Some(error), wav_count: 0 });

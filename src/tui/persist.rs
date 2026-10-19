@@ -1,4 +1,4 @@
-//! Persistence пресета TUI: `~/.config/audio_split/tui.toml` (serde + toml).
+//! Persistence пресета TUI: `~/.config/hexastem/tui.toml` (serde + toml).
 //!
 //! Хранит последние значения полей попапа запуска: загрузка — при открытии
 //! попапа (префилл), сохранение — при успешном старте прогона. Отсутствующий
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Model;
 
-/// Имя файла пресета (в `~/.config/audio_split/`).
+/// Имя файла пресета (в `~/.config/hexastem/`).
 pub const SETTINGS_FILE: &str = "tui.toml";
 
 /// Пресет попапа запуска: последние значения полей.
@@ -77,11 +77,11 @@ pub fn model_label(model: Model) -> &'static str {
     }
 }
 
-/// Полный путь пресета: `~/.config/audio_split/tui.toml`.
+/// Полный путь пресета: `~/.config/hexastem/tui.toml`.
 /// `None` — домашняя директория не определена (грузим дефолты, не сохраняем).
 pub fn path() -> Option<PathBuf> {
     std::env::home_dir().map(|home| {
-        home.join(".config").join("audio_split").join(SETTINGS_FILE)
+        home.join(".config").join("hexastem").join(SETTINGS_FILE)
     })
 }
 
@@ -121,7 +121,7 @@ mod tests {
 
     /// Уникальный файл пресета в temp-директории теста.
     fn temp_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audio_split_persist_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hexastem_persist_{}_{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir.join(SETTINGS_FILE)
     }
@@ -231,11 +231,11 @@ mod tests {
     }
 
     #[test]
-    fn path_lays_under_config_audio_split() {
+    fn path_lays_under_config_hexastem() {
         let Some(path) = path() else {
             panic!("в тестовом окружении HOME определён");
         };
-        assert!(path.ends_with(Path::new("audio_split").join(SETTINGS_FILE)));
+        assert!(path.ends_with(Path::new("hexastem").join(SETTINGS_FILE)));
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(SETTINGS_FILE));
     }
 }

@@ -670,7 +670,7 @@ mod tests {
 
     /// Уникальная локальная рабочая директория теста.
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audio_split_runner_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hexastem_runner_{}_{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir

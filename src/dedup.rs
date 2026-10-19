@@ -474,14 +474,14 @@ pub(crate) fn decode_samples(bytes: &[u8], bits: u16, out: &mut Vec<f32>) {
     out.clear();
     match bits {
         16 => out.extend(
-            bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32_768.0),
+            bytes.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32_768.0),
         ),
-        24 => out.extend(bytes.chunks_exact(3).map(|b| {
+        24 => out.extend(bytes.as_chunks::<3>().0.iter().map(|b| {
             let v = b[0] as i32 | ((b[1] as i32) << 8) | ((b[2] as i8 as i32) << 16);
             v as f32 / 8_388_608.0
         })),
-        32 => out.extend(bytes.chunks_exact(4).map(|b| {
-            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0
+        32 => out.extend(bytes.as_chunks::<4>().0.iter().map(|b| {
+            i32::from_le_bytes(*b) as f32 / 2_147_483_648.0
         })),
         _ => {}
     }
@@ -821,7 +821,7 @@ mod tests {
 
     /// Уникальная локальная директория теста (параллельные не пересекаются).
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("audio_split_dedup_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hexastem_dedup_{}_{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
