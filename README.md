@@ -1,122 +1,142 @@
 # HexaStem
 
-SMB batch stem-separation pipeline: берёт `.wav`-записи из директории на NAS
-(по SMB, без монтирования), разделяет их нейросетью на 6 стемов
-(vocals/drums/bass/guitar/piano/other) и возвращает стемы обратно на шару.
+[Русский](README.ru.md)
 
-Движок разделения один — **native**: инференс целиком в Rust через ONNX
-Runtime (GPU NVIDIA через CUDA, есть фолбэк на CPU), пишет FLAC 24-bit.
+SMB batch stem-separation pipeline: it picks up `.wav` recordings from a NAS
+directory (over SMB, no mounting), splits them with a neural network into
+6 stems (vocals/drums/bass/guitar/piano/other), and uploads the stems back
+to the share.
 
-## Как работает
+HexaStem is job management end to end: batch planning with resume, duplicate
+detection, per-file progress, reports, and exit codes — plus a terminal UI on
+top of the same engine.
 
-1. **План**: скан `remote_dir` → только `*.wav`; скип `CONVERTED_*`,
-   `DUPLICATE_*` и файлов, у которых на шаре уже есть `<basename>/` со всеми
-   6 стемами (resume).
-2. **Download** исходников в `local_dir` (отказ одного файла — в отчёт, батч продолжается).
-3. **Дедупликация**: файлы с одинаковыми `(data_size, frames)` попарно
-   сравниваются (см. «Дедупликация» ниже); дубли снимаются с обработки,
-   их rename на NAS — строго после `Ok` хранителя.
-4. **Separate**: один вызов движка на батч хранителей и уникальных
-   (ONNX-сессия «горячая» — грузится один раз на батч); по событию
-   `file_done` — upload стемов в `<basename>/<stem>.flac`.
-5. **Rename** `CONVERTED_<имя>` — строго после успешной заливки всех 6 стемов
-   (сбой раньше шага оставляет исходник нетронутым), затем локальный cleanup.
-6. **Отчёт**: markdown (`split_report_YYYYMMDD-HHMMSS.md`) на шару +
-   консольная сводка + код возврата (0 — нет отказов, 1 — есть).
+The separation engine is a single **native** one: inference entirely in Rust
+via ONNX Runtime (NVIDIA GPU through CUDA, with an automatic CPU fallback),
+writing 24-bit FLAC.
 
-## FAT-шары: обход mangle 8.3
+| Configure & run (TUI) | Live progress | Batch summary |
+|---|---|---|
+| ![Config popup](https://raw.githubusercontent.com/apilot/hexastem/main/screenshots/03-config-en.png) | ![Running progress](https://raw.githubusercontent.com/apilot/hexastem/main/screenshots/10-running-progress-en.png) | ![Summary](https://raw.githubusercontent.com/apilot/hexastem/main/screenshots/12-summary-en.png) |
 
-На FAT-шаре `mkdir` длинного имени сохраняет его в 8.3-виде, после чего
-`cd`/`ls` по длинному имени дают `NT_STATUS_OBJECT_NAME_NOT_FOUND` — ломая
-resume. Обход в `SmbClient::create_dir`: директория стемов создаётся
-коротким 8.3-safe именем `as_xxxxxxxx` (детерминированный хеш пути) и
-переименовывается в финальное длинное — такое имя хранится и резолвится.
-Повторы и хвосты упавших прогонов погашены (существующий финал /
-`COLLISION` → `Ok`); на локальных папках (`--local`) обход не нужен.
+## How it works
 
-## Дедупликация
+1. **Plan**: scan `remote-dir` → only `*.wav`; skips `CONVERTED_*`,
+   `DUPLICATE_*` and files whose `<basename>/` with all 6 stems already
+   exists on the share (resume).
+2. **Download** sources into `local-dir` (a single-file failure goes to the
+   report, the batch continues).
+3. **Deduplication**: files with identical `(data_size, frames)` are compared
+   pairwise (see «Deduplication» below); duplicates are pulled from
+   processing and renamed on the NAS strictly after the keeper's `Ok`.
+4. **Separate**: one engine call per batch of keepers and uniques (the ONNX
+   session stays hot — loaded once per batch); on each `file_done` event the
+   stems are uploaded to `<basename>/<stem>.flac`.
+5. **Rename** to `CONVERTED_<name>` — strictly after all 6 stems uploaded
+   successfully (a failure before that step leaves the source untouched),
+   then local cleanup.
+6. **Report**: markdown (`split_report_YYYYMMDD-HHMMSS.md`) on the share +
+   console summary + exit code (0 — no failures, 1 — some).
 
-На рекордере появляются файлы-дубли: одна и та же запись, но одна дорожка
-громче (цифровой гейн + лимитер). Реальный кейс: `unknown 2` (чистая, пик
-−6.6 дБФС, крест-фактор ~28 дБ) и `unknown 3` (+11.1 дБ, пережата лимитером,
-пик −0.32 дБФС, крест-фактор ~23 дБ). Дедупликация включена по умолчанию,
-отключается флагом `--no-dedup`.
+## FAT shares: working around 8.3 mangling
 
-### Методика
+On a FAT share, `mkdir` with a long name stores it in 8.3 form, after which
+`cd`/`ls` by the long name fail with `NT_STATUS_OBJECT_NAME_NOT_FOUND` —
+breaking resume. The workaround in `SmbClient::create_dir`: the stem
+directory is first created under a short 8.3-safe name `as_xxxxxxxx`
+(deterministic path hash) and renamed to the final long name, which is then
+remembered and resolved. Retries and tails of crashed runs are absorbed
+(existing final dir / `COLLISION` → `Ok`); local folders (`--local`) don't
+need any of this.
 
-- Кандидаты группируются по `(data_size, frames)`; группы ≥ 2 разбираются
-  попарно. Равное число фреймов — обязательное условие дубля (разница даже
-  в 1 фрейм → не дубль).
-- Каждый PCM WAV читается потоково (файлы ~600 МБ в память не помещаются):
-  RIFF-заголовок, три окна по 30 с (старт+60 с, середина, конец−90 с,
-  фрейм огибающей 50 мс) и блок-скан всего файла на клип (true peak, доля
-  сэмплов у потолка, максимальная серия).
-- Файл — дубль, если корреляция нормированных пик-огибающих ≥ **0.97**
-  в каждом из трёх окон при прямом выравнивании (сдвиг 0). Порог взят
-  с запасом: реальные дубли дают 0.985–0.999, разный контент — < 0.5.
-- Заголовок не разобрался (не PCM WAV 16/24/32 бит, 1/2 каналов) → файл
-  считается уникальным, примечание попадает в отчёт.
+## Deduplication
 
-### Правило хранителя
+Recorders produce duplicate files: the same take, but one track is louder
+(digital gain + limiting). A real case: `unknown 2` (clean, peak −6.6 dBFS,
+crest factor ~28 dB) and `unknown 3` (+11.1 dB, limited, peak −0.32 dBFS,
+crest factor ~23 dB). Deduplication is on by default, disable with
+`--no-dedup`.
 
-Из кластера дублей обрабатывается один — хранитель:
+### Method
 
-1. **Клипующие** (пик у потолка, `true_peak ≥ 0.999`) исключаются;
-2. различие **глобального** крест-фактора (dbfs пика всего файла − медиана
-   медианных RMS трёх окон) > **2 дБ** → хранитель более динамичный
-   (НЕ лимитерованный), даже если тише;
-3. иначе — более громкий (выше RMS).
+- Candidates are grouped by `(data_size, frames)`; groups ≥ 2 are compared
+  pairwise. Equal frame counts are a hard requirement (even a 1-frame
+  difference → not a duplicate).
+- Each PCM WAV is streamed (files ~600 MB don't fit in memory): RIFF header,
+  three 30 s windows (start+60 s, middle, end−90 s, 50 ms envelope frames)
+  and a full-file clip scan (true peak, sample share at the ceiling, longest
+  run).
+- A file is a duplicate if the correlation of normalized peak envelopes is
+  ≥ **0.97** in all three windows at direct alignment (0 shift). The
+  threshold has headroom: real duplicates score 0.985–0.999, different
+  content — below 0.5.
+- An unparsable header (not PCM WAV 16/24/32 bit, 1/2 channels) → the file
+  counts as unique, with a note in the report.
 
-Крест-фактор — именно глобальный, не средний по окнам: окна покрывают лишь
-90 с записи, и в реальном кейсе unknown 2/3 оконный средний давал 21.6 против
-20.8 (Δ 0.8 ≤ 2, хранителем ошибочно становилась лимитерованная копия),
-глобальный — 28.7 против 23.9 (Δ 4.8 > 2, хранитель — чистая).
+### Keeper rule
 
-### Судьба дубля
+One file per duplicate cluster is processed — the keeper:
 
-- Хранитель дошёл до `Ok` (6 стемов залиты, исходник → `CONVERTED_*`) →
-  дубль переименовывается на NAS в `DUPLICATE_<имя>`.
-- Хранитель не дошёл до `Ok` → дубль не трогается, в отчёте — «ждёт Ok
-  хранителя». Дубли никогда не удаляются; файлы с префиксом `DUPLICATE_*`
-  при следующих прогонах скипаются сканом.
-- Статус дубли не влияет на exit code; в отчёте — секция «Дедупликация»
-  с таблицей пар (corr по окнам, гейн, крест-факторы, клип, решение).
+1. **Clipping** files (peak at the ceiling, `true_peak ≥ 0.999`) are
+   excluded;
+2. a **global** crest-factor difference (whole-file peak dbfs − median of
+   the median RMS of the three windows) > **2 dB** → the more dynamic one
+   wins (NOT the limited one), even if quieter;
+3. otherwise — the louder one (higher RMS).
 
-## Сборка
+The crest factor is specifically the global one, not the window average:
+windows cover only 90 s of audio, and in the real unknown 2/3 case the
+windowed average gave 21.6 vs 20.8 (Δ 0.8 ≤ 2 — the limited copy would
+wrongly win), while the global one gave 28.7 vs 23.9 (Δ 4.8 > 2 — the clean
+take wins).
+
+### Duplicate fate
+
+- Keeper reached `Ok` (6 stems uploaded, source → `CONVERTED_*`) → the
+  duplicate is renamed on the NAS to `DUPLICATE_<name>`.
+- Keeper didn't reach `Ok` → the duplicate is left untouched and reported
+  as "waiting for the keeper's Ok". Duplicates are never deleted; files with
+  the `DUPLICATE_*` prefix are skipped by later scans.
+- Duplicate status doesn't affect the exit code; the report has a
+  «Deduplication» section with a table of pairs (per-window corr, gain,
+  crest factors, clip, decision).
+
+## Build
 
 ```bash
 cd hexastem
-cargo build --release   # бинарник target/release/hexastem
-cargo test              # юнит- и e2e-тесты (моки: без сети и без GPU)
+cargo build --release   # binaries: target/release/hexastem, hexastem_tui
+cargo test              # unit + e2e tests (mocked: no network, no GPU)
 ```
 
-Требования: Rust stable ≥ 1.99, `smbclient` в системе, ffmpeg (для
-декодирования не-wav источников библиотекой). Для скорости нужен GPU NVIDIA
-с CUDA (инференс ONNX Runtime); на CPU тоже работает — медленно.
+Requirements: Rust stable ≥ 1.99, `smbclient` on the system. An NVIDIA GPU
+with CUDA is needed for speed (ONNX Runtime inference); CPU works too —
+slowly.
 
-## Запуск
+## Usage
 
 ```bash
 hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
-            --local-dir <work-dir> [--onnx-model <file>] \
-            [--output-format flac] [--smb-creds-file <file>] [--local]
+         --local-dir <work-dir> [--onnx-model <file>] \
+         [--output-format flac] [--smb-creds-file <file>] [--local]
 ```
 
-| Параметр | Дефолт | Описание |
+| Option | Default | Description |
 |---|---|---|
-| `--host` | — | Хост SMB-сервера |
-| `--share` | — | Имя шары |
-| `--remote-dir` | — | Директория с записями на шаре |
-| `--local-dir` | — | Локальная рабочая директория (загрузка/выгрузка) |
-| `--onnx-model` | `<крейт>/.models/onnx/bs_roformer_sw_6stem_fp32.onnx` | ONNX-модель движка |
-| `--output-format` | `flac` | Формат стемов (движок пишет только FLAC) |
-| `--smb-creds-file` | — | Файл кредов smbclient (`username=`, `password=`); иначе `SMB_USER`/`SMB_PASS` из env |
-| `--local` | выкл | Локальная папка вместо SMB (`remote-dir` читается с диска) — отладка и smoke без сети |
-| `--no-dedup` | выкл | Отключить дедупликацию дублей-записей (каждый файл обрабатывается как есть) |
+| `--host` | — | SMB server host |
+| `--share` | — | Share name |
+| `--remote-dir` | — | Directory with recordings on the share |
+| `--local-dir` | — | Local working directory (download/upload) |
+| `--onnx-model` | `<crate>/.models/onnx/bs_roformer_sw_6stem_fp32.onnx` | Engine ONNX model |
+| `--output-format` | `flac` | Stem format (the engine writes FLAC only) |
+| `--smb-creds-file` | — | smbclient auth file (`username=`, `password=`); otherwise `SMB_USER`/`SMB_PASS` from the environment |
+| `--local` | off | Local folder instead of SMB (`remote-dir` is read from disk) — debugging and smoke runs without network |
+| `--no-dedup` | off | Disable duplicate-record deduplication (every file is processed as-is) |
 
-Креды никогда не в коде и не в argv: auth-файл или переменные `SMB_USER`/`SMB_PASS`.
+Credentials never live in code or argv: an auth file or `SMB_USER`/`SMB_PASS`
+environment variables.
 
-### Пример: тестовая шара
+### Example: test share
 
 ```bash
 SMB_USER=user SMB_PASS=pass \
@@ -126,12 +146,12 @@ SMB_USER=user SMB_PASS=pass \
   --local-dir /var/tmp/hexastem_work
 ```
 
-Ожидаемый результат на шаре: `kirtan/2026-10/<трек>/<stem>.flac` × 6,
-исходник переименован в `CONVERTED_<трек>.wav`, в корне `remote-dir` —
-`split_report_*.md`; в stdout — строка сводки вида
-`hexastem: всего=2 ok=2 failed=0 skip(resume)=0 skip(converted)=1 время=…`.
+Expected result on the share: `kirtan/2026-10/<track>/<stem>.flac` × 6, the
+source renamed to `CONVERTED_<track>.wav`, `split_report_*.md` in the root
+of `remote-dir`; stdout prints a summary like
+`hexastem: total=2 ok=2 failed=0 skip(resume)=0 skip(converted)=1 time=…`.
 
-### Пример: локальная отладка без сети
+### Example: local debugging without network
 
 ```bash
 ./target/release/hexastem --local \
@@ -139,29 +159,57 @@ SMB_USER=user SMB_PASS=pass \
   --remote-dir /tmp/music_in --local-dir /tmp/music_work
 ```
 
-### Модель
+### TUI
 
-ONNX-модель по умолчанию — `.models/onnx/bs_roformer_sw_6stem_fp32.onnx`
-внутри крейта (BS-Roformer SW, 6 стемов, fp32); путь переопределяется
-флагом `--onnx-model`. Dylib ONNX Runtime можно подменить переменной
-`ORT_DYLIB_PATH` (иначе — системная/слинкованная).
+`hexastem_tui` drives the same engine interactively: edit the job preset in
+a popup, watch per-file progress with a live waveform, browse the engine log
+and dedup pairs, switch interface language (`l` — Russian/English), and run
+in `--local` mode for offline testing. Presets persist in
+`~/.config/hexastem/tui.toml`.
 
-## Структура
+## Model & hardware
+
+The default model is `.models/onnx/bs_roformer_sw_6stem_fp32.onnx` inside
+the crate — [BS-Roformer SW, 6 stems, fp32](https://huggingface.co/elicwhite/bs-roformer-sw-6stem-onnx)
+(~700 MB). The path is overridden with `--onnx-model`.
+
+The ONNX Runtime shared library can be swapped via `ORT_DYLIB_PATH`
+(1.31.0 or newer recommended); otherwise the system/linked runtime is used.
+
+Backend selection: the CUDA execution provider is attempted first; if
+CUDA libraries are missing or the device is unsupported, HexaStem logs a
+short human-readable reason and falls back to CPU EP automatically.
+
+| Backend | 10 s stereo clip (BS-Roformer SW fp32) |
+|---|---|
+| NVIDIA GPU (CUDA) | real-time factor < 1 |
+| CPU | real-time factor ~2.5–4 |
+
+Known limitation: GPUs with 4 GB VRAM (e.g. GTX 1050 Ti) run out of memory
+during full fp32 inference — a CPU fallback keeps the run alive. Hardware-aware
+model selection (smaller models for modest GPUs) is planned.
+
+## Layout
 
 ```
-src/config.rs    — clap-конфиг прогона (иммутабельный)
-src/smb.rs       — обёртка smbclient: list/get/put/rename (+ парсинг листинга)
-src/local_fs.rs  — локальная папка как SmbOps (--local: тесты/отладка)
-src/dedup.rs     — дедупликация: парсер PCM WAV, окна/огибающие, compare_pair,
-                   правило хранителя (чистые функции, std only)
-src/pipeline.rs  — план батча (resume/CONVERTED_*/DUPLICATE_*), DI-трейты
-                   SmbOps/EngineOps, цикл download→dedup→separate→upload→rename
-src/engine/      — нативный движок: DSP-конвейер (wav → resample → chunker →
-                   stft → ONNX-инференс → iSTFT → кроссфейд → FLAC 24-bit),
-                   CUDA→CPU фолбэк, протокол событий прогресса
-src/report.rs    — markdown-отчёт (+ секция «Дедупликация») + консольная сводка
-                   + exit code
-src/tui/         — TUI-бинарник hexastem_tui (ratatui): попап запуска, прогресс,
-                   журнал, дедуп-таб, GPU-панель
-src/main.rs      — сборка шагов + e2e-смоук (InMemorySmb + StubEngine)
+src/config.rs    — immutable clap config for a run
+src/smb.rs       — smbclient wrapper: list/get/put/rename (+ listing parsing)
+src/local_fs.rs  — local folder as SmbOps (--local: tests/debugging)
+src/dedup.rs     — dedup: PCM WAV parser, windows/envelopes, compare_pair,
+                   keeper rule (pure functions, std only)
+src/pipeline.rs  — batch plan (resume/CONVERTED_*/DUPLICATE_*), DI traits
+                   SmbOps/EngineOps, download→dedup→separate→upload→rename loop
+src/engine/      — native engine: DSP chain (wav → resample → chunker →
+                   stft → ONNX inference → iSTFT → crossfade → FLAC 24-bit),
+                   CUDA→CPU fallback, progress event protocol
+src/report.rs    — markdown report (+ «Deduplication» section) + console
+                   summary + exit code
+src/tui/         — hexastem_tui binary (ratatui): run popup, progress, log,
+                   dedup tab, GPU panel
+src/main.rs      — step assembly + e2e smoke (InMemorySmb + StubEngine)
 ```
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
