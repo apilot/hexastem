@@ -85,15 +85,15 @@ const PAUSE_WHEN_PAUSED: Duration = Duration::from_secs(30);
 #[derive(Debug, clap::Parser)]
 #[command(name = "hexastem_tui", about = "SMB batch stem-separation TUI")]
 pub struct TuiArgs {
-    /// Движок разделения: python (subprocess audio-separator) или
-    /// native (Rust DSP + ONNX напрямую, FLAC 24-bit).
-    #[arg(long, value_enum, default_value = "python")]
+    /// Движок разделения: native (Rust DSP + ONNX Runtime CUDA, дефолт) или
+    /// python (legacy subprocess audio-separator).
+    #[arg(long, value_enum, default_value = "native")]
     pub engine: EngineKind,
 }
 
 /// Точка входа TUI: `init → event loop → restore`, возвращает код выхода
 /// последнего прогона (`runner::exit_code`; 0 — прогонов не было).
-/// Движок прогона задаётся флагом CLI (`--engine`, дефолт python).
+/// Движок прогона задаётся флагом CLI (`--engine`, дефолт native).
 ///
 /// Panic-safe: `ratatui::init` ставит panic hook, восстанавливающий
 /// терминал; поверх него цепочкой ставится hook, гасящий bracketed paste.
@@ -1094,16 +1094,16 @@ mod tests {
     // --- выбор движка CLI (--engine, мини-clap TUI) ---------------------------
 
     #[test]
-    fn tui_engine_defaults_to_python() {
+    fn tui_engine_defaults_to_native() {
         let args = TuiArgs::try_parse_from(["hexastem_tui"]).expect("запуск без аргументов валиден");
-        assert_eq!(args.engine, EngineKind::Python, "дефолт движка — python (смена — T13)");
+        assert_eq!(args.engine, EngineKind::Native, "дефолт движка — native (T13)");
     }
 
     #[test]
-    fn tui_engine_flag_switches_to_native() {
+    fn tui_engine_flag_switches_to_python() {
         let args =
-            TuiArgs::try_parse_from(["hexastem_tui", "--engine", "native"]).expect("валидный флаг");
-        assert_eq!(args.engine, EngineKind::Native);
+            TuiArgs::try_parse_from(["hexastem_tui", "--engine", "python"]).expect("валидный флаг");
+        assert_eq!(args.engine, EngineKind::Python);
     }
 
     #[test]

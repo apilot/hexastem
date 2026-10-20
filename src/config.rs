@@ -9,9 +9,9 @@ use clap::{Parser, ValueEnum};
 /// Движок разделения стемов.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EngineKind {
-    /// Python-драйвер audio-separator (subprocess) — текущий путь, дефолт.
+    /// Python-драйвер audio-separator (subprocess) — legacy-путь, требует venv.
     Python,
-    /// Нативный Rust-DSP движок (ONNX напрямую, FLAC 24-bit).
+    /// Нативный Rust-DSP движок (ONNX Runtime CUDA, FLAC 24-bit) — дефолт.
     Native,
 }
 
@@ -87,9 +87,9 @@ pub struct Config {
     #[arg(long, default_value = "flac")]
     pub output_format: String,
 
-    /// Движок разделения: python (subprocess audio-separator, текущий путь)
-    /// или native (Rust DSP + ONNX напрямую, FLAC 24-bit).
-    #[arg(long, value_enum, default_value = "python")]
+    /// Движок разделения: native (Rust DSP + ONNX Runtime CUDA, дефолт)
+    /// или python (legacy subprocess audio-separator, требует venv).
+    #[arg(long, value_enum, default_value = "native")]
     pub engine: EngineKind,
 
     /// ONNX-модель нативного движка (--engine native).
@@ -197,17 +197,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_defaults_to_python_and_switches_to_native() {
-        // До приёмки native-пути дефолт — python (T10).
+    fn engine_defaults_to_native_and_switches_to_python() {
+        // Паритет native-пути принят (T11) — с T13 дефолт движка — native.
         let default = Config::try_parse_from(base_args()).expect("valid args");
-        assert_eq!(default.engine, EngineKind::Python);
+        assert_eq!(default.engine, EngineKind::Native);
         assert!(default.onnx_model.ends_with("bs_roformer_sw_6stem_fp32.onnx"));
 
-        let native = Config::try_parse_from(
-            base_args().into_iter().chain(["--engine", "native"]).collect::<Vec<_>>(),
+        let python = Config::try_parse_from(
+            base_args().into_iter().chain(["--engine", "python"]).collect::<Vec<_>>(),
         )
-        .expect("valid args with --engine native");
-        assert_eq!(native.engine, EngineKind::Native);
+        .expect("valid args with --engine python");
+        assert_eq!(python.engine, EngineKind::Python);
     }
 
     #[test]

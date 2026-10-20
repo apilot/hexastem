@@ -4,9 +4,10 @@ SMB batch stem-separation pipeline: берёт `.wav`-записи из дире
 (по SMB, без монтирования), разделяет их нейросетью на 6 стемов
 (vocals/drums/bass/guitar/piano/other) и возвращает стемы обратно на шару.
 
-Инференс — не в Rust: бинарник запускает python-драйвер
-(`python/separator_driver.py`) из venv с [audio-separator]; драйвер грузит
-модель один раз на батч и отдаёт прогресс JSON-строками в stdout.
+Движки разделения: **native** (дефолт) — инференс в Rust через ONNX Runtime
+(CUDA), пишет FLAC 24-bit; **python** — legacy через [audio-separator]
+(python-драйвер `python/separator_driver.py` из venv: грузит модель один раз
+на батч и отдаёт прогресс JSON-строками в stdout).
 
 ## Как работает
 
@@ -91,7 +92,8 @@ cargo build --release   # бинарник target/release/hexastem
 cargo test              # юнит- и e2e-тесты (моки: без сети и без GPU)
 ```
 
-Требования: Rust stable ≥ 1.99; для реального прогона — python 3.11 venv с
+Требования: Rust stable ≥ 1.99; для реального прогона с `--engine python` —
+python 3.11 venv с
 `audio-separator[gpu]==0.47.0` (torch пин `2.7.1+cu126` для Pascal-видеокарт),
 `smbclient` в системе, ffmpeg (для декодирования не-wav источников библиотекой).
 
@@ -99,8 +101,9 @@ cargo test              # юнит- и e2e-тесты (моки: без сети
 
 ```bash
 hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
-            --local-dir <work-dir> [--model sw|6s] [--output-format flac] \
-            [--venv-path <dir>] [--smb-creds-file <file>] [--local]
+            --local-dir <work-dir> [--model sw|6s] [--engine native|python] \
+            [--onnx-model <file>] [--output-format flac] [--venv-path <dir>] \
+            [--smb-creds-file <file>] [--local]
 ```
 
 | Параметр | Дефолт | Описание |
@@ -110,6 +113,8 @@ hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
 | `--remote-dir` | — | Директория с записями на шаре |
 | `--local-dir` | — | Локальная рабочая директория (загрузка/выгрузка) |
 | `--model` | `sw` | `sw` = BS-Roformer-SW.ckpt (SOTA, ~2.6 GiB VRAM); `6s` = htdemucs_6s.yaml (быстрее, ~1.1 GiB) |
+| `--engine` | `native` | Движок разделения: `native` = ONNX Runtime CUDA в Rust (FLAC 24-bit); `python` = legacy через audio-separator (subprocess, требует venv) |
+| `--onnx-model` | `<крейт>/.models/onnx/bs_roformer_sw_6stem_fp32.onnx` | ONNX-модель нативного движка (`--engine native`) |
 | `--output-format` | `flac` | Формат стемов (`flac`/`wav`/`mp3`) |
 | `--venv-path` | `<крейт>/.venv` | Python venv с audio-separator |
 | `--smb-creds-file` | — | Файл кредов smbclient (`username=`, `password=`); иначе `SMB_USER`/`SMB_PASS` из env |
