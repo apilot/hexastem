@@ -290,9 +290,16 @@ fn start_run(
         Arc::new(SmbClient::new(spec.host.clone(), spec.share.clone(), None))
     };
     // Нативный DSP-движок: ONNX напрямую (крейто-относительная модель,
-    // как у CLI); stderr-приёмник не нужен — `[engine]`-строки пайплайн
-    // печатает сам.
-    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(NativeEngine::new(&default_onnx_model()));
+    // как у CLI). stderr-приёмник — канальный: `[engine]`-строки движка
+    // (ретраи и фолбэк CUDA→CPU из фабрики) клонируются в тот же канал
+    // событий (`AppEvent::EngineLog`), что и прогресс, — иначе eprintln
+    // рвёт alt-screen ratatui.
+    let tx_stderr = tx_events.clone();
+    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(
+        NativeEngine::new(&default_onnx_model()).on_stderr(Box::new(move |line: &str| {
+            let _ = tx_stderr.send(AppEvent::EngineLog { line: line.to_string() });
+        })),
+    );
     let deps = runner::RunnerDeps { smb, engine };
     let opts = RunnerOptions {
         remote_dir: spec.remote_dir.clone(),

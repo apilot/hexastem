@@ -128,12 +128,18 @@ fn short_cuda_reason(err: &AppError) -> String {
     }
 }
 
-/// Продакшн-фабрика: CUDA EP (device 0), при недоступности — ЯВНЫЙ fallback
-/// на CPU (диагностика в stderr, не молча).
+/// Дефолтный stderr-приёмник: `eprintln!` (CLI в обычном терминале; TUI
+/// подставляет канальный sink — см. [`NativeEngine::on_stderr`]).
+fn eprintln_sink() -> StderrSink {
+    Arc::new(|line| eprintln!("{line}"))
+}
+
+/// Продакшн-сборка бэкенда: CUDA EP (device 0), при недоступности — ЯВНЫЙ
+/// fallback на CPU (диагностика через `sink`, не молча).
 ///
 /// # Errors
 /// [`AppError::Dsp`]: недоступны оба EP (обе ошибки — в тексте сообщения).
-pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppError> {
+fn build_backend(model_path: &Path, sink: &StderrSink) -> Result<BuiltBackend, AppError> {
     match OrtSession::new(model_path, Ep::Cuda { device_id: 0 }) {
         // CUDA стартовал: имя GPU берём у nvidia-smi (честное имя в шапке
         // TUI «Считает: …»); сбой/пустой вывод — заглушка "cuda".
@@ -142,16 +148,31 @@ pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppErr
             device: query_gpu_name().unwrap_or_else(|| "cuda".to_string()),
         }),
         Err(cuda_err) => {
-            eprintln!(
+            sink(&format!(
                 "[engine] CUDA EP недоступен: {}; fallback на CPU EP",
                 short_cuda_reason(&cuda_err)
-            );
+            ));
             let session = OrtSession::new(model_path, Ep::Cpu).map_err(|cpu_err| {
                 AppError::Dsp(format!("model load failed: CUDA: {cuda_err}; CPU: {cpu_err}"))
             })?;
             Ok(BuiltBackend { backend: Arc::new(session), device: "cpu".to_string() })
         }
     }
+}
+
+/// Продакшн-фабрика с приёмником диагностики: все `[engine]`-строки
+/// (фолбэк CUDA→CPU) идут в `sink`, не в stderr (TUI — канальный sink,
+/// чтобы не рвать alt-screen).
+pub fn default_backend_factory_with(sink: StderrSink) -> BackendFactory {
+    Arc::new(move |model_path| build_backend(model_path, &sink))
+}
+
+/// CLI-обёртка: та же сборка, диагностика — в stderr (обычный терминал).
+///
+/// # Errors
+/// [`AppError::Dsp`]: недоступны оба EP (обе ошибки — в тексте сообщения).
+pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppError> {
+    build_backend(model_path, &eprintln_sink())
 }
 
 /// Однократный запрос имени GPU (`nvidia-smi --query-gpu=name`): первая
@@ -408,13 +429,15 @@ impl std::fmt::Debug for NativeEngine {
 }
 
 impl NativeEngine {
-    /// Движок из пути к ONNX-модели (фабрика — продакшн CUDA→CPU).
+    /// Движок из пути к ONNX-модели (фабрика — продакшн CUDA→CPU,
+    /// её диагностика — в тот же sink, что и строки ретраев).
     pub fn new(model_path: &Path) -> Self {
+        let on_stderr: StderrSink = eprintln_sink();
         Self {
             model_path: model_path.to_path_buf(),
-            factory: Arc::new(default_backend_factory),
+            factory: default_backend_factory_with(Arc::clone(&on_stderr)),
             cancelled: Arc::new(AtomicBool::new(false)),
-            on_stderr: Arc::new(|line| eprintln!("{line}")),
+            on_stderr,
         }
     }
 
@@ -425,8 +448,13 @@ impl NativeEngine {
     }
 
     /// Builder: приёмник `[engine]`-строк (диагностика в TUI/CLI).
+    /// Пересоздаёт и дефолтную фабрику с новым sink — фолбэк CUDA→CPU
+    /// идёт туда же, куда и ретраи (один приёмник на весь движок).
+    /// Комбинировать с [`Self::with_backend_factory`] нельзя (фабрика
+    /// будет перезаписана канальным sink'ом).
     pub fn on_stderr(mut self, sink: Box<dyn Fn(&str) + Send + Sync>) -> Self {
         self.on_stderr = Arc::from(sink);
+        self.factory = default_backend_factory_with(Arc::clone(&self.on_stderr));
         self
     }
 }
@@ -883,6 +911,59 @@ mod tests {
         assert!(got.ends_with('…'), "длинный текст обрезан с многоточием");
         assert!(got.chars().count() <= 60);
         assert!(!got.contains("someuser"), "без имён пользователя");
+    }
+
+    /// Коллектор `[engine]`-строк: общий Vec для sink-замыканий.
+    fn line_collector() -> Arc<Mutex<Vec<String>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    #[test]
+    fn default_backend_factory_with_routes_fallback_line_to_sink() {
+        // Фейковая модель: CUDA-EP отклоняется → строка фолбэка обязана
+        // попасть в коллектор, а не в eprintln (рвёт alt-screen TUI).
+        let lines = line_collector();
+        let collector = Arc::clone(&lines);
+        let sink: StderrSink = Arc::new(move |line: &str| {
+            collector.lock().expect("sink mutex").push(line.to_string());
+        });
+        let factory = default_backend_factory_with(sink);
+        let fake = std::env::temp_dir().join("hexastem_no_such_model.onnx");
+        let built = factory(&fake);
+        assert!(built.is_err(), "фейковая модель: оба EP обязаны отказать");
+        let got = lines.lock().expect("sink mutex");
+        assert!(
+            got.iter().any(|l| l.contains("fallback на CPU EP")),
+            "строка фолбэка — в sink, реально: {got:?}"
+        );
+    }
+
+    #[test]
+    fn on_stderr_builder_rewires_factory_diagnostics() {
+        // Builder on_stderr перепривязывает и дефолтную фабрику: прогон
+        // с несуществующей моделью отказывает файлы, а диагностика
+        // фолбэка фабрики идёт в sink движка.
+        let lines = line_collector();
+        let collector = Arc::clone(&lines);
+        let engine = NativeEngine::new(Path::new("/hexastem/definitely_missing.onnx"))
+            .on_stderr(Box::new(move |line: &str| {
+                collector.lock().expect("sink mutex").push(line.to_string());
+            }));
+        let out = std::env::temp_dir().join(format!("hexastem_sink_out_{}", std::process::id()));
+        let mut events = Vec::new();
+        let result =
+            engine.separate_batch(&[PathBuf::from("take.wav")], &out, &mut |e| events.push(e));
+        assert!(result.is_ok(), "сбой фабрики — отказы файлов, не паника");
+        assert!(
+            events.iter().any(|e| matches!(e, EngineEvent::FileError { error, .. }
+                if error.contains("model load failed"))),
+            "файлы отказом из-за модели: {events:?}"
+        );
+        let got = lines.lock().expect("sink mutex");
+        assert!(
+            got.iter().any(|l| l.contains("fallback на CPU EP")),
+            "фолбэк-строка фабрики — в sink движка, реально: {got:?}"
+        );
     }
 
     #[test]
