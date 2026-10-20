@@ -98,6 +98,36 @@ pub struct BuiltBackend {
 /// Фабрика бэкенда (вызывается один раз на батч).
 pub type BackendFactory = Arc<dyn Fn(&Path) -> Result<BuiltBackend, AppError> + Send + Sync>;
 
+/// Короткая человекочитаемая причина недоступности CUDA для журнала:
+/// без ort-простыни и абсолютных путей машины (баннер читает человек).
+/// Полный текст сохраняется для финальной ошибки «умерли оба EP».
+fn short_cuda_reason(err: &AppError) -> String {
+    let text = err.to_string();
+    for (needle, reason) in [
+        ("cannot open shared object", "CUDA-библиотеки не найдены"),
+        ("ARCH_MISMATCH", "GPU не поддерживается этой сборкой CUDA"),
+        ("CUDA_ERROR_NO_DEVICE", "CUDA-устройство не найдено"),
+        ("no CUDA-capable device", "CUDA-устройство не найдено"),
+    ] {
+        if text.contains(needle) {
+            return reason.to_string();
+        }
+    }
+    // Незнакомый кейс: сегмент без ort-деталей, пути маскируются, хвост — с «…».
+    let head = text.split(" : ").next().unwrap_or(&text);
+    let masked = head
+        .split_whitespace()
+        .map(|word| if word.contains('/') { "<path>" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if masked.chars().count() <= 60 {
+        masked
+    } else {
+        let cut: String = masked.chars().take(57).collect();
+        format!("{cut}…")
+    }
+}
+
 /// Продакшн-фабрика: CUDA EP (device 0), при недоступности — ЯВНЫЙ fallback
 /// на CPU (диагностика в stderr, не молча).
 ///
@@ -112,7 +142,10 @@ pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppErr
             device: query_gpu_name().unwrap_or_else(|| "cuda".to_string()),
         }),
         Err(cuda_err) => {
-            eprintln!("[engine] CUDA EP недоступен ({cuda_err}); fallback на CPU EP");
+            eprintln!(
+                "[engine] CUDA EP недоступен: {}; fallback на CPU EP",
+                short_cuda_reason(&cuda_err)
+            );
             let session = OrtSession::new(model_path, Ep::Cpu).map_err(|cpu_err| {
                 AppError::Dsp(format!("model load failed: CUDA: {cuda_err}; CPU: {cpu_err}"))
             })?;
@@ -808,6 +841,48 @@ mod tests {
         assert_eq!(parse_gpu_name("\n"), None, "одна пустая строка");
         assert_eq!(parse_gpu_name("   \n"), None, "пробельная строка");
         assert_eq!(parse_gpu_name("\"\"\n"), None, "пустая строка в кавычках");
+    }
+
+    #[test]
+    fn short_cuda_reason_missing_library() {
+        let err = AppError::Dsp(
+            "ort: /onnxruntime_src/.../provider_bridge_ort.cc:2043 [ONNXRuntimeError] : 1 : FAIL : \
+             Failed to load library /home/someuser/.models/ort/libonnxruntime_providers_cuda.so \
+             with error: libcublasLt.so.12: cannot open shared object file: No such file or directory"
+                .into(),
+        );
+        assert_eq!(short_cuda_reason(&err), "CUDA-библиотеки не найдены");
+    }
+
+    #[test]
+    fn short_cuda_reason_arch_mismatch() {
+        let err = AppError::Dsp(
+            "ort: CUDA failure 803: system has unsupported display driver / cuda driver combination \
+             (CUBLAS ARCH_MISMATCH)".into(),
+        );
+        assert_eq!(
+            short_cuda_reason(&err),
+            "GPU не поддерживается этой сборкой CUDA"
+        );
+    }
+
+    #[test]
+    fn short_cuda_reason_no_device() {
+        let err = AppError::Dsp("ort: no CUDA-capable device is detected".into());
+        assert_eq!(short_cuda_reason(&err), "CUDA-устройство не найдено");
+    }
+
+    #[test]
+    fn short_cuda_reason_unknown_masks_paths_and_truncates() {
+        let err = AppError::Dsp(format!(
+            "/home/someuser/very/long/path/segment_one/segment_two: weird failure {}",
+            "x".repeat(120)
+        ));
+        let got = short_cuda_reason(&err);
+        assert!(got.contains("<path>"), "путь замаскирован: {got}");
+        assert!(got.ends_with('…'), "длинный текст обрезан с многоточием");
+        assert!(got.chars().count() <= 60);
+        assert!(!got.contains("someuser"), "без имён пользователя");
     }
 
     #[test]
