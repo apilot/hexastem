@@ -10,7 +10,7 @@
 //! ```text
 //! SESS=<...>/2026-10-14-native-rust-engine
 //! ORT_DYLIB_PATH=$SESS/onnxruntime-linux-x64-gpu_cuda12-1.31.0/lib/libonnxruntime.so \
-//! LD_LIBRARY_PATH="$SESS/cudart12/nvidia/cuda_runtime/lib:<nvidia/*/lib из venv>" \
+//! LD_LIBRARY_PATH="$SESS/cudart12/nvidia/cuda_runtime/lib:<nvidia/*/lib>" \
 //! cargo test --release --test native_engine_cuda -- --ignored --nocapture
 //! ```
 

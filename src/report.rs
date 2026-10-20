@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::{Config, Model};
+use crate::config::Config;
 use crate::dedup::{DedupSummary, PairReport};
 use crate::error::AppError;
 use crate::pipeline::{BatchResult, EXPECTED_STEM_COUNT, FileResult, FileStatus, SmbOps, DUPLICATE_PREFIX};
@@ -120,29 +120,18 @@ pub fn console_summary(batch: &BatchResult, skipped: &Skipped) -> String {
     out
 }
 
-/// Короткое имя модели для отчёта.
-fn model_name(model: Model) -> &'static str {
-    match model {
-        Model::Sw => "sw",
-        Model::SixS => "6s",
-    }
-}
-
-/// Шапка: когда/где/чем гоняли (дата-время, host/share, remote-dir, модель).
+/// Шапка: когда/где гоняли (дата-время, host/share, remote-dir, формат).
 fn markdown_header(config: &Config, run_time: SystemTime) -> String {
     format!(
         "# hexastem — отчёт о прогоне\n\n\
          - Дата/время (UTC): {ts}\n\
          - Хост/шара: //{host}/{share}\n\
          - Удалённая директория: {dir}\n\
-         - Модель: {model} ({checkpoint})\n\
          - Формат стемов: {fmt}\n",
         ts = format_utc(run_time),
         host = config.host,
         share = config.share,
         dir = config.remote_dir.display(),
-        model = model_name(config.model),
-        checkpoint = config.model.checkpoint(),
         fmt = config.output_format,
     )
 }
@@ -357,10 +346,7 @@ mod tests {
             share: "music".into(),
             remote_dir: PathBuf::from("kirtan"),
             local_dir: PathBuf::from("/tmp/work"),
-            model: Model::Sw,
-            venv_path: PathBuf::from("/opt/venv"),
             output_format: "flac".into(),
-            engine: crate::EngineKind::Python,
             onnx_model: PathBuf::from("/opt/onnx/model.onnx"),
             smb_creds_file: None,
             local: false,
@@ -468,7 +454,6 @@ mod tests {
 - Дата/время (UTC): 2001-09-09 01:46:40
 - Хост/шара: //nas.local/music
 - Удалённая директория: kirtan
-- Модель: sw (BS-Roformer-SW.ckpt)
 - Формат стемов: flac
 
 ## Сводка

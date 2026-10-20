@@ -12,7 +12,7 @@
 //! ввода и курсор были видны.
 //!
 //! Поля: Host / Share / Remote dir / Local dir (текст с курсором),
-//! Model (sw|6s), Dedup и Local mode (переключатели пробелом). Таб/Shift-Tab
+//! Dedup и Local mode (переключатели пробелом). Таб/Shift-Tab
 //! — фокус, Enter — проверка и старт, Esc — отмена. Для сфокусированного
 //! текстового поля ставится терминальный курсор; длинные значения скроллятся
 //! так, чтобы курсор оставался виден.
@@ -26,7 +26,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::config::Model;
 use crate::tui::app::{Focus, ValidationStatus};
 use crate::tui::i18n::StrTable;
 
@@ -34,7 +33,7 @@ use crate::tui::i18n::StrTable;
 const LABEL_WIDTH: usize = 16;
 /// Размер попапа (обрезается по размеру терминала).
 const POPUP_WIDTH: u16 = 68;
-const POPUP_HEIGHT: u16 = 13;
+const POPUP_HEIGHT: u16 = 12;
 
 const STYLE_DIM: Style = Style::new().fg(Color::DarkGray);
 const STYLE_HINT: Style = Style::new().fg(Color::Gray);
@@ -59,8 +58,6 @@ pub struct PopupView {
     pub share: TextFieldView,
     pub remote_dir: TextFieldView,
     pub local_dir: TextFieldView,
-    /// Модель разделения (переключатель sw|6s).
-    pub model: Model,
     /// Дедупликация включена.
     pub dedup: bool,
     /// Локальная папка вместо SMB.
@@ -126,7 +123,6 @@ fn field_rows(inner: Rect, view: &PopupView, tr: &StrTable) -> Vec<Line<'static>
         text_row(tr.label_share, &view.share, view.focus == Focus::Share, value_width),
         text_row(tr.label_remote_dir, &view.remote_dir, view.focus == Focus::RemoteDir, value_width),
         text_row(tr.label_local_dir, &view.local_dir, view.focus == Focus::LocalDir, value_width),
-        model_row(view, tr),
         toggle_row(tr.label_dedup, view.dedup, tr.toggle_on, tr.toggle_off, view.focus == Focus::Dedup),
         toggle_row(
             tr.label_local_mode,
@@ -174,24 +170,6 @@ fn toggle_row(label: &str, on: bool, on_text: &str, off_text: &str, focused: boo
     ])
 }
 
-/// Переключатель модели: выбранная — `[sw]`/`[6s]` жёлтым, другая — dim.
-fn model_row(view: &PopupView, tr: &StrTable) -> Line<'static> {
-    let segment = |label: &'static str, active: bool| {
-        if active {
-            Span::styled(format!("[{label}]"), STYLE_ACTIVE)
-        } else {
-            Span::styled(format!(" {label} "), STYLE_DIM)
-        }
-    };
-    Line::from(vec![
-        Span::styled(format!("{:<LABEL_WIDTH$}", tr.label_model), STYLE_DIM),
-        Span::raw("  "),
-        segment("sw", view.model == Model::Sw),
-        Span::raw("  "),
-        segment("6s", view.model == Model::SixS),
-    ])
-}
-
 /// Строка статуса валидации: после успешного листинга — факт (сколько .wav
 /// найдено); ноль — жёлтый варнинг (старт не блокируется, но путь под вопросом).
 fn status_row(validation: &ValidationStatus, tr: &StrTable) -> Line<'static> {
@@ -231,7 +209,7 @@ fn cursor_position(inner: Rect, view: &PopupView) -> Option<Position> {
         Focus::Share => (&view.share, 1),
         Focus::RemoteDir => (&view.remote_dir, 2),
         Focus::LocalDir => (&view.local_dir, 3),
-        Focus::Model | Focus::Dedup | Focus::LocalMode => return None,
+        Focus::Dedup | Focus::LocalMode => return None,
     };
     let value_width = inner.width as usize - LABEL_WIDTH;
     let (_, cursor_col) = visible_value(field, value_width);
@@ -282,7 +260,6 @@ mod tests {
             share: field("media"),
             remote_dir: field("/recordings"),
             local_dir: field("/tmp/work"),
-            model: Model::Sw,
             dedup: true,
             local_mode: false,
             focus: Focus::RemoteDir,
@@ -296,7 +273,7 @@ mod tests {
     #[test]
     fn popup_area_is_centered_and_capped() {
         let area = popup_area(Rect::new(0, 0, 100, 30));
-        assert_eq!(area, Rect::new(16, 8, POPUP_WIDTH, POPUP_HEIGHT));
+        assert_eq!(area, Rect::new(16, 9, POPUP_WIDTH, POPUP_HEIGHT));
 
         let small = popup_area(Rect::new(0, 0, 40, 10));
         assert_eq!((small.width, small.height), (40, 10), "не больше экрана");
@@ -318,20 +295,6 @@ mod tests {
         assert!(text.contains("/tmp/work"));
         assert!(text.contains("Enter — проверить и старт"));
         assert!(text.contains("Esc — отмена"));
-    }
-
-    #[test]
-    fn model_row_marks_selected_segment() {
-        let mut six = view();
-        six.model = Model::SixS;
-        let text = buffer_text(&render_popup_frame(100, 30, &six));
-        assert!(text.contains("[6s]"), "выбранная модель в скобках");
-        assert!(text.contains(" sw "), "невыбранная — без скобок");
-        assert!(!text.contains("[sw]"));
-
-        let text = buffer_text(&render_popup_frame(100, 30, &view()));
-        assert!(text.contains("[sw]"));
-        assert!(!text.contains("[6s]"));
     }
 
     #[test]
@@ -404,11 +367,11 @@ mod tests {
     #[test]
     fn focused_field_is_reversed_and_unfocused_are_not() {
         let terminal = render_popup_frame(100, 30, &view());
-        // Remote dir — 4-я строка контента: inner.y = 9 (попап с y=8) + 2.
+        // Remote dir — 3-я строка контента: inner.y = 10 (попап с y=9) + 2.
         let remote_value_x = (16 + LABEL_WIDTH + 1) as u16;
-        let remote_cell = terminal.backend().buffer()[(remote_value_x, 11)].clone();
+        let remote_cell = terminal.backend().buffer()[(remote_value_x, 12)].clone();
         assert!(remote_cell.modifier.contains(Modifier::REVERSED), "фокус подсвечен");
-        let host_cell = terminal.backend().buffer()[(remote_value_x, 9)].clone();
+        let host_cell = terminal.backend().buffer()[(remote_value_x, 10)].clone();
         assert!(!host_cell.modifier.contains(Modifier::REVERSED), "не-фокус без реверса");
     }
 
@@ -419,7 +382,7 @@ mod tests {
         let mut terminal = render_popup_frame(100, 30, &view());
         let position = terminal.backend_mut().get_cursor_position().unwrap();
         // inner.x = 17, значение с колонки 17+12, курсор в конце "/recordings" (+11).
-        assert_eq!(position, Position { x: 44, y: 11 });
+        assert_eq!(position, Position { x: 44, y: 12 });
 
         // Фокус на переключателе — курсор не рисуется.
         let mut toggles = view();
@@ -488,7 +451,7 @@ mod tests {
     #[test]
     fn cursor_position_outside_text_fields_is_none() {
         let mut toggles = view();
-        toggles.focus = Focus::Model;
+        toggles.focus = Focus::LocalMode;
         let area = Rect::new(0, 0, 100, 30);
         assert_eq!(cursor_position(popup_area(area), &toggles), None);
     }

@@ -1,11 +1,10 @@
 //! Нативный движок разделения: трейт [`EngineOps`] поверх DSP-конвейера
 //! крейта (`wav` → `resample` → `chunker` → `stft` → инференс → iSTFT →
-//! кроссфейд → FLAC 24-bit), без python-subprocess.
+//! кроссфейд → FLAC 24-bit), целиком в Rust.
 //!
-//! Эталон семантики — python/separator_driver.py: события протокола
-//! (`progress`/`device`/`file_done`/`file_error`/`batch_done`), ретрай
-//! per-file 1+1, «model hot» (одна сессия ONNX на батч), раскладка стемов
-//! `<output_dir>/<file_stem>/<stem>.flac`.
+//! События прогресса (`progress`/`device`/`file_done`/`file_error`/
+//! `batch_done`), ретрай per-file 1+1, «model hot» (одна сессия ONNX
+//! на батч), раскладка стемов `<output_dir>/<file_stem>/<stem>.flac`.
 //!
 //! # DI (SOLID)
 //!
@@ -21,14 +20,14 @@
 //! Прогресс честный, по чанкам: `pct = (files_done + chunks_done/total)
 //! / total_files` (`est: false`). Между чанками (пока идёт инференс в
 //! воркер-потоке) главный поток тикает оценку `est: true` по скользящему
-//! среднему времени чанка (кап 95%, как у драйвера). `on_event` остаётся
+//! среднему времени чанка (кап 95%). `on_event` остаётся
 //! в вызывающем потоке (он `&mut dyn FnMut`, не `Send`).
 //!
 //! [`NativeEngine::kill_current_engine`] взводит [`AtomicBool`]; проверка —
 //! между чанками (мягкая отмена, флаг-«защёлка»): текущий файл получает
 //! `file_error` «cancelled», ретрай не выполняется, оставшиеся файлы
 //! получают `file_error` сразу, батч завершается `batch_done`. Экземпляр
-//! движка — на один прогон (как `EngineRunner` у TUI), сброс флага не нужен.
+//! движка — на один прогон, сброс флага не нужен.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,11 +52,11 @@ use crate::engine::{CHUNK_SAMPLES, MODEL_SAMPLE_RATE, NUM_STEMS, SPEC_BINS, SPEC
 use crate::error::AppError;
 use crate::pipeline::{EngineEvent, EngineOps, StderrSink};
 
-/// Период est-тиков прогресса между чанками (паритет с драйвером).
+/// Период est-тиков прогресса между чанками.
 const EST_TICK: Duration = Duration::from_millis(1000);
-/// Оценка не заявляет завершение (как `EST_CAP_PCT` драйвера).
+/// Оценка не заявляет завершение.
 const EST_CAP_PCT: f64 = 95.0;
-/// Попыток на файл: 1 проба + 1 ретрай (паритет с драйвером).
+/// Попыток на файл: 1 проба + 1 ретрай.
 const ATTEMPTS_PER_FILE: u32 = 2;
 /// Текст мягкой отмены (виден в отчёте пайплайна).
 const CANCELLED: &str = "native engine cancelled by user";
@@ -286,7 +285,7 @@ fn write_stem_flac(
     Ok(())
 }
 
-/// Локальные пути стемов файла — раскладка драйвера:
+/// Локальные пути стемов файла — раскладка
 /// `<output_dir>/<file_stem>/<stem>.flac` (сырой stem, без trim).
 fn stem_output_paths(output_dir: &Path, file: &Path) -> Vec<PathBuf> {
     let stem = file
@@ -299,7 +298,7 @@ fn stem_output_paths(output_dir: &Path, file: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Квантование pct события прогресса (1 знак, паритет с драйвером).
+/// Квантование pct события прогресса (1 знак).
 fn round_pct(pct: f64) -> f64 {
     (pct * 10.0).round() / 10.0
 }
@@ -365,7 +364,7 @@ pub struct NativeEngine {
     /// Флаг мягкой отмены (взводится `kill_current_engine`).
     cancelled: Arc<AtomicBool>,
     /// Приёмник `[engine]`-строк (диагностика ретраев). По умолчанию
-    /// `eprintln!` (CLI); TUI подставляет канал событий — как у драйвера.
+    /// `eprintln!` (CLI); TUI подставляет канал событий.
     on_stderr: StderrSink,
 }
 
@@ -392,7 +391,7 @@ impl NativeEngine {
         self
     }
 
-    /// Builder: приёмник `[engine]`-строк (паритет с [`crate::pipeline::EngineRunner`]).
+    /// Builder: приёмник `[engine]`-строк (диагностика в TUI/CLI).
     pub fn on_stderr(mut self, sink: Box<dyn Fn(&str) + Send + Sync>) -> Self {
         self.on_stderr = Arc::from(sink);
         self
@@ -402,7 +401,7 @@ impl NativeEngine {
 impl EngineOps for NativeEngine {
     /// Один вызов на батч: сборка бэкенда → per-file (ретрай 1+1) → `batch_done`.
     ///
-    /// Сбой загрузки модели отказывает все файлы (паритет с драйвером);
+    /// Сбой загрузки модели отказывает все файлы;
     /// отказ одного файла батч не останавливает. Отмена (`kill_current_engine`)
     /// завершает текущий файл и все оставшиеся `file_error`-ами.
     fn separate_batch(
@@ -421,7 +420,7 @@ impl EngineOps for NativeEngine {
         let built = match (self.factory)(&self.model_path) {
             Ok(built) => built,
             Err(err) => {
-                // Паритет с драйвером: сбой загрузки модели отказывает все файлы.
+                // Сбой загрузки модели отказывает все файлы батча.
                 let message = format!("model load failed: {err}");
                 for file in files {
                     on_event(EngineEvent::FileError {
@@ -812,14 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn stem_output_paths_follow_driver_layout() {
+    fn stem_output_paths_follow_expected_layout() {
         let paths = stem_output_paths(Path::new("/tmp/out"), Path::new("/work/song.wav"));
         let actual: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let expected: Vec<String> = STEM_NAMES
             .iter()
             .map(|stem| format!("/tmp/out/song/{stem}.flac"))
             .collect();
-        assert_eq!(actual, expected, "раскладка и имена — как у python-драйвера");
+        assert_eq!(actual, expected, "раскладка и имена стемов");
     }
 
     #[test]
@@ -1300,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_model_load_failure_fails_whole_batch_like_driver() {
+    fn engine_model_load_failure_fails_whole_batch() {
         let dir = temp_dir("loadfail");
         let wav = dir.join("a.wav");
         write_wav(&wav, 44_100, &sine_stereo(44_100, 0.2, 110.0));

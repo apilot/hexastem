@@ -78,7 +78,7 @@ pub struct StrTable {
     // --- шапка ---
     pub model_loading: fn(f64) -> String,
     pub gpu_na: &'static str,
-    /// Имя вычислительного устройства движка (событие `device` драйвера).
+    /// Имя вычислительного устройства движка (событие `device`).
     pub computing_on: fn(&str) -> String,
 
     // --- футер ---
@@ -171,7 +171,6 @@ pub struct StrTable {
     pub label_share: &'static str,
     pub label_remote_dir: &'static str,
     pub label_local_dir: &'static str,
-    pub label_model: &'static str,
     pub label_dedup: &'static str,
     pub label_local_mode: &'static str,
     pub toggle_on: &'static str,
@@ -240,7 +239,7 @@ static RU: StrTable = StrTable {
     gpu_na: "GPU: n/a",
     computing_on: |name| format!("Считает: {name}"),
 
-    keyhints: "[s]тарт [p]ауза [r]етрай [m]одель [o]тчёт [?]справка [q]выход",
+    keyhints: "[s]тарт [p]ауза [r]етрай [o]тчёт [?]справка [q]выход",
     files_word: "файлы",
     footer_error: |error| format!("ошибка: {error}"),
 
@@ -306,7 +305,7 @@ static RU: StrTable = StrTable {
     help_confirm: "подтвердить в диалогах и попапе",
     help_close: "закрыть попап/справку/диалог",
     help_quit: "выход; в Running — подтверждение отмены",
-    help_reserved: "модель/отчёт — зарезервировано",
+    help_reserved: "отчёт — зарезервировано",
     help_lang: "язык интерфейса (ru/en)",
     help_clip_legend: " CLIP: K/D — клипует хранитель/дубль · REN: ✓ — переименован",
 
@@ -324,7 +323,6 @@ static RU: StrTable = StrTable {
     label_share: "Шара:",
     label_remote_dir: "Исходная папка:",
     label_local_dir: "Рабочая папка:",
-    label_model: "Модель:",
     label_dedup: "Дедуп:",
     label_local_mode: "Локально:",
     toggle_on: "вкл",
@@ -395,7 +393,7 @@ static EN: StrTable = StrTable {
     gpu_na: "GPU: n/a",
     computing_on: |name| format!("Compute: {name}"),
 
-    keyhints: "[s]tart [p]ause [r]etry [m]odel [o]pen report [?]help [q]uit",
+    keyhints: "[s]tart [p]ause [r]etry [o]pen report [?]help [q]uit",
     files_word: "files",
     footer_error: |error| format!("error: {error}"),
 
@@ -461,7 +459,7 @@ static EN: StrTable = StrTable {
     help_confirm: "confirm in dialogs and popup",
     help_close: "close popup/help/dialog",
     help_quit: "quit; in Running — cancel confirmation",
-    help_reserved: "model/report — reserved",
+    help_reserved: "report — reserved",
     help_lang: "interface language (ru/en)",
     help_clip_legend: " CLIP: K/D — keeper/duplicate clips · REN: ✓ — renamed",
 
@@ -479,7 +477,6 @@ static EN: StrTable = StrTable {
     label_share: "Share:",
     label_remote_dir: "Remote dir:",
     label_local_dir: "Local dir:",
-    label_model: "Model:",
     label_dedup: "Dedup:",
     label_local_mode: "Local mode:",
     toggle_on: "on",

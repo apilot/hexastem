@@ -12,7 +12,7 @@
 //! Жизненный цикл прогона: Enter в попапе → локальные проверки → тяжёлая
 //! валидация (листинг шары через реальный бэкенд, с фактом «сколько .wav»)
 //! → повторный Enter подтверждает старт → [`runner::spawn`] с
-//! `SmbClient`/`EngineRunner` (или `LocalFs` в local mode) + GPU-поллер;
+//! `SmbClient`+`NativeEngine` (или `LocalFs` в local mode) + GPU-поллер;
 //! `BatchFinished` → State::Finished; retry'и из экрана Finished живут, пока
 //! пользователь не уйдёт с него (shutdown) или не выйдет из TUI — итог серии
 //! ([`runner::exit_code`]) становится кодом завершения процесса.
@@ -32,7 +32,6 @@ pub mod runner;
 pub mod widgets;
 
 use std::io::{self};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,10 +48,10 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::{EngineKind, Model, default_onnx_model};
+use crate::config::default_onnx_model;
 use crate::engine::native::NativeEngine;
 use crate::local_fs::LocalFs;
-use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
+use crate::pipeline::{EngineOps, SmbOps};
 use crate::smb::SmbClient;
 use crate::tui::event::{
     spawn_input_thread, AppEvent, BatchOutcome, RunSpec, Stage,
@@ -80,29 +79,22 @@ const ENVELOPE_COLUMNS: usize = 200;
 /// Кооперативная пауза при включённой паузе (применяется на границе файлов).
 const PAUSE_WHEN_PAUSED: Duration = Duration::from_secs(30);
 
-/// Аргументы TUI-бинарника (мини-clap): пока только выбор движка. Движок —
-/// тот же [`EngineKind`], что у CLI (`value_enum` даёт `--engine python|native`).
+/// Аргументы TUI-бинарника (мини-clap): флагов нет — движок один (native).
 #[derive(Debug, clap::Parser)]
 #[command(name = "hexastem_tui", about = "SMB batch stem-separation TUI")]
-pub struct TuiArgs {
-    /// Движок разделения: native (Rust DSP + ONNX Runtime CUDA, дефолт) или
-    /// python (legacy subprocess audio-separator).
-    #[arg(long, value_enum, default_value = "native")]
-    pub engine: EngineKind,
-}
+pub struct TuiArgs {}
 
 /// Точка входа TUI: `init → event loop → restore`, возвращает код выхода
 /// последнего прогона (`runner::exit_code`; 0 — прогонов не было).
-/// Движок прогона задаётся флагом CLI (`--engine`, дефолт native).
 ///
 /// Panic-safe: `ratatui::init` ставит panic hook, восстанавливающий
 /// терминал; поверх него цепочкой ставится hook, гасящий bracketed paste.
-pub async fn run(engine: EngineKind) -> io::Result<i32> {
+pub async fn run() -> io::Result<i32> {
     let terminal = ratatui::init();
     wrap_panic_hook_with_paste_restore();
     let paste_enabled = enable_bracketed_paste().is_ok();
     let mouse_enabled = enable_mouse_capture().is_ok();
-    let result = event_loop(terminal, engine).await;
+    let result = event_loop(terminal).await;
     ratatui::restore();
     if paste_enabled {
         let _ = disable_bracketed_paste();
@@ -115,10 +107,9 @@ pub async fn run(engine: EngineKind) -> io::Result<i32> {
 
 /// Основной цикл: отрисовать кадр → ждать событие (ввод/внутренние/GPU/tick)
 /// → обновить App → синхронизировать флаги управления с раннером.
-/// Движок прогона (`engine`) выбирается флагом CLI.
 ///
 /// Выход: quit по клавише либо закрытие канала ввода (читатель умер).
-async fn event_loop(mut terminal: DefaultTerminal, engine: EngineKind) -> io::Result<i32> {
+async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
     let (tx_input, mut rx_input) = mpsc::unbounded_channel::<AppEvent>();
     spawn_input_thread(tx_input);
     let (tx_events, mut rx_events) = mpsc::unbounded_channel::<AppEvent>();
@@ -188,7 +179,7 @@ async fn event_loop(mut terminal: DefaultTerminal, engine: EngineKind) -> io::Re
         // спека уже проверена — сохранить пресет и запустить прогон.
         if let Some(spec) = app.take_confirmed_start() {
             let _ = persist::save(&settings_of_spec(&spec, app.lang()));
-            run = Some(start_run(spec, engine, tx_events.clone(), tx_gpu.clone()));
+            run = Some(start_run(spec, tx_events.clone(), tx_gpu.clone()));
         }
         quit |= app.should_quit();
     }
@@ -241,7 +232,7 @@ fn event_log_messages(event: &AppEvent, table: &StrTable) -> Vec<String> {
         AppEvent::DuplicatesKnown { names } => {
             vec![(table.dups_known_log)(&names.join(", "))]
         }
-        // Строки `[engine]` (прогресс/сводка драйвера) — как есть в таб Log.
+        // Строки `[engine]` (прогресс/сводка движка) — как есть в таб Log.
         AppEvent::EngineLog { line } => vec![line.clone()],
         AppEvent::BatchFinished { outcome } => batch_log_messages(outcome, table),
         _ => Vec::new(),
@@ -275,7 +266,7 @@ fn sync_run_controls(app: &mut App, run: Option<&ActiveRun>) {
     if app.cancel_requested() {
         active.handle.cancel();
     }
-    // Форс-отмена: убить subprocess движка немедленно (текущий файл без
+    // Форс-отмена: убить движок немедленно (текущий файл без
     // rename — resume); раннер завершится ошибкой, finish не зависнет.
     if app.take_force_kill() {
         active.handle.force_kill();
@@ -286,11 +277,10 @@ fn sync_run_controls(app: &mut App, run: Option<&ActiveRun>) {
     }
 }
 
-/// Запустить серию: бэкенды по спеке (LocalFs / SmbClient + движок по
-/// `engine_kind`), раннер и GPU-поллер. Прежний прогон к этому моменту погашен.
+/// Запустить серию: бэкенды по спеке (LocalFs / SmbClient + NativeEngine),
+/// раннер и GPU-поллер. Прежний прогон к этому моменту погашен.
 fn start_run(
     spec: RunSpec,
-    engine_kind: EngineKind,
     tx_events: UnboundedSender<AppEvent>,
     tx_gpu: UnboundedSender<GpuEvent>,
 ) -> ActiveRun {
@@ -299,26 +289,10 @@ fn start_run(
     } else {
         Arc::new(SmbClient::new(spec.host.clone(), spec.share.clone(), None))
     };
-    let engine: Arc<dyn EngineOps + Send + Sync> = match engine_kind {
-        // Нативный DSP-движок: ONNX напрямую (та же крейто-относительная
-        // модель, что у CLI); события протокола идут напрямую —
-        // rtf-оценка и приёмник stderr не нужны.
-        EngineKind::Native => Arc::new(NativeEngine::new(&default_onnx_model())),
-        // Python-драйвер: subprocess; stderr — в общий канал событий
-        // (только таб Log, терминал TUI не засоряется — A: STDERR-ЛИК).
-        EngineKind::Python => {
-            let tx_engine_log = tx_events.clone();
-            Arc::new(
-                EngineRunner::new(&venv_path(), &driver_script(), spec.model.checkpoint(), OUTPUT_FORMAT)
-                    // Стартовая RTF-оценка модели для estimированного
-                    // separate-прогресса (уточняется им по бою между файлами).
-                    .with_rtf_estimate(spec.model.rtf_estimate())
-                    .on_stderr(Box::new(move |line: &str| {
-                        let _ = tx_engine_log.send(AppEvent::EngineLog { line: line.to_string() });
-                    })),
-            )
-        }
-    };
+    // Нативный DSP-движок: ONNX напрямую (крейто-относительная модель,
+    // как у CLI); stderr-приёмник не нужен — `[engine]`-строки пайплайн
+    // печатает сам.
+    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(NativeEngine::new(&default_onnx_model()));
     let deps = runner::RunnerDeps { smb, engine };
     let opts = RunnerOptions {
         remote_dir: spec.remote_dir.clone(),
@@ -411,21 +385,10 @@ fn settings_of_spec(spec: &RunSpec, lang: Lang) -> TuiSettings {
         share: spec.share.clone(),
         remote_dir: spec.remote_dir.to_string_lossy().into_owned(),
         local_dir: spec.local_dir.to_string_lossy().into_owned(),
-        model: persist::model_label(spec.model).to_string(),
         dedup: spec.dedup,
         local_mode: spec.local_mode,
         lang: lang.label().to_string(),
     }
-}
-
-/// venv с audio-separator (как дефолт CLI).
-fn venv_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv")
-}
-
-/// Python-драйвер относительно крейта (путь фиксируется при сборке).
-fn driver_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/separator_driver.py")
 }
 
 // --- bracketed paste и захват мыши ------------------------------------------------
@@ -579,7 +542,7 @@ fn current_file_view(app: &App, table: &StrTable) -> Option<CurrentFileView> {
     })
 }
 
-/// Шапка: подключение/дир/модель из открытого конфига, GPU-слот из поллера,
+/// Шапка: подключение/дир из открытого конфига, GPU-слот из поллера,
 /// индикатор загрузки модели — глобальный.
 fn header_view(app: &App) -> HeaderView {
     let model_pct = app.model_pct();
@@ -596,16 +559,10 @@ fn header_view(app: &App) -> HeaderView {
         host: cfg.host.as_str().to_string(),
         share: cfg.share.as_str().to_string(),
         remote_dir: cfg.remote_dir.as_str().to_string(),
-        model: model_label(cfg.model).to_string(),
         gpu: app.gpu().cloned(),
         compute_device,
         model_pct,
     }
-}
-
-/// Метка модели как в CLI (`sw` | `6s`).
-fn model_label(model: Model) -> &'static str {
-    persist::model_label(model)
 }
 
 /// Строка таблицы из модели прогона: бейдж и стадия по исходу (терминальные
@@ -971,7 +928,7 @@ mod tests {
 
         feed(&mut app, AppEvent::FileStems { name: "a.wav".into(), count: 6 });
         let text = render(100, 30, &app);
-        assert!(text.contains("6/6"), "живой счётчик по событию драйвера: {text}");
+        assert!(text.contains("6/6"), "живой счётчик по событию движка: {text}");
     }
 
     #[test]
@@ -1077,7 +1034,7 @@ mod tests {
         assert!(!text.contains("n/a"));
     }
 
-    /// Событие `device` драйвера обновляет шапку («Считает: …»); до события —
+    /// Событие `device` обновляет шапку («Считает: …»); до события —
     /// прежний рендер (слота нет, GPU-виджет «n/a»).
     #[test]
     fn device_event_shows_computing_in_header() {
@@ -1091,25 +1048,11 @@ mod tests {
         assert!(text.contains("Считает: RTX 4090"), "событие device обновляет шапку: {text}");
     }
 
-    // --- выбор движка CLI (--engine, мини-clap TUI) ---------------------------
+    // --- аргументы TUI (мини-clap) --------------------------------------------
 
     #[test]
-    fn tui_engine_defaults_to_native() {
-        let args = TuiArgs::try_parse_from(["hexastem_tui"]).expect("запуск без аргументов валиден");
-        assert_eq!(args.engine, EngineKind::Native, "дефолт движка — native (T13)");
-    }
-
-    #[test]
-    fn tui_engine_flag_switches_to_python() {
-        let args =
-            TuiArgs::try_parse_from(["hexastem_tui", "--engine", "python"]).expect("валидный флаг");
-        assert_eq!(args.engine, EngineKind::Python);
-    }
-
-    #[test]
-    fn tui_unknown_engine_value_is_rejected() {
-        let result = TuiArgs::try_parse_from(["hexastem_tui", "--engine", "bogus"]);
-        assert!(result.is_err(), "неизвестное значение --engine отклоняется (clap → код 2)");
+    fn tui_args_parse_without_any_flags() {
+        let _args = TuiArgs::try_parse_from(["hexastem_tui"]).expect("запуск без аргументов валиден");
     }
 
     // --- валидация спеки (реальный диск, без сети) ----------------------------
@@ -1124,7 +1067,6 @@ mod tests {
             share: String::new(),
             remote_dir: base.clone(),
             local_dir: base.join("work"),
-            model: Model::Sw,
             dedup: true,
             local_mode: true,
         };
@@ -1149,7 +1091,6 @@ mod tests {
             share: String::new(),
             remote_dir: base.clone(),
             local_dir: base.join("work"),
-            model: Model::Sw,
             dedup: true,
             local_mode: true,
         };
@@ -1170,7 +1111,6 @@ mod tests {
             share: String::new(),
             remote_dir: base.join("nope"),
             local_dir: base.clone(),
-            model: Model::Sw,
             dedup: true,
             local_mode: true,
         };
@@ -1188,7 +1128,6 @@ mod tests {
             share: "media".into(),
             remote_dir: "/rec".into(),
             local_dir: std::env::temp_dir(),
-            model: Model::Sw,
             dedup: true,
             local_mode: false,
         };
@@ -1333,12 +1272,11 @@ mod tests {
             share: String::new(),
             remote_dir: base.clone(),
             local_dir: base.join("work"),
-            model: Model::Sw,
             dedup: true,
             local_mode: true,
         };
 
-        let active = start_run(spec, EngineKind::Python, tx_events, tx_gpu);
+        let active = start_run(spec, tx_events, tx_gpu);
         let event = tokio::time::timeout(Duration::from_secs(30), rx_events.recv())
             .await
             .expect("раннер завис")
@@ -1351,21 +1289,18 @@ mod tests {
     }
 
     #[test]
-    fn settings_and_model_labels_roundtrip_through_spec() {
+    fn settings_roundtrip_through_spec() {
         let spec = RunSpec {
             host: "nas".into(),
             share: "media".into(),
             remote_dir: "/rec".into(),
             local_dir: "/tmp/w".into(),
-            model: Model::SixS,
             dedup: false,
             local_mode: true,
         };
 
         let settings = settings_of_spec(&spec, Lang::Ru);
 
-        assert_eq!(settings.model, "6s");
-        assert_eq!(settings.model(), Model::SixS);
         assert!(!settings.dedup);
         assert!(settings.local_mode);
         assert_eq!(settings.remote_dir, "/rec");

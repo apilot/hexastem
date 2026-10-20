@@ -7,10 +7,10 @@ use std::time::SystemTime;
 
 use clap::Parser;
 
-use hexastem::pipeline::{plan, BatchPlan, BatchResult, EngineOps, EngineRunner, Pipeline, SmbOps};
+use hexastem::pipeline::{plan, BatchPlan, BatchResult, EngineOps, Pipeline, SmbOps};
 use hexastem::report::{self, Skipped};
 use hexastem::smb::SmbClient;
-use hexastem::{Config, EngineKind};
+use hexastem::Config;
 
 use hexastem::engine::native::NativeEngine;
 use hexastem::error::AppError;
@@ -26,7 +26,7 @@ fn main() {
 /// в stderr и код 1; отдельные файлы отказом прогон не роняют.
 fn run(config: &Config) -> i32 {
     let smb = storage_backend(config);
-    let engine = match engine_runner(config) {
+    let engine = match native_engine(config) {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("hexastem: {err}");
@@ -56,33 +56,17 @@ fn storage_backend(config: &Config) -> Box<dyn SmbOps> {
     }
 }
 
-/// Драйвер разделения: `--engine python` — python-драйвер (venv из конфига,
-/// скрипт — `python/` крейта), `--engine native` — нативный DSP-движок
-/// (ONNX-модель из конфига; dylib ONNX Runtime — через ORT_DYLIB_PATH).
-/// Native пишет только FLAC: другой output_format — ошибка конфигурации.
-fn engine_runner(config: &Config) -> Result<Box<dyn EngineOps>, AppError> {
-    match config.engine {
-        EngineKind::Python => Ok(Box::new(EngineRunner::new(
-            &config.venv_path,
-            &driver_script(),
-            config.model.checkpoint(),
-            &config.output_format,
-        ))),
-        EngineKind::Native => {
-            if !config.output_format.eq_ignore_ascii_case("flac") {
-                return Err(AppError::Config(format!(
-                    "native engine writes FLAC stems only, --output-format `{}` is not supported",
-                    config.output_format
-                )));
-            }
-            Ok(Box::new(NativeEngine::new(&config.onnx_model)))
-        }
+/// Движок разделения — единственный, нативный (ONNX-модель из конфига;
+/// dylib ONNX Runtime — через ORT_DYLIB_PATH). Пишет только FLAC:
+/// другой output_format — ошибка конфигурации.
+fn native_engine(config: &Config) -> Result<Box<dyn EngineOps>, AppError> {
+    if !config.output_format.eq_ignore_ascii_case("flac") {
+        return Err(AppError::Config(format!(
+            "native engine writes FLAC stems only, --output-format `{}` is not supported",
+            config.output_format
+        )));
     }
-}
-
-/// Python-драйвер относительно крейта (путь фиксируется при сборке).
-fn driver_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/separator_driver.py")
+    Ok(Box::new(NativeEngine::new(&config.onnx_model)))
 }
 
 /// Итог прогона: батч, скипы плана и путь отчёта на хранилище
@@ -128,7 +112,7 @@ mod tests {
 
     use hexastem::pipeline::{EngineEvent, EXPECTED_STEMS};
     use hexastem::smb::SmbEntry;
-    use hexastem::{Config, Model};
+    use hexastem::Config;
 
     use super::*;
 
@@ -265,7 +249,7 @@ mod tests {
     }
 
     /// Движок-мок: на каждый файл — 6 фейковых стемов на диске и `file_done`
-    /// (как реальный драйвер); файл, чей stem совпал с `fail_stem`, получает
+    /// (как реальный движок); файл, чей stem совпал с `fail_stem`, получает
     /// `file_error` без стемов. Завершает `batch_done` со счётчиками.
     struct StubEngine {
         fail_stem: Option<String>,
@@ -318,7 +302,7 @@ mod tests {
         }
     }
 
-    /// Локальные пути стемов файла (порядок EXPECTED_STEMS) — как у драйвера.
+    /// Локальные пути стемов файла (порядок EXPECTED_STEMS) — как у движка.
     fn stub_stem_paths(output_dir: &Path, base: &str) -> Vec<String> {
         EXPECTED_STEMS
             .iter()
@@ -345,10 +329,7 @@ mod tests {
             share: "local".to_string(),
             remote_dir: remote_dir.to_path_buf(),
             local_dir: local_dir.to_path_buf(),
-            model: Model::Sw,
-            venv_path: PathBuf::from("/unused/venv"),
             output_format: "flac".to_string(),
-            engine: EngineKind::Python,
             onnx_model: PathBuf::from("/unused/onnx/model.onnx"),
             smb_creds_file: None,
             local: true,

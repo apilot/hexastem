@@ -147,7 +147,8 @@ impl FileBadge {
 
 // --- view-структуры --------------------------------------------------------------
 
-/// Шапка: подключение + модель. `gpu: None` → «GPU: n/a» (поллер — seq 06).
+/// Шапка: подключение + индикатор загрузки модели. `gpu: None` → «GPU: n/a»
+/// (поллер — seq 06).
 #[derive(Debug, Clone, Default)]
 pub struct HeaderView {
     /// Хост SMB.
@@ -156,11 +157,9 @@ pub struct HeaderView {
     pub share: String,
     /// Удалённая директория прогона.
     pub remote_dir: String,
-    /// Модель разделения (`sw` | `6s`).
-    pub model: String,
     /// Снимок GPU-поллера, когда он поднят.
     pub gpu: Option<GpuView>,
-    /// Имя вычислительного устройства движка (событие `device` драйвера):
+    /// Имя вычислительного устройства движка (событие `device`):
     /// шапка показывает «Считает: <name>»; `None` — слот скрыт, GPU-виджет
     /// живёт прежней семантикой («GPU: n/a» до данных поллера).
     pub compute_device: Option<String>,
@@ -550,7 +549,7 @@ fn column_peak(peaks: &[f32], col: usize, columns: usize) -> f32 {
 
 // --- рендеры ---------------------------------------------------------------------
 
-/// Шапка: `hexastem ─ //host/share ─ dir ─ модель ─ GPU [бар] mem`.
+/// Шапка: `hexastem ─ //host/share ─ dir ─ GPU [бар] mem`.
 pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView, tr: &StrTable) {
     let block = Block::bordered().border_type(BorderType::Rounded).title(" hexastem ");
     let inner = block.inner(area);
@@ -562,7 +561,7 @@ pub fn render_header(frame: &mut Frame, area: Rect, view: &HeaderView, tr: &StrT
     frame.render_widget(Paragraph::new(line), inner);
 }
 
-/// Спаны шапки: подключение, директория, модель (+загрузка), GPU-слот.
+/// Спаны шапки: подключение, директория, загрузка модели, GPU-слот.
 fn header_spans(view: &HeaderView, tr: &StrTable) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled("hexastem", STYLE_HEADER),
@@ -570,15 +569,13 @@ fn header_spans(view: &HeaderView, tr: &StrTable) -> Vec<Span<'static>> {
         Span::styled(format!("//{}/{}", view.host, view.share), Style::new().fg(Color::Cyan)),
         Span::raw(" ─ "),
         Span::raw(view.remote_dir.clone()),
-        Span::raw(" ─ "),
-        Span::styled(view.model.clone(), Style::new().add_modifier(Modifier::BOLD)),
     ];
     if let Some(pct) = view.model_pct {
         // Глобальная загрузка модели: видна только пока идёт (до 100%).
         spans.push(Span::raw(" ─ "));
         spans.push(Span::styled((tr.model_loading)(pct), STYLE_FILL));
     }
-    // Устройство движка («Считает: RTX 4090» / «cpu»): пока драйвер не
+    // Устройство движка («Считает: RTX 4090» / «cpu»): пока движок не
     // сообщил — слота нет, GPU-виджет остаётся прежним.
     if let Some(name) = &view.compute_device {
         spans.push(Span::raw(" ─ "));
@@ -1206,7 +1203,7 @@ fn help_lines(tr: &StrTable) -> Vec<(&'static str, &'static str)> {
         ("Enter", tr.help_confirm),
         ("Esc", tr.help_close),
         ("q/Esc", tr.help_quit),
-        ("m/o", tr.help_reserved),
+        ("o", tr.help_reserved),
     ]
 }
 
@@ -1722,18 +1719,18 @@ mod tests {
 
     #[test]
     fn header_shows_model_load_indicator_only_while_active() {
-        let loading = HeaderView { model: "sw".into(), model_pct: Some(37.4), ..HeaderView::default() };
+        let loading = HeaderView { model_pct: Some(37.4), ..HeaderView::default() };
         let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading, tr())));
         assert!(text.contains("модель: 37%"), "глобальная загрузка модели видна");
 
-        let idle = HeaderView { model: "sw".into(), ..HeaderView::default() };
+        let idle = HeaderView::default();
         let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &idle, tr())));
         assert!(!text.contains("модель:"), "вне загрузки слот скрыт");
     }
 
     #[test]
     fn header_model_loading_label_in_both_locales() {
-        let loading = HeaderView { model: "sw".into(), model_pct: Some(37.4), ..HeaderView::default() };
+        let loading = HeaderView { model_pct: Some(37.4), ..HeaderView::default() };
         let text = buffer_text(&render_frame(100, 3, |f, a| render_header(f, a, &loading, tr())));
         assert!(text.contains("модель: 37%"), "ru: {text}");
 
@@ -1879,7 +1876,6 @@ mod tests {
             host: "nas.local".into(),
             share: "media".into(),
             remote_dir: "/recordings".into(),
-            model: "sw".into(),
             gpu: None,
             compute_device: None,
             model_pct: None,
@@ -1934,13 +1930,12 @@ mod tests {
     const MID_PEAK_COLOR: Color = Color::Rgb(0xC0, 0x60, 0x00);
 
     #[test]
-    fn header_renders_connection_model_and_gpu_placeholder() {
+    fn header_renders_connection_and_gpu_placeholder() {
         let terminal = render_frame(80, 3, |f, area| render_header(f, area, &header_view(), tr()));
         let text = buffer_text(&terminal);
         assert!(text.contains("hexastem"));
         assert!(text.contains("//nas.local/media"));
         assert!(text.contains("/recordings"));
-        assert!(text.contains("sw"));
         assert!(text.contains("GPU: n/a"));
     }
 
@@ -2233,7 +2228,6 @@ mod tests {
         assert!(text.contains("[s]тарт"));
         assert!(text.contains("[p]ауза"));
         assert!(text.contains("[r]етрай"));
-        assert!(text.contains("[m]одель"));
         assert!(text.contains("[o]тчёт"));
         assert!(text.contains("[?]справка"));
         assert!(text.contains("[q]выход"));
@@ -2612,7 +2606,7 @@ mod tests {
         assert!(text.contains("очистить журнал"), "c");
         assert!(text.contains("PgUp/PgDn"), "прокрутка");
         assert!(text.contains("подтверждение отмены"), "q/Esc в Running");
-        assert!(text.contains("зарезервировано"), "m/o");
+        assert!(text.contains("зарезервировано"), "o");
         assert!(text.contains("язык интерфейса"), "l — переключатель языка");
         assert!(text.contains("K/D — клипует"), "легенда CLIP");
     }

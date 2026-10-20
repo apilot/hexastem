@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::config::Model;
 use crate::envelope::StereoEnvelope;
 use crate::pipeline::{FileStatus, EXPECTED_STEM_COUNT};
 use crate::tui::event::{AppEvent, BatchOutcome, PlanSummary, RunSpec, Stage};
@@ -91,14 +90,14 @@ pub struct FileView {
     pub stage: Stage,
     /// Процент отдельной стадии (Separate/Download); `estimated` — оценка.
     pub pct: Option<f64>,
-    /// `true` — pct оценочный (драйвер не знает реальный прогресс separate),
-    /// UI помечает такой процент тильдой «~NN%».
+    /// `true` — pct оценочный (движок на separate даёт честный процент,
+    /// поллер — нет), UI помечает такой процент тильдой «~NN%».
     pub estimated: bool,
     /// Полная стерео-огибающая пиков (после download; ровно 1 раз на файл).
     pub envelope: Option<Arc<StereoEnvelope>>,
     /// Терминальный исход (Ok/Failed/Duplicate/Skipped).
     pub outcome: Option<FileOutcome>,
-    /// Готовых стемов (факт от драйвера); `None` — счётчик неизвестен:
+    /// Готовых стемов (факт от движка); `None` — счётчик неизвестен:
     /// колонка STEMS рисует «—», а не врущее «0/6».
     pub stems_done: Option<u8>,
     /// Момент входа в текущую стадию: тикающий таймер стадии в UI.
@@ -180,7 +179,7 @@ fn byte_index(value: &str, char_index: usize) -> usize {
     value.char_indices().nth(char_index).map_or(value.len(), |(byte, _)| byte)
 }
 
-/// Фокус попапа запуска: четыре текстовых поля и три переключателя.
+/// Фокус попапа запуска: четыре текстовых поля и два переключателя.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
     #[default]
@@ -188,18 +187,16 @@ pub enum Focus {
     Share,
     RemoteDir,
     LocalDir,
-    Model,
     Dedup,
     LocalMode,
 }
 
 /// Порядок обхода фокуса Tab/Shift-Tab (кольцевой).
-const FOCUS_ORDER: [Focus; 7] = [
+const FOCUS_ORDER: [Focus; 6] = [
     Focus::Host,
     Focus::Share,
     Focus::RemoteDir,
     Focus::LocalDir,
-    Focus::Model,
     Focus::Dedup,
     Focus::LocalMode,
 ];
@@ -228,7 +225,6 @@ pub struct ConfigState {
     pub share: TextField,
     pub remote_dir: TextField,
     pub local_dir: TextField,
-    pub model: Model,
     pub dedup: bool,
     pub local_mode: bool,
     pub focus: Focus,
@@ -245,7 +241,6 @@ impl ConfigState {
             share: TextField::new(preset.share.clone()),
             remote_dir: TextField::new(preset.remote_dir.clone()),
             local_dir: TextField::new(preset.local_dir.clone()),
-            model: preset.model(),
             dedup: preset.dedup,
             local_mode: preset.local_mode,
             focus: Focus::default(),
@@ -298,7 +293,7 @@ impl ConfigState {
             Focus::Share => Some(&mut self.share),
             Focus::RemoteDir => Some(&mut self.remote_dir),
             Focus::LocalDir => Some(&mut self.local_dir),
-            Focus::Model | Focus::Dedup | Focus::LocalMode => None,
+            Focus::Dedup | Focus::LocalMode => None,
         }
     }
 
@@ -308,7 +303,7 @@ impl ConfigState {
             Focus::Share => Some(&self.share),
             Focus::RemoteDir => Some(&self.remote_dir),
             Focus::LocalDir => Some(&self.local_dir),
-            Focus::Model | Focus::Dedup | Focus::LocalMode => None,
+            Focus::Dedup | Focus::LocalMode => None,
         }
     }
 
@@ -340,7 +335,6 @@ impl ConfigState {
             share: self.share.as_str().trim().to_string(),
             remote_dir: PathBuf::from(self.remote_dir.as_str().trim()),
             local_dir: PathBuf::from(self.local_dir.as_str().trim()),
-            model: self.model,
             dedup: self.dedup,
             local_mode: self.local_mode,
         }
@@ -391,13 +385,8 @@ impl ConfigState {
         }
     }
 
-    /// Left/Right: в текстовом поле — курсор, на модели — переключение.
+    /// Left/Right: в текстовом поле — курсор.
     fn on_horizontal(&mut self, forward: bool) {
-        if self.focus == Focus::Model {
-            self.toggle_model();
-            self.invalidate_validation();
-            return;
-        }
         if let Some(field) = self.focused_field_mut() {
             if forward {
                 field.right();
@@ -409,7 +398,6 @@ impl ConfigState {
 
     fn on_char(&mut self, c: char) {
         match self.focus {
-            Focus::Model if c == ' ' => self.toggle_model(),
             Focus::Dedup if c == ' ' => self.dedup = !self.dedup,
             Focus::LocalMode if c == ' ' => self.local_mode = !self.local_mode,
             _ => {
@@ -418,13 +406,6 @@ impl ConfigState {
                 }
             }
         }
-    }
-
-    fn toggle_model(&mut self) {
-        self.model = match self.model {
-            Model::Sw => Model::SixS,
-            Model::SixS => Model::Sw,
-        };
     }
 }
 
@@ -459,7 +440,7 @@ pub struct App {
     pending_start: Option<RunSpec>,
     /// Снимок GPU-поллера для шапки.
     gpu: Option<GpuView>,
-    /// Имя вычислительного устройства движка (событие `device` драйвера):
+    /// Имя вычислительного устройства движка (событие `device`):
     /// шапка показывает «Считает: <name>»; пока не пришло — `None`.
     gpu_device_name: Option<String>,
     /// История утилизации GPU (%) для спарклайна в шапке (btop-стиль).
@@ -630,7 +611,6 @@ impl App {
             share: field(&cfg.share),
             remote_dir: field(&cfg.remote_dir),
             local_dir: field(&cfg.local_dir),
-            model: cfg.model,
             dedup: cfg.dedup,
             local_mode: cfg.local_mode,
             focus: cfg.focus,
@@ -649,7 +629,7 @@ impl App {
         self.gpu.as_ref()
     }
 
-    /// Имя вычислительного устройства движка (`None` — драйвер ещё не сообщил).
+    /// Имя вычислительного устройства движка (`None` — движок ещё не сообщил).
     pub fn gpu_device_name(&self) -> Option<&str> {
         self.gpu_device_name.as_deref()
     }
@@ -728,7 +708,7 @@ impl App {
             }
             // Устройство движка (после загрузки модели) — для шапки.
             AppEvent::Device { name } => self.gpu_device_name = Some(name.clone()),
-            // Живой счётчик стемов (список пришёл от драйвера).
+            // Живой счётчик стемов (список пришёл от движка).
             AppEvent::FileStems { name, count } => {
                 self.update_file(name, |file| file.stems_done = Some(*count));
             }
@@ -1573,7 +1553,7 @@ mod tests {
 
         app.handle(&AppEvent::FileStems { name: "a.wav".into(), count: 6 });
 
-        assert_eq!(app.files()[0].stems_done, Some(6), "живой счётчик от драйвера");
+        assert_eq!(app.files()[0].stems_done, Some(6), "живой счётчик от движка");
         assert_eq!(app.files()[0].outcome, None, "терминальный исход не тронут");
     }
 
@@ -1767,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn device_name_resets_on_new_run_until_driver_reports() {
+    fn device_name_resets_on_new_run_until_engine_reports() {
         let mut app = App::new();
         start_run(&mut app);
         app.handle(&AppEvent::Device { name: "RTX".into() });

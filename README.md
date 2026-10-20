@@ -4,10 +4,8 @@ SMB batch stem-separation pipeline: берёт `.wav`-записи из дире
 (по SMB, без монтирования), разделяет их нейросетью на 6 стемов
 (vocals/drums/bass/guitar/piano/other) и возвращает стемы обратно на шару.
 
-Движки разделения: **native** (дефолт) — инференс в Rust через ONNX Runtime
-(CUDA), пишет FLAC 24-bit; **python** — legacy через [audio-separator]
-(python-драйвер `python/separator_driver.py` из venv: грузит модель один раз
-на батч и отдаёт прогресс JSON-строками в stdout).
+Движок разделения один — **native**: инференс целиком в Rust через ONNX
+Runtime (GPU NVIDIA через CUDA, есть фолбэк на CPU), пишет FLAC 24-bit.
 
 ## Как работает
 
@@ -18,9 +16,9 @@ SMB batch stem-separation pipeline: берёт `.wav`-записи из дире
 3. **Дедупликация**: файлы с одинаковыми `(data_size, frames)` попарно
    сравниваются (см. «Дедупликация» ниже); дубли снимаются с обработки,
    их rename на NAS — строго после `Ok` хранителя.
-4. **Separate**: один вызов драйвера на батч хранителей и уникальных
-   (модель «горячая»); по событию `file_done` — upload стемов
-   в `<basename>/<stem>.flac`.
+4. **Separate**: один вызов движка на батч хранителей и уникальных
+   (ONNX-сессия «горячая» — грузится один раз на батч); по событию
+   `file_done` — upload стемов в `<basename>/<stem>.flac`.
 5. **Rename** `CONVERTED_<имя>` — строго после успешной заливки всех 6 стемов
    (сбой раньше шага оставляет исходник нетронутым), затем локальный cleanup.
 6. **Отчёт**: markdown (`split_report_YYYYMMDD-HHMMSS.md`) на шару +
@@ -92,18 +90,16 @@ cargo build --release   # бинарник target/release/hexastem
 cargo test              # юнит- и e2e-тесты (моки: без сети и без GPU)
 ```
 
-Требования: Rust stable ≥ 1.99; для реального прогона с `--engine python` —
-python 3.11 venv с
-`audio-separator[gpu]==0.47.0` (torch пин `2.7.1+cu126` для Pascal-видеокарт),
-`smbclient` в системе, ffmpeg (для декодирования не-wav источников библиотекой).
+Требования: Rust stable ≥ 1.99, `smbclient` в системе, ffmpeg (для
+декодирования не-wav источников библиотекой). Для скорости нужен GPU NVIDIA
+с CUDA (инференс ONNX Runtime); на CPU тоже работает — медленно.
 
 ## Запуск
 
 ```bash
 hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
-            --local-dir <work-dir> [--model sw|6s] [--engine native|python] \
-            [--onnx-model <file>] [--output-format flac] [--venv-path <dir>] \
-            [--smb-creds-file <file>] [--local]
+            --local-dir <work-dir> [--onnx-model <file>] \
+            [--output-format flac] [--smb-creds-file <file>] [--local]
 ```
 
 | Параметр | Дефолт | Описание |
@@ -112,11 +108,8 @@ hexastem --host <host> --share <share> --remote-dir <dir-on-share> \
 | `--share` | — | Имя шары |
 | `--remote-dir` | — | Директория с записями на шаре |
 | `--local-dir` | — | Локальная рабочая директория (загрузка/выгрузка) |
-| `--model` | `sw` | `sw` = BS-Roformer-SW.ckpt (SOTA, ~2.6 GiB VRAM); `6s` = htdemucs_6s.yaml (быстрее, ~1.1 GiB) |
-| `--engine` | `native` | Движок разделения: `native` = ONNX Runtime CUDA в Rust (FLAC 24-bit); `python` = legacy через audio-separator (subprocess, требует venv) |
-| `--onnx-model` | `<крейт>/.models/onnx/bs_roformer_sw_6stem_fp32.onnx` | ONNX-модель нативного движка (`--engine native`) |
-| `--output-format` | `flac` | Формат стемов (`flac`/`wav`/`mp3`) |
-| `--venv-path` | `<крейт>/.venv` | Python venv с audio-separator |
+| `--onnx-model` | `<крейт>/.models/onnx/bs_roformer_sw_6stem_fp32.onnx` | ONNX-модель движка |
+| `--output-format` | `flac` | Формат стемов (движок пишет только FLAC) |
 | `--smb-creds-file` | — | Файл кредов smbclient (`username=`, `password=`); иначе `SMB_USER`/`SMB_PASS` из env |
 | `--local` | выкл | Локальная папка вместо SMB (`remote-dir` читается с диска) — отладка и smoke без сети |
 | `--no-dedup` | выкл | Отключить дедупликацию дублей-записей (каждый файл обрабатывается как есть) |
@@ -130,8 +123,7 @@ SMB_USER=user SMB_PASS=pass \
 ./target/release/hexastem \
   --host nas.local --share music \
   --remote-dir kirtan/2026-10 \
-  --local-dir /var/tmp/hexastem_work \
-  --model sw
+  --local-dir /var/tmp/hexastem_work
 ```
 
 Ожидаемый результат на шаре: `kirtan/2026-10/<трек>/<stem>.flac` × 6,
@@ -144,22 +136,15 @@ SMB_USER=user SMB_PASS=pass \
 ```bash
 ./target/release/hexastem --local \
   --host local --share local \
-  --remote-dir /tmp/music_in --local-dir /tmp/music_work \
-  --venv-path .venv
+  --remote-dir /tmp/music_in --local-dir /tmp/music_work
 ```
 
-### Venv и модели
+### Модель
 
-Venv по умолчанию — `.venv` внутри крейта; развёртывание (см. также сессию
-`2026-10-13-audio-split-pipeline`):
-
-```bash
-python3.11 -m venv .venv
-.venv/bin/pip install "audio-separator[gpu]==0.47.0" "torch==2.7.1+cu126"
-```
-
-Кэш моделей — `.models` внутри крейта (драйвер ведёт его сам); при первом
-прогоне модели скачаются автоматически (~720 MB для `sw`).
+ONNX-модель по умолчанию — `.models/onnx/bs_roformer_sw_6stem_fp32.onnx`
+внутри крейта (BS-Roformer SW, 6 стемов, fp32); путь переопределяется
+флагом `--onnx-model`. Dylib ONNX Runtime можно подменить переменной
+`ORT_DYLIB_PATH` (иначе — системная/слинкованная).
 
 ## Структура
 
@@ -170,12 +155,13 @@ src/local_fs.rs  — локальная папка как SmbOps (--local: те�
 src/dedup.rs     — дедупликация: парсер PCM WAV, окна/огибающие, compare_pair,
                    правило хранителя (чистые функции, std only)
 src/pipeline.rs  — план батча (resume/CONVERTED_*/DUPLICATE_*), DI-трейты
-                   SmbOps/EngineOps, цикл download→dedup→separate→upload→rename,
-                   адаптер драйвера
+                   SmbOps/EngineOps, цикл download→dedup→separate→upload→rename
+src/engine/      — нативный движок: DSP-конвейер (wav → resample → chunker →
+                   stft → ONNX-инференс → iSTFT → кроссфейд → FLAC 24-bit),
+                   CUDA→CPU фолбэк, протокол событий прогресса
 src/report.rs    — markdown-отчёт (+ секция «Дедупликация») + консольная сводка
                    + exit code
+src/tui/         — TUI-бинарник hexastem_tui (ratatui): попап запуска, прогресс,
+                   журнал, дедуп-таб, GPU-панель
 src/main.rs      — сборка шагов + e2e-смоук (InMemorySmb + StubEngine)
-python/separator_driver.py — python-драйвер audio-separator (JSON-lines в stdout)
 ```
-
-[audio-separator]: https://pypi.org/project/audio-separator/

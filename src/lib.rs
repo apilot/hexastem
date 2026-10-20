@@ -1,7 +1,7 @@
 //! hexastem — SMB batch stem-separation pipeline.
 //!
 //! Пайплайн: скан SMB-директории → download → separation → upload стемов
-//! → rename `CONVERTED_*` → отчёт. Инференс — subprocess, не в Rust.
+//! → rename `CONVERTED_*` → отчёт. Инференс — нативный движок (ONNX) в Rust.
 
 pub mod config;
 pub mod dedup;
@@ -14,5 +14,5 @@ pub mod report;
 pub mod smb;
 pub mod tui;
 
-pub use config::{default_onnx_model, Config, EngineKind, Model};
+pub use config::{default_onnx_model, Config};
 pub use error::AppError;

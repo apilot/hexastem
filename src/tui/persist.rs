@@ -10,13 +10,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::config::Model;
-
 /// Имя файла пресета (в `~/.config/hexastem/`).
 pub const SETTINGS_FILE: &str = "tui.toml";
 
 /// Пресет попапа запуска: последние значения полей.
-/// `serde(default)` — неполный файл дозаполняется из `Default` (graceful).
+/// `serde(default)` — неполный файл дозаполняется из `Default` (graceful);
+/// лишние ключи старых версий пресета игнорируются (tolerant).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct TuiSettings {
@@ -28,8 +27,6 @@ pub struct TuiSettings {
     pub remote_dir: String,
     /// Локальная рабочая директория.
     pub local_dir: String,
-    /// Модель разделения: `sw` | `6s`.
-    pub model: String,
     /// Дедупликация включена.
     pub dedup: bool,
     /// Локальная папка вместо SMB (remote читается с диска).
@@ -45,7 +42,6 @@ impl Default for TuiSettings {
             share: String::new(),
             remote_dir: String::new(),
             local_dir: String::new(),
-            model: model_label(Model::Sw).to_string(),
             dedup: true,
             local_mode: false,
             lang: crate::tui::i18n::Lang::default().label().to_string(),
@@ -54,26 +50,9 @@ impl Default for TuiSettings {
 }
 
 impl TuiSettings {
-    /// Модель из пресета: неизвестное значение → дефолт `sw` (graceful).
-    pub fn model(&self) -> Model {
-        if self.model == model_label(Model::SixS) {
-            Model::SixS
-        } else {
-            Model::Sw
-        }
-    }
-
     /// Язык из пресета: неизвестное значение → дефолт `Ru` (graceful).
     pub fn lang(&self) -> crate::tui::i18n::Lang {
         crate::tui::i18n::Lang::from_label(&self.lang)
-    }
-}
-
-/// Метка модели как в CLI (`--model sw|6s`).
-pub fn model_label(model: Model) -> &'static str {
-    match model {
-        Model::Sw => "sw",
-        Model::SixS => "6s",
     }
 }
 
@@ -132,7 +111,6 @@ mod tests {
             share: "media".into(),
             remote_dir: "/recordings 2026".into(),
             local_dir: "/tmp/work".into(),
-            model: "6s".into(),
             dedup: false,
             local_mode: true,
             lang: "en".into(),
@@ -187,16 +165,19 @@ mod tests {
         assert!(!settings.local_mode);
     }
 
+    /// Старый пресет с ключом `model` (выпилен из TUI) читается tolerant:
+    /// лишний ключ игнорируется, остальные поля на месте.
     #[test]
-    fn model_parses_known_labels_and_falls_back_to_sw() {
-        let mut settings = TuiSettings::default();
-        assert_eq!(settings.model(), Model::Sw);
+    fn legacy_preset_with_model_key_loads_tolerantly() {
+        let path = temp_path("legacy_model");
+        fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        fs::write(&path, "host = \"nas\"\nmodel = \"6s\"\ndedup = false\n").unwrap();
 
-        settings.model = "6s".into();
-        assert_eq!(settings.model(), Model::SixS);
+        let settings = load_from(&path);
 
-        settings.model = "bogus".into();
-        assert_eq!(settings.model(), Model::Sw, "неизвестное значение → sw");
+        assert_eq!(settings.host, "nas");
+        assert!(!settings.dedup);
+        assert_eq!(settings.lang(), crate::tui::i18n::Lang::Ru, "остальное — дефолт");
     }
 
     #[test]
@@ -223,8 +204,6 @@ mod tests {
     fn default_preset_is_smb_with_dedup() {
         let settings = TuiSettings::default();
 
-        assert_eq!(settings.model(), Model::Sw);
-        assert_eq!(settings.model, "sw");
         assert!(settings.dedup);
         assert!(!settings.local_mode);
         assert!(settings.host.is_empty() && settings.remote_dir.is_empty());

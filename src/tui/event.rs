@@ -12,7 +12,6 @@ use std::time::Duration;
 use crossterm::event::{read, Event, KeyEvent, KeyEventKind, MouseEvent};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::Model;
 use crate::dedup::DedupSummary;
 use crate::envelope::StereoEnvelope;
 use crate::pipeline::{BatchResult, FileResult};
@@ -110,8 +109,6 @@ pub struct RunSpec {
     pub remote_dir: PathBuf,
     /// Локальная рабочая директория.
     pub local_dir: PathBuf,
-    /// Модель разделения.
-    pub model: Model,
     /// Дедупликация включена.
     pub dedup: bool,
     /// Локальная папка вместо SMB: бэкенд — [`crate::local_fs::LocalFs`].
@@ -254,13 +251,12 @@ mod tests {
             share: "media".into(),
             remote_dir: PathBuf::from("/rec"),
             local_dir: PathBuf::from("/tmp/w"),
-            model: crate::config::Model::SixS,
             dedup: false,
             local_mode: true,
         };
 
         assert_eq!(spec, spec.clone());
-        assert!(matches!(&spec, RunSpec { local_mode: true, model: crate::config::Model::SixS, .. }));
+        assert!(matches!(&spec, RunSpec { local_mode: true, dedup: false, .. }));
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub enum AppError {
         message: String,
     },
 
-    /// Сбой движка разделения (subprocess audio-separator).
+    /// Сбой движка разделения (diagnostics — хвост stderr движка).
     #[error("separation engine failed for `{file}` (exit {exit_code:?}): {stderr_tail}")]
     Engine {
         file: PathBuf,

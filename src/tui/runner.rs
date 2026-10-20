@@ -20,15 +20,16 @@
 //!
 //! # Ограничения (принято, lib не правится)
 //!
-//! - **Отмена внутри separate невозможна**: батч — один subprocess драйвера,
-//!   `EngineOps` не даёт хука прерывания. Cancel, запрошенный во время
-//!   батча, останавливает заливку/rename завершающихся файлов (они получают
-//!   Failed, исходники на NAS нетронуты — инвариант rename; resume подхватит
-//!   при следующем прогоне), но GPU-батч отрабатывает до конца.
+//! - **Отмена внутри separate невозможна**: батч — один вызов `separate_batch`,
+//!   движок прерывается только мягко (флаг отмены между чанками). Cancel,
+//!   запрошенный во время батча, останавливает заливку/rename завершающихся
+//!   файлов (они получают Failed, исходники на NAS нетронуты — инвариант
+//!   rename; resume подхватит при следующем прогоне), но текущий GPU-батч
+//!   отрабатывает до границы чанка.
 //! - **Scan-стадия не имеет отдельного события**: план приходит одним
 //!   [`AppEvent::RunStarted`] после скана; стадия scan видима как Running
 //!   без строк таблицы.
-//! - **Процент separate — оценка драйвера** (`est: true`), download-прогресс —
+//! - **Процент separate — оценка движка** (`est: true`), download-прогресс —
 //!   фактический (поллер размера локального файла против размера на шаре),
 //!   upload/rename — indeterminate (размеров операций у UI нет).
 
@@ -63,7 +64,7 @@ const CANCELLED: &str = "cancelled by user";
 type SharedDownloads = Arc<Mutex<BTreeMap<String, String>>>;
 
 /// Зависимости раннера: инжектируемые операции SMB и движка (продакшн —
-/// `SmbClient`/`EngineRunner`, тесты — моки `mocks`).
+/// `SmbClient`/`NativeEngine`, тесты — моки `mocks`).
 pub struct RunnerDeps {
     /// Операции SMB (list/get/put/rename).
     pub smb: Arc<dyn SmbOps + Send + Sync>,
@@ -112,18 +113,18 @@ impl Ctrl {
 pub struct RunnerHandle {
     ctrl: Arc<Ctrl>,
     task: JoinHandle<Result<BatchResult, AppError>>,
-    /// Движок прогона: адресат форс-kill'а (субпроцесс драйвера).
+    /// Движок прогона: адресат форс-kill'а.
     engine: Arc<dyn EngineOps + Send + Sync>,
 }
 
 impl RunnerHandle {
     /// Кооперативная отмена: проверки срабатывают на границах файлов/стадий
-    /// (см. ограничения модуля — отдельный subprocess не прерывается).
+    /// (см. ограничения модуля — текущий батч не прерывается жёстко).
     pub fn cancel(&self) {
         self.ctrl.cancel.store(true, Ordering::Relaxed);
     }
 
-    /// Форс-отмена: немедленно убить subprocess движка (текущий файл
+    /// Форс-отмена: немедленно убить движок (текущий файл
     /// останется без rename — resume подберёт его в следующем прогоне).
     /// Ожидание движка завершается ошибкой, раннер доходит до выхода сам.
     pub fn force_kill(&self) {
@@ -622,7 +623,7 @@ impl EngineOps for TeeEngine<'_> {
                         pct: 100.0,
                         estimated: false,
                     });
-                    // Список стемов драйвера не теряем: живой счётчик STEMS
+                    // Список стемов движка не теряем: живой счётчик STEMS
                     // честен уже на upload/rename (раньше здесь был `..`).
                     let _ = events.send(AppEvent::FileStems {
                         name,
@@ -904,7 +905,7 @@ mod tests {
                 event,
                 AppEvent::FileStems { name, count: 6 } if name == "a.wav"
             )),
-            "список стемов драйвера не теряется в маппинге: {events:?}"
+            "список стемов движка не теряется в маппинге: {events:?}"
         );
         // Живой счётчик доезжает до App раньше терминального Ok.
         let mut app = App::new();
@@ -914,7 +915,7 @@ mod tests {
         assert_eq!(app.files()[0].stems_done, Some(6), "колонка STEMS честна в Finished");
     }
 
-    /// Событие `device` драйвера проходит сквозь tee в канал UI (шапка TUI).
+    /// Событие `device` проходит сквозь tee в канал UI (шапка TUI).
     #[tokio::test]
     async fn device_event_is_forwarded_to_ui_channel() {
         let dir = temp_dir("device");

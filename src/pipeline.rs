@@ -8,28 +8,22 @@
 //! 3. дедупликация (см. `dedup`): файлы с одинаковыми (data_size, frames)
 //!    попарно сравниваются; дубли снимаются с обработки, их rename на NAS —
 //!    строго после `Ok` хранителя;
-//! 4. ОДИН вызов движка на батч хранителей и уникальных («model hot», см.
-//!    python/separator_driver.py): JSON-события драйвера читаются построчно;
-//!    по `file_done` — upload стемов → rename `CONVERTED_*` → локальный
-//!    cleanup;
+//! 4. ОДИН вызов движка на батч хранителей и уникальных («model hot» — одна
+//!    сессия инференса на батч); по `file_done` — upload стемов → rename
+//!    `CONVERTED_*` → локальный cleanup;
 //! 5. инвариант: rename ТОЛЬКО после успешной заливки всех 6 стемов — любой
 //!    сбой раньше оставляет исходник на NAS нетронутым;
 //! 6. итог — [`BatchResult`] (ok/failed/duplicate по каждому файлу).
 //!
 //! DI: SMB и движок инжектятся трейтами [`SmbOps`]/[`EngineOps`] — тесты идут
-//! на моках, без сети и GPU. Зависание драйвера лечит форс-отмена TUI:
-//! [`EngineRunner::kill_current_engine`] добивает процесс движка (текущий файл
-//! останется без rename — resume подберёт его в следующем прогоне).
+//! на моках, без сети и GPU. Зависание движка лечит форс-отмена TUI:
+//! [`EngineOps::kill_current_engine`] добивает движок (текущий файл останется
+//! без rename — resume подберёт его в следующем прогоне).
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use serde::Deserialize;
 
 use crate::dedup::{self, DedupSummary, FileAnalysis, KeeperReason, PairReport, PairVerdict};
 use crate::error::AppError;
@@ -41,21 +35,18 @@ pub const CONVERTED_PREFIX: &str = "CONVERTED_";
 /// Префикс переименованного дубля на NAS (хранитель обработан вместо него).
 pub const DUPLICATE_PREFIX: &str = "DUPLICATE_";
 
-/// Стемы пресета — должны совпадать с EXPECTED_STEMS драйвера
-/// (python/separator_driver.py).
+/// Стемы пресета — должны совпадать со списком, который раскладывает движок.
 pub const EXPECTED_STEMS: [&str; 6] = ["vocals", "drums", "bass", "guitar", "piano", "other"];
 
 /// Ожидимое число стемов на файл (инвариант rename).
 pub const EXPECTED_STEM_COUNT: usize = EXPECTED_STEMS.len();
 
-/// Хвост stderr движка в тексте ошибки (диагностика без засорения логов).
-const STDERR_TAIL_CHARS: usize = 300;
+// --- события движка -------------------------------------------------------------
 
-// --- протокол драйвера ---------------------------------------------------------
-
-/// Событие JSON-протокола драйвера: одна строка stdout = одно событие.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+/// Событие движка: прогресс, per-file исход и финальная сводка батча.
+/// [`NativeEngine`](crate::engine::native::NativeEngine) отдаёт события
+/// напрямую в колбэк `separate_batch`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     /// Прогресс (загрузка модели / разделение файла).
     Progress {
@@ -65,9 +56,8 @@ pub enum EngineEvent {
         stage: String,
         /// Процент 0..100.
         pct: f64,
-        /// `true` — оценка по времени (драйвер не знает реальный прогресс
-        /// separate); `false` (или отсутствие поля) — точное значение.
-        #[serde(rename = "est", default)]
+        /// `true` — оценка по времени (движок между чанками не знает
+        /// точный прогресс); `false` (или отсутствие поля) — точное значение.
         estimated: bool,
     },
     /// Файл разделён: локальные пути стемов.
@@ -79,38 +69,27 @@ pub enum EngineEvent {
         /// Секунды разделения.
         seconds: f64,
     },
-    /// Файл не разделён (после ретраев драйвера).
+    /// Файл не разделён (после ретрая движка).
     FileError {
         /// Локальный путь файла.
         file: String,
         /// Текст последней ошибки.
         error: String,
     },
-    /// Финальная сводка батча драйвера.
+    /// Финальная сводка батча движка.
     BatchDone {
         /// Успешных файлов.
         ok: u32,
         /// Неудачных файлов.
         failed: u32,
     },
-    /// Драйвер сообщил вычислительное устройство (сразу после загрузки
+    /// Движок сообщил вычислительное устройство (сразу после загрузки
     /// модели): имя CUDA-GPU или `cpu`. Пайплайн не использует — событие
     /// для шапки TUI.
     Device {
         /// Имя GPU (`NVIDIA GeForce RTX 4090`) или `cpu`.
         name: String,
     },
-}
-
-/// Разбор строки stdout драйвера; `None` — пустая/не протокольная строка.
-/// Решающие сигналы — `file_done`/`file_error` и код выхода, поэтому мусорная
-/// строка не фатальна (логи библиотеки идут в stderr и сюда не попадают).
-pub fn parse_event(line: &str) -> Option<EngineEvent> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    serde_json::from_str(trimmed).ok()
 }
 
 // --- DI-границы ----------------------------------------------------------------
@@ -159,7 +138,8 @@ impl SmbOps for SmbClient {
     }
 }
 
-/// Движок разделения (продакшн — [`EngineRunner`], тесты — мок).
+/// Движок разделения (продакшн —
+/// [`NativeEngine`](crate::engine::native::NativeEngine), тесты — мок).
 pub trait EngineOps {
     /// Разделяет пакет локальных файлов одной загрузкой модели; события
     /// протокола отдаются в `on_event` по мере поступления.
@@ -178,259 +158,6 @@ pub trait EngineOps {
 /// Строки stderr движка, перехваченные из пути событий (CLI-путь: терминал,
 /// TUI-путь: общий канал событий → таб Log).
 pub type StderrSink = Arc<dyn Fn(&str) + Send + Sync>;
-
-/// Rust-адаптер python-драйвера: subprocess `{venv}/bin/python separator_driver.py`.
-#[derive(Clone)]
-pub struct EngineRunner {
-    /// Интерпретатор venv (`{venv}/bin/python`).
-    python: PathBuf,
-    /// Путь к python/separator_driver.py.
-    driver: PathBuf,
-    /// Чекпойнт модели (см. `Model::checkpoint`).
-    model_checkpoint: String,
-    /// Формат стемов (напр. `flac`).
-    output_format: String,
-    /// Приёмник `[engine]`-строк (прогресс/сводка драйвера). По умолчанию —
-    /// `eprintln!` (CLI-поведение); TUI подставляет канал событий.
-    on_stderr: StderrSink,
-    /// Слот текущего процесса драйвера: форс-kill забирает `Child` из слота,
-    /// ожидание это видит и завершается ошибкой «движок убит».
-    current: Arc<Mutex<Option<Child>>>,
-    /// Стартовая оценка RTF для драйвера (`--rtf-estimate`); `None` — не передавать.
-    rtf_estimate: Option<f64>,
-}
-
-impl std::fmt::Debug for EngineRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineRunner")
-            .field("python", &self.python)
-            .field("driver", &self.driver)
-            .field("model_checkpoint", &self.model_checkpoint)
-            .field("output_format", &self.output_format)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Интервал опроса потомка в ожидании (kill-совместимое ожидание).
-const CHILD_POLL: Duration = Duration::from_millis(50);
-
-/// Блокировка без отравления: паника предыдущего владельца не должна ломать
-/// доступ к слоту процесса (данные консистентны — просто guard брошен).
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl EngineRunner {
-    /// Адаптер драйвера из путей venv и скрипта.
-    pub fn new(venv_path: &Path, driver_script: &Path, model_checkpoint: &str, output_format: &str) -> Self {
-        Self {
-            python: venv_path.join("bin/python"),
-            driver: driver_script.to_path_buf(),
-            model_checkpoint: model_checkpoint.to_string(),
-            output_format: output_format.to_string(),
-            on_stderr: Arc::new(|line| eprintln!("{line}")),
-            current: Arc::new(Mutex::new(None)),
-            rtf_estimate: None,
-        }
-    }
-
-    /// Builder: стартовая оценка RTF драйвера (уточняется им по бою).
-    pub fn with_rtf_estimate(mut self, rtf_estimate: f64) -> Self {
-        self.rtf_estimate = Some(rtf_estimate);
-        self
-    }
-
-    /// Builder: подменяет приёмник `[engine]`-строк (CLI оставляет дефолт —
-    /// терминал; TUI шлёт строки в общий канал событий).
-    pub fn on_stderr(mut self, sink: Box<dyn Fn(&str) + Send + Sync>) -> Self {
-        self.on_stderr = Arc::from(sink);
-        self
-    }
-
-    /// Останавливает текущий процесс драйвера, если он запущен (форс-отмена).
-    /// `Child` забирается из слота — поллер ожидания видит пустой слот и
-    /// возвращает «движок убит». Текущий файл останется без rename — resume.
-    pub fn kill_current_engine(&self) {
-        let child = lock(&self.current).take();
-        if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    /// `[engine]`-строки события (формат прежнего CLI-вывода).
-    fn stderr_line(event: &EngineEvent) -> Option<String> {
-        match event {
-            EngineEvent::Progress { file, stage, pct, .. } => {
-                Some(format!("[engine] {file}: {stage} {pct:.1}%"))
-            }
-            EngineEvent::BatchDone { ok, failed } => Some(format!("[engine] batch done: ok={ok} failed={failed}")),
-            // Имя устройства — событие шапки TUI, `[engine]`-строки не даёт.
-            EngineEvent::FileDone { .. } | EngineEvent::FileError { .. } | EngineEvent::Device { .. } => None,
-        }
-    }
-
-    /// Команда запуска драйвера (отдельно — для юнит-теста аргументов).
-    fn build_command(&self, files: &[PathBuf], output_dir: &Path) -> Command {
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(&self.driver)
-            .arg("--model-file")
-            .arg(&self.model_checkpoint)
-            .arg("--output-dir")
-            .arg(output_dir)
-            .arg("--output-format")
-            .arg(&self.output_format)
-            .arg("--files")
-            .args(files);
-        if let Some(rtf) = self.rtf_estimate {
-            cmd.arg("--rtf-estimate").arg(rtf.to_string());
-        }
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd
-    }
-
-    /// Ожидание потомка c проверкой kill-слота: пустой слот = движок убит.
-    /// Guard не держится между опросами — kill никогда не блокируется.
-    fn wait_cancellable(&self, file: &Path) -> Result<ExitStatus, AppError> {
-        loop {
-            {
-                let mut guard = lock(&self.current);
-                match guard.as_mut() {
-                    Some(child) => {
-                        let status = child.try_wait().map_err(|err| AppError::Io {
-                            path: self.python.clone(),
-                            source: err,
-                        })?;
-                        if let Some(status) = status {
-                            return Ok(status);
-                        }
-                    }
-                    None => {
-                        return Err(AppError::Engine {
-                            file: file.to_path_buf(),
-                            exit_code: None,
-                            stderr_tail: "engine killed by user (current file left without rename)".to_string(),
-                        });
-                    }
-                }
-            }
-            std::thread::sleep(CHILD_POLL);
-        }
-    }
-}
-
-impl EngineOps for EngineRunner {
-    fn separate_batch(
-        &self,
-        files: &[PathBuf],
-        output_dir: &Path,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<(), AppError> {
-        if files.is_empty() {
-            return Ok(());
-        }
-        let child = self
-            .build_command(files, output_dir)
-            .spawn()
-            .map_err(|err| AppError::Engine {
-                file: files[0].clone(),
-                exit_code: None,
-                stderr_tail: format!("spawn failed: {err}"),
-            })?;
-        *lock(&self.current) = Some(child);
-
-        let sink = Arc::clone(&self.on_stderr);
-        let mut tee = |event: EngineEvent| {
-            if let Some(line) = Self::stderr_line(&event) {
-                sink(&line);
-            }
-            on_event(event);
-        };
-
-        // Захват пайпов под коротким guard'ом; сам guard НЕ держится во время
-        // чтения stdout — иначе kill_current_engine заблокируется до конца батча.
-        let (stdout, stderr) = {
-            let mut guard = lock(&self.current);
-            let child = guard
-                .as_mut()
-                .ok_or_else(|| AppError::Pipeline("engine process slot lost".to_string()))?;
-            (child.stdout.take(), child.stderr.take())
-        };
-        let stderr_tail = read_stderr(stderr);
-        let saw_summary = relay_stdout(stdout, &files[0], &mut tee)?;
-
-        let status = self.wait_cancellable(&files[0])?;
-        evaluate_exit(status, saw_summary, stderr_tail, &files[0])
-    }
-
-    fn kill_current_engine(&self) {
-        EngineRunner::kill_current_engine(self);
-    }
-}
-
-/// Читает stderr драйвера в фоне; возвращает хвост для текста ошибки
-/// (отдельный поток — иначе переполненный пайп stderr заблокирует stdout).
-fn read_stderr(stderr: Option<ChildStderr>) -> JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = stderr {
-            let _ = pipe.read_to_string(&mut text); // диагностика, не критично
-        }
-        tail_chars(&text, STDERR_TAIL_CHARS)
-    })
-}
-
-/// Потоковое чтение stdout построчно → события в колбэк; возвращает признак
-/// того, что финальная сводка (`batch_done`) была получена.
-fn relay_stdout(
-    stdout: Option<ChildStdout>,
-    file: &Path,
-    on_event: &mut dyn FnMut(EngineEvent),
-) -> Result<bool, AppError> {
-    let stdout = stdout.ok_or_else(|| AppError::Pipeline("engine stdout was not captured".to_string()))?;
-    let mut saw_summary = false;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.map_err(|err| engine_io_error(file, err))?;
-        if let Some(event) = parse_event(&line) {
-            saw_summary |= matches!(event, EngineEvent::BatchDone { .. });
-            on_event(event);
-        }
-    }
-    Ok(saw_summary)
-}
-
-/// Код выхода: 0 либо полученная сводка — батч завершён (пер-файловые отказы
-/// уже в событиях); иначе драйвер рухнул — батчевая ошибка.
-fn evaluate_exit(
-    status: ExitStatus,
-    saw_summary: bool,
-    stderr_tail: JoinHandle<String>,
-    file: &Path,
-) -> Result<(), AppError> {
-    if status.success() || saw_summary {
-        return Ok(());
-    }
-    Err(AppError::Engine {
-        file: file.to_path_buf(),
-        exit_code: status.code(),
-        stderr_tail: stderr_tail.join().unwrap_or_default(),
-    })
-}
-
-fn engine_io_error(file: &Path, err: std::io::Error) -> AppError {
-    AppError::Engine {
-        file: file.to_path_buf(),
-        exit_code: None,
-        stderr_tail: format!("stdout read failed: {err}"),
-    }
-}
-
-/// Последние `max` символов без разрыва границ символов.
-fn tail_chars(text: &str, max: usize) -> String {
-    let skip = text.chars().count().saturating_sub(max);
-    text.chars().skip(skip).collect()
-}
 
 // --- план батча ------------------------------------------------------------------
 
@@ -640,7 +367,7 @@ impl<'a> Pipeline<'a> {
     }
 
     /// Один вызов движка на батч + пост-обработка по событиям; файлы без
-    /// события завершения (крах драйвера) помечаются отказом.
+    /// события завершения (крах движка) помечаются отказом.
     fn separate_and_finalize(&self, downloaded: &[Downloaded], results: &mut Vec<FileResult>) {
         if downloaded.is_empty() {
             return;
@@ -665,7 +392,7 @@ impl<'a> Pipeline<'a> {
     /// (spawn/крах), если движок отчитался ею.
     fn run_engine(&self, files: &[PathBuf], done: &mut HashMap<String, FileResult>) -> Option<String> {
         let mut on_event = |event: EngineEvent| match event {
-            // `[engine]`-строки печатает сам EngineRunner (stderr-sink):
+            // `[engine]`-строки печатает сам движок (stderr-sink):
             // CLI — в терминал, TUI — в общий канал событий (таб Log).
             // Device — событие шапки TUI, пайплайн не использует.
             EngineEvent::Progress { .. } | EngineEvent::BatchDone { .. } | EngineEvent::Device { .. } => {}
@@ -724,7 +451,7 @@ impl<'a> Pipeline<'a> {
     /// занимают диск и не могут испортить уже завершённый файл.
     fn cleanup_local(&self, name: &str, local_file: &str) {
         let _ = std::fs::remove_file(local_file);
-        // Локальная раскладка — за драйвером (сырой stem, без trim):
+        // Локальная раскладка — за движком (сырой stem, без trim):
         // удаляем ровно то, что создал он.
         let _ = std::fs::remove_dir_all(self.local_dir.join(stem_of(name)));
     }
@@ -740,7 +467,7 @@ struct Downloaded {
 }
 
 impl Downloaded {
-    /// Ключ сопоставления с событиями драйвера (строка локального пути).
+    /// Ключ сопоставления с событиями движка (строка локального пути).
     fn key(&self) -> String {
         self.local.to_string_lossy().into_owned()
     }
@@ -927,7 +654,7 @@ fn stem_of(name: &str) -> &str {
 /// Имя стем-директории на NAS: [`stem_of`] без краевых пробелов
 /// («name .WAV» → «name») — хвостовой пробел неудобен в файловых менеджерах.
 /// Единая точка для upload-директории и resume-проверки: имена консистентны
-/// по построению (DRY). Локальная директория стемов — не здесь: драйвер
+/// по построению (DRY). Локальная директория стемов — не здесь: движок
 /// раскладывает стемы по сырому stem, см. [`Pipeline::cleanup_local`].
 fn stem_dir_name(name: &str) -> &str {
     stem_of(name).trim()
@@ -1109,7 +836,7 @@ mod tests {
     }
 
     /// Движок-мок: проигрывает сценарные события; для `FileDone` создаёт
-    /// файлы стемов на диске (как реальный драйвер) — ради честного cleanup.
+    /// файлы стемов на диске (как реальный движок) — ради честного cleanup.
     struct MockEngine {
         calls: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
         events: Vec<EngineEvent>,
@@ -1186,7 +913,7 @@ mod tests {
             .collect()
     }
 
-    /// Событие успешного разделения файла (как у реального драйвера).
+    /// Событие успешного разделения файла (как у реального движка).
     fn done_event(local_dir: &Path, name: &str) -> EngineEvent {
         EngineEvent::FileDone {
             file: local_dir.join(name).to_string_lossy().into_owned(),
@@ -1317,199 +1044,6 @@ mod tests {
         assert!(!has_all_stems(&entries[..5], "flac"), "5 of 6 is not done");
     }
 
-    // --- протокол драйвера ---------------------------------------------------------
-
-    #[test]
-    fn parse_event_reads_all_driver_events() {
-        let cases = [
-            (
-                r#"{"event":"progress","file":"a.wav","stage":"separate","pct":42.5}"#,
-                EngineEvent::Progress {
-                    file: "a.wav".to_string(),
-                    stage: "separate".to_string(),
-                    pct: 42.5,
-                    estimated: false,
-                },
-            ),
-            (
-                r#"{"event":"progress","file":"a.wav","stage":"separate","pct":42.5,"est":false}"#,
-                EngineEvent::Progress {
-                    file: "a.wav".to_string(),
-                    stage: "separate".to_string(),
-                    pct: 42.5,
-                    estimated: false,
-                },
-            ),
-            (
-                r#"{"event":"progress","file":"a.wav","stage":"separate","pct":33.3,"est":true}"#,
-                EngineEvent::Progress {
-                    file: "a.wav".to_string(),
-                    stage: "separate".to_string(),
-                    pct: 33.3,
-                    estimated: true,
-                },
-            ),
-            (
-                r#"{"event":"file_done","file":"/tmp/a.wav","stems":["/tmp/a/vocals.flac"],"seconds":1.25}"#,
-                EngineEvent::FileDone {
-                    file: "/tmp/a.wav".to_string(),
-                    stems: vec!["/tmp/a/vocals.flac".to_string()],
-                    seconds: 1.25,
-                },
-            ),
-            (
-                r#"{"event":"file_error","file":"a.wav","error":"boom"}"#,
-                EngineEvent::FileError { file: "a.wav".to_string(), error: "boom".to_string() },
-            ),
-            (
-                r#"{"event":"batch_done","ok":2,"failed":1}"#,
-                EngineEvent::BatchDone { ok: 2, failed: 1 },
-            ),
-            (
-                r#"{"event":"device","name":"NVIDIA GeForce RTX 4090"}"#,
-                EngineEvent::Device { name: "NVIDIA GeForce RTX 4090".to_string() },
-            ),
-            (
-                r#"{"event":"device","name":"cpu"}"#,
-                EngineEvent::Device { name: "cpu".to_string() },
-            ),
-        ];
-        for (line, expected) in cases {
-            assert_eq!(parse_event(line), Some(expected), "line: {line}");
-        }
-    }
-
-    #[test]
-    fn parse_event_ignores_blank_and_non_protocol_lines() {
-        assert_eq!(parse_event(""), None);
-        assert_eq!(parse_event("   "), None);
-        assert_eq!(parse_event("not json at all"), None);
-    }
-
-    // --- адаптер движка --------------------------------------------------------------
-
-    #[test]
-    fn engine_runner_builds_driver_command() {
-        let runner = EngineRunner::new(Path::new("/venv"), Path::new("/app/driver.py"), "BS-Roformer-SW.ckpt", "flac");
-        let cmd = runner.build_command(&[PathBuf::from("/tmp/a.wav")], Path::new("/tmp/work"));
-
-        assert_eq!(cmd.get_program().to_string_lossy(), "/venv/bin/python");
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(
-            args,
-            [
-                "/app/driver.py",
-                "--model-file",
-                "BS-Roformer-SW.ckpt",
-                "--output-dir",
-                "/tmp/work",
-                "--output-format",
-                "flac",
-                "--files",
-                "/tmp/a.wav",
-            ]
-        );
-    }
-
-    #[test]
-    fn engine_runner_appends_rtf_estimate_flag_when_set() {
-        let runner = EngineRunner::new(Path::new("/venv"), Path::new("/app/driver.py"), "m", "flac")
-            .with_rtf_estimate(0.45);
-        let cmd = runner.build_command(&[PathBuf::from("/tmp/a.wav")], Path::new("/tmp/work"));
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        let idx = args.iter().position(|a| a == "--rtf-estimate").expect("flag present");
-        assert_eq!(args[idx + 1], "0.45");
-
-        let plain = EngineRunner::new(Path::new("/venv"), Path::new("/app/driver.py"), "m", "flac");
-        let cmd = plain.build_command(&[PathBuf::from("/tmp/a.wav")], Path::new("/tmp/work"));
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(!args.contains(&"--rtf-estimate".to_string()), "no flag by default");
-    }
-
-    /// Fake-venv: `bin/python` — shell-скрипт, изображающий драйвер.
-    fn fake_venv(venv: &Path, body: &str) {
-        let bin = venv.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        let python = bin.join("python");
-        fs::write(&python, format!("#!/bin/sh\n{body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[test]
-    fn stderr_sink_receives_engine_lines_and_events_are_forwarded() {
-        let dir = temp_dir("stderr_sink");
-        fake_venv(
-            &dir.join("venv"),
-            "echo '{\"event\":\"progress\",\"file\":\"a.wav\",\"stage\":\"separate\",\"pct\":42.5}'\n\
-             echo '{\"event\":\"batch_done\",\"ok\":1,\"failed\":0}'",
-        );
-        let driver = dir.join("driver.py");
-        fs::write(&driver, "").unwrap();
-        let work = dir.join("work");
-        fs::create_dir_all(&work).unwrap();
-
-        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&lines);
-        let runner = EngineRunner::new(&dir.join("venv"), &driver, "m", "flac")
-            .on_stderr(Box::new(move |line: &str| captured.lock().unwrap().push(line.to_string())));
-
-        let mut forwarded = Vec::new();
-        runner
-            .separate_batch(&[dir.join("a.wav")], &work, &mut |e| forwarded.push(e))
-            .unwrap();
-
-        assert_eq!(
-            *lines.lock().unwrap(),
-            [
-                "[engine] a.wav: separate 42.5%".to_string(),
-                "[engine] batch done: ok=1 failed=0".to_string(),
-            ],
-            "[engine]-строки идут в sink, а не в stderr"
-        );
-        assert_eq!(
-            forwarded,
-            [
-                EngineEvent::Progress {
-                    file: "a.wav".to_string(),
-                    stage: "separate".to_string(),
-                    pct: 42.5,
-                    estimated: false,
-                },
-                EngineEvent::BatchDone { ok: 1, failed: 0 },
-            ],
-            "события протокола форвардятся без изменений"
-        );
-    }
-
-    #[test]
-    fn kill_current_engine_unblocks_running_batch_quickly() {
-        let dir = temp_dir("kill");
-        fake_venv(&dir.join("venv"), "sleep 30 >/dev/null"); // «зависший» драйвер — только kill
-        let driver = dir.join("driver.py");
-        fs::write(&driver, "").unwrap();
-        let work = dir.join("work");
-        fs::create_dir_all(&work).unwrap();
-
-        let runner = EngineRunner::new(&dir.join("venv"), &driver, "m", "flac");
-        let killer_runner = runner.clone();
-        let killer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            killer_runner.kill_current_engine(); // как RunnerHandle::force_kill
-        });
-
-        let started = Instant::now();
-        let result = runner.separate_batch(&[dir.join("a.wav")], &work, &mut |_| {});
-        killer.join().unwrap();
-
-        let err = result.expect_err("убитый движок = батчевая ошибка");
-        assert!(err.to_string().contains("engine killed"), "неожиданная ошибка: {err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "форс-kill обязан прервать ожидание быстро, а не через 30 c"
-        );
-    }
-
     // --- цикл per-file -------------------------------------------------------------
 
     #[test]
@@ -1576,7 +1110,7 @@ mod tests {
             renames(&calls),
             vec![("/remote/name .WAV".to_string(), "/remote/CONVERTED_name .WAV".to_string())]
         );
-        // Локальный cleanup — по сырой раскладке драйвера («name »).
+        // Локальный cleanup — по сырой раскладке движка («name »).
         assert!(!local.join("name .WAV").exists(), "source cleaned up");
         assert!(!local.join("name ").exists(), "local stems dir (raw stem) cleaned up");
     }
