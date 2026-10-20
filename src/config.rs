@@ -44,6 +44,17 @@ impl Model {
     }
 }
 
+/// Дефолт ONNX-модели нативного движка: крейто-относительный путь.
+/// Статическая строка — единая точка для CLI-дефолта (`default_value`
+/// принимает только статические строки без фичи clap «string»).
+pub const DEFAULT_ONNX_MODEL: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/.models/onnx/bs_roformer_sw_6stem_fp32.onnx");
+
+/// Дефолт ONNX-модели как путь: единая точка для TUI (`--engine native`).
+pub fn default_onnx_model() -> PathBuf {
+    PathBuf::from(DEFAULT_ONNX_MODEL)
+}
+
 /// Настройки одного прогона пайплайна.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "hexastem", about = "SMB batch stem-separation pipeline")]
@@ -82,7 +93,7 @@ pub struct Config {
     pub engine: EngineKind,
 
     /// ONNX-модель нативного движка (--engine native).
-    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/.models/onnx/bs_roformer_sw_6stem_fp32.onnx"))]
+    #[arg(long, default_value = DEFAULT_ONNX_MODEL)]
     pub onnx_model: PathBuf,
 
     /// Файл SMB-креденшелов для smbclient (-A); опционально.
@@ -215,6 +226,16 @@ mod tests {
             cfg.onnx_model.starts_with(env!("CARGO_MANIFEST_DIR")),
             "дефолт ONNX-модели — относительно крейта: {}",
             cfg.onnx_model.display()
+        );
+    }
+
+    #[test]
+    fn default_onnx_model_names_bs_roformer_sw() {
+        let model = default_onnx_model();
+        assert!(
+            model.ends_with(".models/onnx/bs_roformer_sw_6stem_fp32.onnx"),
+            "единая точка дефолта ONNX: {}",
+            model.display()
         );
     }
 }

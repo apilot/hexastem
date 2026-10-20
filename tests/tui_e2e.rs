@@ -365,6 +365,33 @@ fn engine_events(local: &Path, names: &[&str]) -> Vec<EngineEvent> {
     events
 }
 
+/// Сценарий native-движка (паритет событий src/engine/native.rs): load 0→100,
+/// Device с честным именем GPU (nvidia-smi), честный по-чанковый separate
+/// (8 чанков: 12.5% после 1-го, 37.5% после 3-го), FileDone с 6 стемами.
+fn native_engine_events(local: &Path, names: &[&str]) -> Vec<EngineEvent> {
+    let first = local.join(names[0]).to_string_lossy().into_owned();
+    let mut events = vec![
+        EngineEvent::Progress { file: first.clone(), stage: "load".into(), pct: 0.0, estimated: false },
+        EngineEvent::Progress { file: first, stage: "load".into(), pct: 100.0, estimated: false },
+        EngineEvent::Device { name: "NVIDIA GeForce RTX 3060".to_string() },
+    ];
+    for name in names {
+        let file = local.join(name).to_string_lossy().into_owned();
+        for pct in [12.5, 37.5] {
+            events.push(EngineEvent::Progress {
+                file: file.clone(),
+                stage: "separate".to_string(),
+                pct,
+                estimated: false,
+            });
+        }
+        let base = Path::new(name).file_stem().and_then(|n| n.to_str()).unwrap_or(name);
+        events.push(EngineEvent::FileDone { file, stems: stem_paths(local, base), seconds: 2.0 });
+    }
+    events.push(EngineEvent::BatchDone { ok: names.len() as u32, failed: 0 });
+    events
+}
+
 fn result_status<'a>(
     result: &'a hexastem::pipeline::BatchResult,
     name: &str,
@@ -703,4 +730,50 @@ fn e2e_popup_fast_validation_requires_host_in_smb_mode() {
     assert_eq!(app.state(), State::Config);
     let text = render(&app);
     assert!(text.contains("укажите хост SMB-сервера"), "{text}");
+}
+
+// --- сценарий 6: native-движок (нативные события протокола) -------------------
+
+/// Регресс native-пути TUI: движок отдаёт события в стиле нативного движка
+/// (Device с полным именем GPU из nvidia-smi, честные доли чанков, 6 стемов
+/// на файл) — тот же раннер ведёт файл до Ok, шапка показывает «Считает: …»,
+/// счётчик стемов и итог корректны, прогон чистый (код 0).
+#[tokio::test]
+async fn e2e_native_engine_events_drive_header_stems_and_clean_run() {
+    let base = temp_dir("native");
+    let work = base.join("work");
+    let remote = PathBuf::from("/nas");
+    let smb = MockSmb::new().with_dir(&remote, &["a.wav"]);
+    let engine = MockEngine::new(native_engine_events(&work, &["a.wav"]));
+
+    let mut app = App::new();
+    let (tx, mut rx) = unbounded_channel();
+    let handle = spawn(
+        RunnerDeps { smb: std::sync::Arc::new(smb), engine: std::sync::Arc::new(engine) },
+        opts(&work, &remote),
+        tx,
+    );
+    drive(&mut app, &mut rx, 1).await;
+    handle.shutdown();
+    let result = handle.finish().await.expect("итог прогона");
+    drain(&mut app, &mut rx).await;
+
+    // Прогон чистый: native-события проходят тот же раннер без отказов.
+    assert_eq!((result.ok, result.failed), (1, 0));
+    assert_eq!(exit_code(&result), 0, "native-путь не даёт отказов");
+    assert_eq!(result_status(&result, "a.wav"), &FileStatus::Ok);
+
+    // Имя устройства из device-события — в шапке («Считает: …»).
+    assert_eq!(app.state(), State::Finished);
+    let text = render(&app);
+    assert!(
+        text.contains("Считает: NVIDIA GeForce RTX 3060"),
+        "полное имя GPU из Device-события в шапке: {text}"
+    );
+
+    // Счётчик стемов живой (6/6 из FileDone), итог батча — в сводке footer.
+    assert!(text.contains("6/6"), "счётчик стемов по native-FileDone: {text}");
+    assert!(text.contains("ГОТ 1 · ОШБ 0 · ДУБЛ 0 · ПРОП 0"), "сводка: {text}");
+
+    let _ = std::fs::remove_dir_all(&base);
 }

@@ -49,7 +49,8 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::Model;
+use crate::config::{EngineKind, Model, default_onnx_model};
+use crate::engine::native::NativeEngine;
 use crate::local_fs::LocalFs;
 use crate::pipeline::{EngineOps, EngineRunner, SmbOps};
 use crate::smb::SmbClient;
@@ -79,17 +80,29 @@ const ENVELOPE_COLUMNS: usize = 200;
 /// Кооперативная пауза при включённой паузе (применяется на границе файлов).
 const PAUSE_WHEN_PAUSED: Duration = Duration::from_secs(30);
 
+/// Аргументы TUI-бинарника (мини-clap): пока только выбор движка. Движок —
+/// тот же [`EngineKind`], что у CLI (`value_enum` даёт `--engine python|native`).
+#[derive(Debug, clap::Parser)]
+#[command(name = "hexastem_tui", about = "SMB batch stem-separation TUI")]
+pub struct TuiArgs {
+    /// Движок разделения: python (subprocess audio-separator) или
+    /// native (Rust DSP + ONNX напрямую, FLAC 24-bit).
+    #[arg(long, value_enum, default_value = "python")]
+    pub engine: EngineKind,
+}
+
 /// Точка входа TUI: `init → event loop → restore`, возвращает код выхода
 /// последнего прогона (`runner::exit_code`; 0 — прогонов не было).
+/// Движок прогона задаётся флагом CLI (`--engine`, дефолт python).
 ///
 /// Panic-safe: `ratatui::init` ставит panic hook, восстанавливающий
 /// терминал; поверх него цепочкой ставится hook, гасящий bracketed paste.
-pub async fn run() -> io::Result<i32> {
+pub async fn run(engine: EngineKind) -> io::Result<i32> {
     let terminal = ratatui::init();
     wrap_panic_hook_with_paste_restore();
     let paste_enabled = enable_bracketed_paste().is_ok();
     let mouse_enabled = enable_mouse_capture().is_ok();
-    let result = event_loop(terminal).await;
+    let result = event_loop(terminal, engine).await;
     ratatui::restore();
     if paste_enabled {
         let _ = disable_bracketed_paste();
@@ -102,9 +115,10 @@ pub async fn run() -> io::Result<i32> {
 
 /// Основной цикл: отрисовать кадр → ждать событие (ввод/внутренние/GPU/tick)
 /// → обновить App → синхронизировать флаги управления с раннером.
+/// Движок прогона (`engine`) выбирается флагом CLI.
 ///
 /// Выход: quit по клавише либо закрытие канала ввода (читатель умер).
-async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
+async fn event_loop(mut terminal: DefaultTerminal, engine: EngineKind) -> io::Result<i32> {
     let (tx_input, mut rx_input) = mpsc::unbounded_channel::<AppEvent>();
     spawn_input_thread(tx_input);
     let (tx_events, mut rx_events) = mpsc::unbounded_channel::<AppEvent>();
@@ -174,7 +188,7 @@ async fn event_loop(mut terminal: DefaultTerminal) -> io::Result<i32> {
         // спека уже проверена — сохранить пресет и запустить прогон.
         if let Some(spec) = app.take_confirmed_start() {
             let _ = persist::save(&settings_of_spec(&spec, app.lang()));
-            run = Some(start_run(spec, tx_events.clone(), tx_gpu.clone()));
+            run = Some(start_run(spec, engine, tx_events.clone(), tx_gpu.clone()));
         }
         quit |= app.should_quit();
     }
@@ -272,26 +286,39 @@ fn sync_run_controls(app: &mut App, run: Option<&ActiveRun>) {
     }
 }
 
-/// Запустить серию: бэкенды по спеке (LocalFs / SmbClient + EngineRunner),
-/// раннер и GPU-поллер. Прежний прогон к этому моменту погашен.
-fn start_run(spec: RunSpec, tx_events: UnboundedSender<AppEvent>, tx_gpu: UnboundedSender<GpuEvent>) -> ActiveRun {
+/// Запустить серию: бэкенды по спеке (LocalFs / SmbClient + движок по
+/// `engine_kind`), раннер и GPU-поллер. Прежний прогон к этому моменту погашен.
+fn start_run(
+    spec: RunSpec,
+    engine_kind: EngineKind,
+    tx_events: UnboundedSender<AppEvent>,
+    tx_gpu: UnboundedSender<GpuEvent>,
+) -> ActiveRun {
     let smb: Arc<dyn SmbOps + Send + Sync> = if spec.local_mode {
         Arc::new(LocalFs)
     } else {
         Arc::new(SmbClient::new(spec.host.clone(), spec.share.clone(), None))
     };
-    let tx_engine_log = tx_events.clone();
-    let engine: Arc<dyn EngineOps + Send + Sync> = Arc::new(
-        EngineRunner::new(&venv_path(), &driver_script(), spec.model.checkpoint(), OUTPUT_FORMAT)
-            // Стартовая RTF-оценка модели для estimированного separate-прогресса
-            // драйвера (уточняется им по бою между файлами).
-            .with_rtf_estimate(spec.model.rtf_estimate())
-            // Строки stderr драйвера — в общий канал событий: только таб Log,
-            // терминал TUI не засоряется (A: STDERR-ЛИК).
-            .on_stderr(Box::new(move |line: &str| {
-                let _ = tx_engine_log.send(AppEvent::EngineLog { line: line.to_string() });
-            })),
-    );
+    let engine: Arc<dyn EngineOps + Send + Sync> = match engine_kind {
+        // Нативный DSP-движок: ONNX напрямую (та же крейто-относительная
+        // модель, что у CLI); события протокола идут напрямую —
+        // rtf-оценка и приёмник stderr не нужны.
+        EngineKind::Native => Arc::new(NativeEngine::new(&default_onnx_model())),
+        // Python-драйвер: subprocess; stderr — в общий канал событий
+        // (только таб Log, терминал TUI не засоряется — A: STDERR-ЛИК).
+        EngineKind::Python => {
+            let tx_engine_log = tx_events.clone();
+            Arc::new(
+                EngineRunner::new(&venv_path(), &driver_script(), spec.model.checkpoint(), OUTPUT_FORMAT)
+                    // Стартовая RTF-оценка модели для estimированного
+                    // separate-прогресса (уточняется им по бою между файлами).
+                    .with_rtf_estimate(spec.model.rtf_estimate())
+                    .on_stderr(Box::new(move |line: &str| {
+                        let _ = tx_engine_log.send(AppEvent::EngineLog { line: line.to_string() });
+                    })),
+            )
+        }
+    };
     let deps = runner::RunnerDeps { smb, engine };
     let opts = RunnerOptions {
         remote_dir: spec.remote_dir.clone(),
@@ -712,6 +739,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect, table: &StrTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
     use crate::tui::app::{Focus, ValidationStatus};
     use crate::tui::event::{BatchOutcome, PlanSummary};
     use ratatui::backend::TestBackend;
@@ -1063,6 +1091,27 @@ mod tests {
         assert!(text.contains("Считает: RTX 4090"), "событие device обновляет шапку: {text}");
     }
 
+    // --- выбор движка CLI (--engine, мини-clap TUI) ---------------------------
+
+    #[test]
+    fn tui_engine_defaults_to_python() {
+        let args = TuiArgs::try_parse_from(["hexastem_tui"]).expect("запуск без аргументов валиден");
+        assert_eq!(args.engine, EngineKind::Python, "дефолт движка — python (смена — T13)");
+    }
+
+    #[test]
+    fn tui_engine_flag_switches_to_native() {
+        let args =
+            TuiArgs::try_parse_from(["hexastem_tui", "--engine", "native"]).expect("валидный флаг");
+        assert_eq!(args.engine, EngineKind::Native);
+    }
+
+    #[test]
+    fn tui_unknown_engine_value_is_rejected() {
+        let result = TuiArgs::try_parse_from(["hexastem_tui", "--engine", "bogus"]);
+        assert!(result.is_err(), "неизвестное значение --engine отклоняется (clap → код 2)");
+    }
+
     // --- валидация спеки (реальный диск, без сети) ----------------------------
 
     #[test]
@@ -1289,7 +1338,7 @@ mod tests {
             local_mode: true,
         };
 
-        let active = start_run(spec, tx_events, tx_gpu);
+        let active = start_run(spec, EngineKind::Python, tx_events, tx_gpu);
         let event = tokio::time::timeout(Duration::from_secs(30), rx_events.recv())
             .await
             .expect("раннер завис")

@@ -106,7 +106,12 @@ pub type BackendFactory = Arc<dyn Fn(&Path) -> Result<BuiltBackend, AppError> + 
 /// [`AppError::Dsp`]: недоступны оба EP (обе ошибки — в тексте сообщения).
 pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppError> {
     match OrtSession::new(model_path, Ep::Cuda { device_id: 0 }) {
-        Ok(session) => Ok(BuiltBackend { backend: Arc::new(session), device: "cuda".to_string() }),
+        // CUDA стартовал: имя GPU берём у nvidia-smi (честное имя в шапке
+        // TUI «Считает: …»); сбой/пустой вывод — заглушка "cuda".
+        Ok(session) => Ok(BuiltBackend {
+            backend: Arc::new(session),
+            device: query_gpu_name().unwrap_or_else(|| "cuda".to_string()),
+        }),
         Err(cuda_err) => {
             eprintln!("[engine] CUDA EP недоступен ({cuda_err}); fallback на CPU EP");
             let session = OrtSession::new(model_path, Ep::Cpu).map_err(|cpu_err| {
@@ -115,6 +120,25 @@ pub fn default_backend_factory(model_path: &Path) -> Result<BuiltBackend, AppErr
             Ok(BuiltBackend { backend: Arc::new(session), device: "cpu".to_string() })
         }
     }
+}
+
+/// Однократный запрос имени GPU (`nvidia-smi --query-gpu=name`): первая
+/// строка CSV без кавычек. Любой сбой (нет бинарника/вывода) — `None`;
+/// вызывающий код подставляет заглушку. Обёртка тонкая — без теста.
+fn query_gpu_name() -> Option<String> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    parse_gpu_name(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Имя GPU из вывода `nvidia-smi --format=csv,noheader`: первая строка,
+/// снятые кавычки CSV и обрамующие пробелы/переводы строк; пусто — `None`.
+fn parse_gpu_name(output: &str) -> Option<String> {
+    let line = output.lines().next()?.trim();
+    let name = line.trim_matches('"').trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 // --- чистые функции конвейера ----------------------------------------------------
@@ -767,6 +791,24 @@ mod tests {
     fn round_pct_keeps_one_decimal() {
         assert_eq!(round_pct(12.34), 12.3);
         assert_eq!(round_pct(12.36), 12.4);
+    }
+
+    #[test]
+    fn parse_gpu_name_takes_first_stripped_line() {
+        assert_eq!(parse_gpu_name("NVIDIA GeForce RTX 3060\n"), Some("NVIDIA GeForce RTX 3060".into()));
+        assert_eq!(parse_gpu_name("NVIDIA GeForce RTX 3060\r\n"), Some("NVIDIA GeForce RTX 3060".into()));
+        // CSV может брать строки в кавычки — снимаем их.
+        assert_eq!(parse_gpu_name("\"NVIDIA GeForce RTX 3060\"\n"), Some("NVIDIA GeForce RTX 3060".into()));
+        // Многострочный вывод (несколько GPU) — только первая строка.
+        assert_eq!(parse_gpu_name("RTX A\nRTX B\n"), Some("RTX A".into()));
+    }
+
+    #[test]
+    fn parse_gpu_name_empty_output_is_none() {
+        assert_eq!(parse_gpu_name(""), None, "пустой вывод");
+        assert_eq!(parse_gpu_name("\n"), None, "одна пустая строка");
+        assert_eq!(parse_gpu_name("   \n"), None, "пробельная строка");
+        assert_eq!(parse_gpu_name("\"\"\n"), None, "пустая строка в кавычках");
     }
 
     #[test]

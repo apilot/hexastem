@@ -14,5 +14,5 @@ pub mod report;
 pub mod smb;
 pub mod tui;
 
-pub use config::{Config, EngineKind, Model};
+pub use config::{default_onnx_model, Config, EngineKind, Model};
 pub use error::AppError;
