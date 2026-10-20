@@ -1,4 +1,5 @@
-//! Gated-тесты OrtSession: реальный инференс чанка на модели BS-Roformer-SW.
+//! Gated-тесты OrtSession: реальный инференс чанка на модели BS-Roformer-SW,
+//! регрессия CPU-фолбэка после провала CUDA.
 //!
 //! Выполняются ТОЛЬКО при наличии `ORT_DYLIB_PATH` (dylib ONNX Runtime ≥ 1.31)
 //! и модели (`HEXASTEM_MODEL_PATH` или дефолт `.models/onnx/`), иначе —
@@ -79,4 +80,32 @@ fn cuda_inference_chunk_deterministic_and_finite() {
         "cuda chunk: {elapsed:.3} s (audio 4.0 s, RTF {:.3}), checksum={checksum:.4}",
         elapsed / 4.0
     );
+}
+
+/// Регрессия боя: явный фолбэк `default_backend_factory`. Первая попытка
+/// CUDA падает (Pascal: `CUBLAS_STATUS_ARCH_MISMATCH` на commit) — вторая
+/// попытка CPU обязана пройти в том же процессе. Раньше падала: каждый
+/// `OrtSession::new` звал `ort::init()`, а OrtEnv в процессе ровно один.
+#[test]
+#[ignore = "нужны модель ONNX и ORT_DYLIB_PATH (GPU не обязателен) — запуск: cargo test --release -- --ignored"]
+fn cpu_session_succeeds_after_failed_cuda_attempt() {
+    let Some(model) = model_path() else {
+        eprintln!("SKIP: модель не найдена (HEXASTEM_MODEL_PATH или .models/onnx/)");
+        return;
+    };
+    if std::env::var("ORT_DYLIB_PATH").map_or(true, |v| v.is_empty()) {
+        eprintln!("SKIP: ORT_DYLIB_PATH не задан");
+        return;
+    }
+
+    match OrtSession::new(&model, Ep::Cuda { device_id: 0 }) {
+        // RTX-машина: CUDA успешен — сценарий фолбэка здесь неприменим.
+        Ok(_) => eprintln!("SKIP: CUDA-сессия успешна — фолбэк-сценарий неприменим"),
+        Err(cuda_err) => {
+            eprintln!("CUDA EP отклонён: {cuda_err}; пробую CPU-фолбэк (тот же процесс)");
+            let _session =
+                OrtSession::new(&model, Ep::Cpu).expect("CPU-сессия после провала CUDA");
+            eprintln!("cpu fallback: сессия построена после провала CUDA — OK");
+        }
+    }
 }

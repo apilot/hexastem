@@ -7,12 +7,15 @@
 //! Загрузка: `load-dynamic` требует `ORT_DYLIB_PATH` — проверяется до любого
 //! вызова ort, иначе ort паникует на первом обращении к API (нет dylib).
 //!
+//! Окружение: OrtEnv в процессе ровно один — [`ORT_ENV`] создаёт его при
+//! первом `OrtSession::new` и переиспользует (ошибка init тоже кэшируется).
+//!
 //! Потоки: `Session::run` в ort требует `&mut self`, поэтому сессия обёрнута
 //! в `Mutex` (Session: Send + Sync) — [`OrtSession`] остаётся `Send + Sync`
 //! и отдаёт `run(&self)`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::engine::{NUM_STEMS, SPEC_BINS, SPEC_FRAMES};
 use crate::error::AppError;
@@ -48,6 +51,27 @@ pub struct OrtSession {
     session: Mutex<ort::session::Session>,
 }
 
+use ort::environment::Environment;
+
+/// Процесс-wide singleton окружения ort. ONNX Runtime допускает ровно один
+/// OrtEnv на процесс — повторный `ort::init().build()` отвечает
+/// «only one environment is allowed per process» (внутри ort окружение
+/// учтено через `Weak` в `OnceLock`: даже после дропа всех хендлов второй
+/// `build()` не пройдёт). Поэтому создаём один раз и переиспользуем:
+/// это позволяет строить несколько сессий (явный CUDA→CPU fallback
+/// в [`crate::engine::native::default_backend_factory`]).
+/// Ошибка инициализации кэшируется тоже — повторные попытки получают ту же
+/// ошибку, а не «second init».
+static ORT_ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
+
+/// Единое окружение ort для всего процесса (аргумент `Session::builder`).
+fn ort_env() -> Result<&'static Environment, AppError> {
+    ORT_ENV
+        .get_or_init(|| ort::init().build().map_err(|e| format!("ort init: {e}")))
+        .as_ref()
+        .map_err(|msg| AppError::Dsp(msg.clone()))
+}
+
 impl OrtSession {
     /// Строит сессию из ONNX-файла с выбранным EP.
     ///
@@ -65,9 +89,7 @@ impl OrtSession {
             )));
         }
 
-        let env = ort::init()
-            .build()
-            .map_err(|e| AppError::Dsp(format!("ort init: {e}")))?;
+        let env = ort_env()?;
 
         let builder = match ep {
             Ep::Cuda { device_id } => {
@@ -79,21 +101,24 @@ impl OrtSession {
                     .with_conv_algorithm_search(ort::ep::cuda::ConvAlgorithmSearch::Heuristic)
                     .build()
                     .error_on_failure();
-                let builder = ort::session::Session::builder(&env).map_err(ort_err)?;
+                let builder = ort::session::Session::builder(env).map_err(ort_err)?;
                 builder
                     .with_execution_providers([cuda])
                     .map_err(ort_err)?
+                    // Запрет молчаливого отката CUDA→CPU внутри сессии:
+                    // решение о фолбэке — за default_backend_factory.
+                    .with_disable_cpu_fallback()
+                    .map_err(ort_err)?
             }
-            // CPU — дефолтные провайдеры ORT; disable_cpu_fallback ниже
-            // единообразно закрывает обе ветки от молчаливых переключений.
-            Ep::Cpu => ort::session::Session::builder(&env).map_err(ort_err)?,
+            // CPU: EP не регистрируются. disable_cpu_fallback здесь нельзя:
+            // без другого EP ORT отвечает «fallback to CPU EP has been
+            // explicitly disabled» — commit CPU-сессии всегда падал бы.
+            Ep::Cpu => ort::session::Session::builder(env).map_err(ort_err)?,
         };
 
         // error_on_failure() возвращает dispatch без Result: реальная ошибка
         // регистрации EP (нет CUDA и т.п.) проявится здесь, на commit.
         let session = builder
-            .with_disable_cpu_fallback()
-            .map_err(ort_err)?
             .with_memory_pattern(false)
             .map_err(ort_err)?
             .commit_from_file(model_path)
