@@ -1,5 +1,7 @@
 # HexaStem
 
+[![CI](https://github.com/apilot/hexastem/actions/workflows/ci.yml/badge.svg)](https://github.com/apilot/hexastem/actions/workflows/ci.yml)
+
 [English](README.md)
 
 SMB-конвейер батчевого разделения на стемы: берёт `.wav`-записи из

@@ -1,5 +1,7 @@
 # HexaStem
 
+[![CI](https://github.com/apilot/hexastem/actions/workflows/ci.yml/badge.svg)](https://github.com/apilot/hexastem/actions/workflows/ci.yml)
+
 [Русский](README.ru.md)
 
 SMB batch stem-separation pipeline: it picks up `.wav` recordings from a NAS

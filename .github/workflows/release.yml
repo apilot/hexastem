@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST="hexastem-${VERSION}-x86_64-linux"
+          mkdir -p "dist/${DIST}"
+          cp target/release/hexastem target/release/hexastem_tui "dist/${DIST}/"
+          cp README.md README.ru.md LICENSE-MIT LICENSE-APACHE "dist/${DIST}/"
+          tar -czf "dist/${DIST}.tar.gz" -C dist "${DIST}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/*.tar.gz
+
+  github-release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.tar.gz"
+          body: |
+            Prebuilt binaries (x86_64-linux). Runtime requirements:
+            `smbclient` (for SMB shares) and `ffmpeg` (non-WAV sources).
+
+            ONNX Runtime dylib ≥ 1.31 and the BS-Roformer SW model are
+            **not** bundled — see README («Model & hardware»).
+
+            Or install from crates.io: `cargo install hexastem`
+
+  publish:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
